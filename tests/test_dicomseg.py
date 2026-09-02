@@ -111,3 +111,43 @@ def test_write_dicom_seg_refuses_empty_mask(ct_series, tmp_path):
     mask = write_mask(tmp_path / "empty.nii.gz", np.zeros((COLS, ROWS, SLICES)), affine=series_ras_affine())
     with pytest.raises(ValueError, match="empty"):
         dicomseg.write_dicom_seg(mask, directory, {}, tmp_path / "x.dcm", model_name="m")
+
+
+def _strip_patient_study_attributes(directory, read_dicom):
+    """Re-save every slice without the Type 2 patient/study attributes, as TCIA de-identification does."""
+    for path in directory.glob("*.dcm"):
+        ds = read_dicom(path)
+        for name in dicomseg._TYPE2_PATIENT_STUDY_ATTRIBUTES:
+            if name in ds:
+                delattr(ds, name)
+        ds.save_as(str(path), enforce_file_format=True)
+
+
+def test_write_dicom_seg_tolerates_deidentified_series_missing_type2_attributes(ct_series, tmp_path, read_dicom):
+    directory, _ = ct_series
+    _strip_patient_study_attributes(directory, read_dicom)
+    assert "PatientBirthDate" not in read_dicom(next(directory.glob("*.dcm")))  # control: really stripped
+    mask = write_mask(tmp_path / "mask.nii.gz", blob_mask(), affine=series_ras_affine())
+    out = tmp_path / "out" / "segmentation.seg.dcm"
+
+    info = dicomseg.write_dicom_seg(mask, directory, {3: "spleen"}, out, model_name="m", model_version="1")
+
+    assert info["segments"] == {1: 3, 2: 7}
+    seg = read_dicom(out)
+    assert seg.Modality == "SEG"
+    assert seg.PatientBirthDate == ""
+    assert seg.PatientID == ""
+    assert int(seg.NumberOfFrames) == 3 + 1
+
+
+def test_ensure_type2_attributes_reports_missing_and_keeps_present_values(ct_series):
+    _, datasets = ct_series
+    for ds in datasets:
+        delattr(ds, "PatientBirthDate")
+        delattr(ds, "AccessionNumber")
+
+    missing = dicomseg.ensure_type2_patient_study_attributes(datasets)
+
+    assert missing == ["PatientBirthDate", "AccessionNumber"]
+    assert all(ds.PatientBirthDate == "" and ds.AccessionNumber == "" for ds in datasets)
+    assert all(ds.PatientID == "WRAPUP001" for ds in datasets)

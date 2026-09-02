@@ -103,6 +103,31 @@ def align_mask_to_series(mask_image: nib.Nifti1Image, datasets: list[Dataset]) -
     return np.ascontiguousarray(np.transpose(aligned, (2, 1, 0)))
 
 
+# Type 2 patient/study attributes highdicom copies from the source images by direct
+# attribute access. DICOM requires them to be present (possibly empty); anonymisers
+# such as TCIA's strip them outright, which made the SEG builder raise
+# "'FileDataset' object has no attribute 'PatientBirthDate'" on a de-identified series.
+_TYPE2_PATIENT_STUDY_ATTRIBUTES = (
+    "PatientName", "PatientID", "PatientBirthDate", "PatientSex",
+    "StudyDate", "StudyTime", "StudyID", "AccessionNumber", "ReferringPhysicianName",
+)
+
+
+def ensure_type2_patient_study_attributes(datasets: list[Dataset]) -> list[str]:
+    """Add any missing Type 2 patient/study attribute to every dataset as an empty value.
+
+    Returns the names that were missing on the first dataset, for the log.
+    """
+    missing = [name for name in _TYPE2_PATIENT_STUDY_ATTRIBUTES if name not in datasets[0]]
+    for dataset in datasets:
+        for name in _TYPE2_PATIENT_STUDY_ATTRIBUTES:
+            if name not in dataset:
+                setattr(dataset, name, "")
+    if missing:
+        logger.info("source series lacks %s (de-identified?); SEG carries them empty", ", ".join(missing))
+    return missing
+
+
 def write_dicom_seg(
     mask_path: Path,
     dicom_dir: Path,
@@ -122,6 +147,7 @@ def write_dicom_seg(
     from pydicom.sr.codedict import codes
 
     datasets = load_series(dicom_dir)
+    ensure_type2_patient_study_attributes(datasets)
     frames = align_mask_to_series(nib.load(str(mask_path)), datasets)
 
     present = [int(v) for v in np.unique(frames) if v != 0]
