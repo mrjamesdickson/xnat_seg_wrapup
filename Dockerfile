@@ -12,4 +12,7 @@ RUN pip install --no-cache-dir --no-deps /opt/seg-wrapup
 LABEL org.nrg.commands="[{\"name\":\"seg-wrapup\",\"description\":\"Post-process segmentation output: volumetrics report, ITK-SNAP/Slicer label files, DICOM SEG when the parent copied its source DICOM to /output/.source_dicom\",\"version\":\"0.1.0\",\"type\":\"docker-wrapup\",\"image\":\"xnatworks/seg-wrapup:0.1.0\",\"command-line\":\"seg-wrapup\",\"mounts\":[],\"inputs\":[],\"outputs\":[],\"xnat\":[]}]"
 
 RUN mkdir -p /input /output
-ENTRYPOINT ["seg-wrapup"]
+# No ENTRYPOINT: the Container Service runs a wrapup with its own command-line
+# (here "seg-wrapup") and cannot override an entrypoint, so an entrypoint would
+# make the container run "seg-wrapup seg-wrapup" and fail on argument parsing.
+CMD ["seg-wrapup"]

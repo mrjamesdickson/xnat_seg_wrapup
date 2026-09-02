@@ -33,6 +33,10 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   the `org.nrg.commands` label in the Dockerfile; or `POST /xapi/commands` with
   `commands/seg-wrapup.json`.
 - A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.1.0"`.
+- CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
+  This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
+  entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
+  live run.
 
 ### The DICOM SEG needs the source series
 
