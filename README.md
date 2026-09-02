@@ -32,6 +32,13 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   image must already be registered as a command. Pulling the image registers it from
   the `org.nrg.commands` label in the Dockerfile; or `POST /xapi/commands` with
   `commands/seg-wrapup.json`.
+- The wrapup never sees the parent's *input mounts* (e.g. the source DICOM); if it
+  needs those files the parent command-line copies them into its own output mount.
+  It **does** receive the parent's resolved `environment-variables` (CS copies them
+  onto the wrapup container) and its `command-line` is resolved against the parent's
+  replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
+  derived inputs can therefore hand the launch context to the wrapup as
+  `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
 - A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.1.0"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
