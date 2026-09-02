@@ -17,3 +17,4 @@ Runs as a Container Service wrapup command; upstream model images stay untouched
 | R9 | LABELMAP segmentation type (DICOM 2024) to shrink multi-structure SEGs; keep BINARY where the viewer cannot read LABELMAP | Not started | OHIF support to be verified first |
 | R10 | Register the SEG as an ROI collection so OHIF lists it (`/xapi/roi/...`) | **Done** | Context arrives as environment from the parent's derived inputs (`SEG_PROJECT`, `SEG_SESSION_ID`, `SEG_SCAN_ID`) plus CS's `XNAT_*`; failure logged, not fatal |
 | R11 | RTStruct output option | Not started | |
+| R12 | Merge one-multilabel-map-per-model outputs (MOOSE) with label offsets; per-mask sidecar label files; MOOSE `organ_indices.json` format | **Done** (0.2.0) | Eight tests in `tests/test_multilabel_merge.py` |

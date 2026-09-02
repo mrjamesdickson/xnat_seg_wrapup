@@ -19,9 +19,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
-from .labels import collect_labels, discover_labels, itksnap_label_file, load_labels, slicer_color_table
+from .labels import collect_labels, discover_labels, itksnap_label_file, load_labels, sidecar_labels, slicer_color_table
 from .report import render_html
-from .volumes import find_masks, looks_like_binary_set, measure_mask, merge_binary_masks
+from .volumes import find_masks, looks_like_binary_set, measure_mask, merge_binary_masks, merge_label_maps
 
 logger = logging.getLogger("seg-wrapup")
 
@@ -84,6 +84,11 @@ def run(args: argparse.Namespace) -> int:
     logger.info("label table: %d entries from %s", len(label_table), label_source or "none")
 
     merge = args.merge == "yes" or (args.merge == "auto" and looks_like_binary_set(masks))
+    # Several multilabel maps, each with its own label table beside it (one model each):
+    # merge them with offsets so one SEG and one report cover the whole launch.
+    sidecars = [sidecar_labels(mask) for mask in masks]
+    merge_maps = (args.merge != "no" and not merge and len(masks) > 1
+                  and all(table for table, _ in sidecars))
     delivered: list[Path] = []
     manifest: dict = {
         "wrapup_version": __version__,
@@ -105,7 +110,25 @@ def run(args: argparse.Namespace) -> int:
             label_table = {**label_table, **merged_table}
             delivered.append(merged_path)
             manifest["merged_labels"] = merged_table
-    if not merge:
+    if merge_maps:
+        merged_path = output_dir / MERGED_MASK_NAME
+        try:
+            merged_table = merge_label_maps(masks, [table for table, _ in sidecars], merged_path)
+        except ValueError as error:
+            logger.error("multilabel merge failed, delivering maps unmerged: %s", error)
+            merge_maps = False
+        else:
+            label_table = {**label_table, **merged_table}
+            delivered.append(merged_path)
+            manifest["merged"] = True
+            manifest["merged_label_maps"] = [str(m.relative_to(input_dir)) for m in masks]
+            manifest["label_source"] = ", ".join(str(p.name) for _, p in sidecars if p)
+            logger.info("merged %d label maps (%s) into %s", len(masks), manifest["label_source"], MERGED_MASK_NAME)
+    elif len(masks) == 1 and not label_table and sidecars[0][0]:
+        label_table, label_source = sidecars[0]
+        manifest["label_source"] = str(label_source)
+        logger.info("label table: %d entries from sidecar %s", len(label_table), label_source.name)
+    if not merge and not merge_maps:
         for mask in masks:
             destination = output_dir / mask.name
             if destination.exists():

@@ -92,6 +92,15 @@ def load_label_csv(path: Path) -> LabelTable:
     return table
 
 
+def load_organ_indices_json(path: Path) -> LabelTable:
+    """MOOSE ``*_organ_indices.json``: ``{"organ_indices": {"1": {"name": ..., "SNOMED": {...}}}}``."""
+    data = json.loads(path.read_text())
+    indices = data.get("organ_indices")
+    if not isinstance(indices, dict):
+        raise ValueError(f"{path}: no 'organ_indices' mapping")
+    return _clean_names({key: (value.get("name") if isinstance(value, dict) else value) for key, value in indices.items()})
+
+
 def load_labels(path: Path) -> LabelTable:
     """Read any supported label file. Raises ValueError when the file cannot be parsed."""
     name = path.name.lower()
@@ -100,6 +109,8 @@ def load_labels(path: Path) -> LabelTable:
             return load_nnunet_dataset_json(path)
         if name == "metadata.json":
             return load_monai_metadata_json(path)
+        if name.endswith("organ_indices.json"):
+            return load_organ_indices_json(path)
         if name.endswith(".json"):
             return _from_mapping(json.loads(path.read_text()))
         if name.endswith(".csv"):
@@ -123,6 +134,39 @@ def discover_labels(search_dir: Path) -> tuple[LabelTable, Path | None]:
             if table:
                 return table, candidate
     return {}, None
+
+
+def sidecar_labels(mask_path: Path) -> tuple[LabelTable, Path | None]:
+    """A label file that belongs to one mask: same directory, longest shared filename prefix.
+
+    Tools that run several models write one mask and one label file per model side by
+    side (MOOSE: ``clin_CT_organs_segmentation_X.nii.gz`` next to
+    ``clin_CT_organs_organ_indices.json``). The shared prefix pairs them without any
+    tool-specific naming rule; at least four characters must match so ``labels.json``
+    beside ``liver.nii.gz`` is not mistaken for a sidecar.
+    """
+    best: tuple[int, Path] | None = None
+    stem = mask_path.name
+    for candidate in sorted(mask_path.parent.iterdir()):
+        if candidate == mask_path or not candidate.is_file():
+            continue
+        if not candidate.name.lower().endswith((".json", ".txt", ".csv")):
+            continue
+        shared = 0
+        for a, b in zip(stem, candidate.name):
+            if a != b:
+                break
+            shared += 1
+        if shared >= 4 and (best is None or shared > best[0]):
+            best = (shared, candidate)
+    if best is None:
+        return {}, None
+    try:
+        table = load_labels(best[1])
+    except ValueError as error:
+        logger.warning("Ignoring sidecar %s for %s: %s", best[1].name, mask_path.name, error)
+        return {}, None
+    return table, best[1]
 
 
 def without_background(table: LabelTable) -> LabelTable:

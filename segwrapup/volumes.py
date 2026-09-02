@@ -129,6 +129,47 @@ def merge_binary_masks(mask_paths: list[Path], out_path: Path, label_names: Labe
     return table
 
 
+def merge_label_maps(mask_paths: list[Path], tables: list[LabelTable], out_path: Path) -> LabelTable:
+    """Combine several multilabel maps into one by offsetting each map's labels.
+
+    Used when one launch ran several models that each number their structures from 1
+    (MOOSE). Maps are merged in the given order; map ``k``'s labels are shifted by the
+    highest label used so far, so every structure keeps a unique index and its name.
+    Later maps win where structures overlap; overlaps are logged.
+    """
+    if len(mask_paths) != len(tables) or not mask_paths:
+        raise ValueError("merge_label_maps needs one label table per mask")
+    merged: np.ndarray | None = None
+    reference: nib.Nifti1Image | None = None
+    combined: LabelTable = {}
+    offset = 0
+    for path, table in zip(mask_paths, tables):
+        data, image = load_label_array(path)
+        if merged is None:
+            merged = np.zeros(data.shape, dtype=np.uint16)
+            reference = image
+        elif data.shape != merged.shape:
+            raise ValueError(f"{path.name}: shape {data.shape} differs from first mask {merged.shape}")
+        present = [int(v) for v in np.unique(data) if v != 0]
+        if not present:
+            logger.warning("%s contains no labels; skipped in merge", path.name)
+            continue
+        foreground = data > 0
+        overlap = int((foreground & (merged > 0)).sum())
+        if overlap:
+            logger.warning("%s overlaps %d voxels already labelled; later map wins", path.name, overlap)
+        merged[foreground] = (data[foreground].astype(np.int64) + offset).astype(np.uint16)
+        for label in present:
+            combined[label + offset] = table.get(label, f"{structure_name_from_filename(path)} label {label}")
+        for label, name in table.items():
+            if label != 0 and (label + offset) not in combined:
+                combined[label + offset] = name
+        offset += max(max(present), max(table, default=0))
+    assert merged is not None and reference is not None
+    nib.save(nib.Nifti1Image(merged, reference.affine, reference.header), str(out_path))
+    return combined
+
+
 _BINARY_LIKE = re.compile(r"^[01]$")
 
 
