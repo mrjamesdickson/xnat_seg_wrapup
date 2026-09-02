@@ -84,9 +84,23 @@ overlaps, and overlaps are logged.
 
 ## Example parent command
 
-`commands/examples/totalsegmentator-with-wrapup.json` shows a parent command on the
-upstream `wasserth/totalsegmentator` image using this wrapup. **It is an example,
-not yet run against a live XNAT.**
+`commands/examples/totalsegmentator-with-wrapup.json` is a parent command on the
+upstream `wasserth/totalsegmentator:2.18.0` image using this wrapup, run live on
+demo02 (command 675, wrapper 821) on 2026-09-02. Two things it encodes that cost
+a launch each to learn:
+
+- `override-entrypoint: true` makes the Container Service run the command line as
+  `/bin/sh -c "<command-line>"`, so `&&` chains work and you must **not** wrap the
+  line in your own `sh -c`.
+- Upstream images that are not built on a PyTorch/NVIDIA base do not set
+  `NVIDIA_VISIBLE_DEVICES`, and without it the nvidia runtime exposes no GPU: the
+  first run reported "No GPU detected. Running on CPU." Set
+  `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=compute,utility` in
+  the command's `environment-variables`.
+
+The label table is produced inside the model container from TotalSegmentator's own
+`class_map`, so the report names all 117 structures without a copy of the map in
+this repo.
 
 ## Development
 

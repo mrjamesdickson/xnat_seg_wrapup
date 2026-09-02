@@ -1,38 +1,93 @@
 {
   "name": "totalsegmentator-ct",
-  "description": "EXAMPLE (not yet run): upstream TotalSegmentator on a DICOM scan with seg-wrapup for report, label files and DICOM SEG",
-  "version": "2.18.0-example",
+  "label": "TotalSegmentator (upstream image + seg-wrapup)",
+  "description": "Upstream TotalSegmentator on a DICOM scan; seg-wrapup adds the volumetrics report, label files and DICOM SEG",
+  "version": "2.18.0",
+  "schema-version": "1.0",
+  "info-url": "https://github.com/wasserth/TotalSegmentator",
   "type": "docker",
   "image": "wasserth/totalsegmentator:2.18.0",
   "runtime": "nvidia",
-  "command-line": "sh -c 'TotalSegmentator -i /input -o /output/seg --ml --statistics --task #TASK# && cp -r /input /output/.source_dicom'",
+  "limit-memory": 16384,
+  "override-entrypoint": true,
+  "command-line": "TotalSegmentator -i /input -o /output/segmentation.nii.gz --ml --statistics --task #TASK# && python -c \"import json,sys; from totalsegmentator.map_to_binary import class_map; json.dump({str(k): v for k, v in class_map[sys.argv[1]].items()}, open('/output/labels.json', 'w'))\" #TASK# && cp -r /input /output/.source_dicom",
   "environment-variables": {
     "SEG_MODEL_NAME": "TotalSegmentator",
-    "SEG_MODEL_VERSION": "2.18.0"
+    "SEG_MODEL_VERSION": "2.18.0",
+    "NVIDIA_VISIBLE_DEVICES": "all",
+    "NVIDIA_DRIVER_CAPABILITIES": "compute,utility"
   },
   "mounts": [
-    {"name": "input-mount", "writable": false, "path": "/input"},
-    {"name": "output-mount", "writable": true, "path": "/output"}
+    {
+      "name": "input-mount",
+      "writable": false,
+      "path": "/input"
+    },
+    {
+      "name": "output-mount",
+      "writable": true,
+      "path": "/output"
+    }
   ],
   "inputs": [
-    {"name": "task", "description": "TotalSegmentator task", "type": "string", "default-value": "total", "replacement-key": "#TASK#"}
+    {
+      "name": "task",
+      "label": "Task",
+      "description": "TotalSegmentator task (total, total_mr, lung_vessels, ...)",
+      "type": "string",
+      "default-value": "total",
+      "required": true,
+      "replacement-key": "#TASK#"
+    }
   ],
   "outputs": [
-    {"name": "segmentation", "description": "Label map, statistics and the copied source series for the wrapup", "mount": "output-mount", "required": true}
+    {
+      "name": "segmentation",
+      "description": "Label map, statistics.json, labels.json and the copied source series for the wrapup",
+      "mount": "output-mount",
+      "required": true
+    }
   ],
   "xnat": [
     {
       "name": "totalsegmentator-ct-scan",
-      "description": "Run TotalSegmentator on a scan's DICOM resource",
-      "contexts": ["xnat:imageScanData"],
+      "label": "TotalSegmentator on scan (DICOM)",
+      "description": "Run TotalSegmentator on a scan's DICOM resource; output lands on the scan as TOTALSEG",
+      "contexts": [
+        "xnat:imageScanData"
+      ],
       "external-inputs": [
-        {"name": "scan", "type": "Scan", "required": true, "matcher": "'DICOM' in @.resources[*].label"}
+        {
+          "name": "scan",
+          "description": "Scan with a DICOM resource",
+          "type": "Scan",
+          "required": true,
+          "matcher": "'DICOM' in @.resources[*].label",
+          "load-children": true
+        }
       ],
       "derived-inputs": [
-        {"name": "dicom", "type": "Resource", "derived-from-wrapper-input": "scan", "provides-files-for-command-mount": "input-mount", "matcher": "@.label == 'DICOM'"}
+        {
+          "name": "scan-dicom",
+          "description": "The DICOM resource on the scan",
+          "type": "Resource",
+          "required": true,
+          "derived-from-wrapper-input": "scan",
+          "provides-files-for-command-mount": "input-mount",
+          "matcher": "@.label == 'DICOM'",
+          "load-children": true,
+          "multiple": false
+        }
       ],
       "output-handlers": [
-        {"name": "seg-resource", "accepts-command-output": "segmentation", "via-wrapup-command": "xnatworks/seg-wrapup:0.1.0", "as-a-child-of": "scan", "type": "Resource", "label": "TOTALSEG"}
+        {
+          "name": "seg-resource",
+          "accepts-command-output": "segmentation",
+          "via-wrapup-command": "xnatworks/seg-wrapup:0.1.0",
+          "as-a-child-of": "scan",
+          "type": "Resource",
+          "label": "TOTALSEG"
+        }
       ]
     }
   ]
