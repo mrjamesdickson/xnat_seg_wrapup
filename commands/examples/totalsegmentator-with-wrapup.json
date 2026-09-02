@@ -15,7 +15,10 @@
     "SEG_MODEL_NAME": "TotalSegmentator",
     "SEG_MODEL_VERSION": "2.18.0",
     "NVIDIA_VISIBLE_DEVICES": "all",
-    "NVIDIA_DRIVER_CAPABILITIES": "compute,utility"
+    "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+    "SEG_PROJECT": "#PROJECT_ID#",
+    "SEG_SESSION_ID": "#SESSION_ID#",
+    "SEG_SCAN_ID": "#SCAN_ID#"
   },
   "mounts": [
     {
@@ -38,6 +41,30 @@
       "default-value": "total",
       "required": true,
       "replacement-key": "#TASK#"
+    },
+    {
+      "name": "project-id",
+      "description": "XNAT project ID (derived)",
+      "type": "string",
+      "required": true,
+      "user-settable": false,
+      "replacement-key": "#PROJECT_ID#"
+    },
+    {
+      "name": "session-id",
+      "description": "XNAT session ID (derived)",
+      "type": "string",
+      "required": true,
+      "user-settable": false,
+      "replacement-key": "#SESSION_ID#"
+    },
+    {
+      "name": "scan-id",
+      "description": "Scan ID (derived)",
+      "type": "string",
+      "required": true,
+      "user-settable": false,
+      "replacement-key": "#SCAN_ID#"
     }
   ],
   "outputs": [
@@ -76,6 +103,54 @@
           "provides-files-for-command-mount": "input-mount",
           "matcher": "@.label == 'DICOM'",
           "load-children": true,
+          "multiple": false
+        },
+        {
+          "name": "session",
+          "type": "Session",
+          "required": true,
+          "user-settable": false,
+          "load-children": true,
+          "derived-from-wrapper-input": "scan",
+          "multiple": false
+        },
+        {
+          "name": "project",
+          "type": "Project",
+          "required": true,
+          "user-settable": false,
+          "load-children": true,
+          "derived-from-wrapper-input": "session",
+          "multiple": false
+        },
+        {
+          "name": "project-id",
+          "type": "string",
+          "required": true,
+          "user-settable": false,
+          "provides-value-for-command-input": "project-id",
+          "derived-from-wrapper-input": "project",
+          "derived-from-xnat-object-property": "id",
+          "multiple": false
+        },
+        {
+          "name": "session-id",
+          "type": "string",
+          "required": true,
+          "user-settable": false,
+          "provides-value-for-command-input": "session-id",
+          "derived-from-wrapper-input": "session",
+          "derived-from-xnat-object-property": "id",
+          "multiple": false
+        },
+        {
+          "name": "scan-id",
+          "type": "string",
+          "required": true,
+          "user-settable": false,
+          "provides-value-for-command-input": "scan-id",
+          "derived-from-wrapper-input": "scan",
+          "derived-from-xnat-object-property": "id",
           "multiple": false
         }
       ],

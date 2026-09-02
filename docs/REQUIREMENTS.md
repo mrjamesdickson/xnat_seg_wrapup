@@ -15,5 +15,5 @@ Runs as a Container Service wrapup command; upstream model images stay untouched
 | R7 | DICOM SEG from the mask and the source series when the parent copied it to `/output/.source_dicom`; masks on a different grid refused, never resampled | **Done** | BINARY type; a 117-segment × 203-frame SEG is ~116 MB. LABELMAP encoding would be far smaller: see R9 |
 | R8 | Failure policy: no mask → fail; report/label/SEG failure → logged, masks still delivered | **Done** | Tested |
 | R9 | LABELMAP segmentation type (DICOM 2024) to shrink multi-structure SEGs; keep BINARY where the viewer cannot read LABELMAP | Not started | OHIF support to be verified first |
-| R10 | Register the SEG as an ROI collection so OHIF lists it (`/xapi/roi/...`) | Not started | Needs project/session, which a wrapup does not receive |
+| R10 | Register the SEG as an ROI collection so OHIF lists it (`/xapi/roi/...`) | **Done** | Context arrives as environment from the parent's derived inputs (`SEG_PROJECT`, `SEG_SESSION_ID`, `SEG_SCAN_ID`) plus CS's `XNAT_*`; failure logged, not fatal |
 | R11 | RTStruct output option | Not started | |

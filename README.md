@@ -52,8 +52,16 @@ clear error rather than resampled; a silently resampled overlay is worse than no
 Sparse label values are renumbered to consecutive DICOM segment numbers; the mapping
 is in `wrapup.json`.
 
-Registering the SEG as an ROI collection so OHIF lists it (`/xapi/roi/...`) is not
-done here yet; the file lands in the resource. See "Not yet" below.
+### The SEG is registered with OHIF when the context is present
+
+When the environment carries `SEG_PROJECT` and `SEG_SESSION_ID` (from the parent's
+derived inputs, see above) plus the `XNAT_HOST`/`XNAT_USER`/`XNAT_PASS` that CS
+injects, the wrapup `PUT`s the SEG to
+`/xapi/roi/projects/{project}/sessions/{session}/collections/{label}?type=SEG&overwrite=true`,
+which is what the OHIF viewer plugin lists as an ROI collection. The label is
+`<model>_scan<id>_<UTC stamp>` unless `--roi-label` / `SEG_ROI_LABEL` is set. A
+registration failure is logged and recorded in `wrapup.json`; the SEG file still
+ships in the resource. `--no-register` turns it off.
 
 ## Failure policy
 
@@ -67,7 +75,7 @@ segmentation stranded in a build directory is not.
 ```
 seg-wrapup [--input /input] [--output /output] [--model NAME] [--model-version V]
            [--labels FILE] [--source-dicom DIR] [--merge auto|yes|no] [--no-dicom-seg]
-           [--session LABEL] [--scan ID]
+           [--session LABEL] [--scan ID] [--no-register] [--roi-label LABEL]
 ```
 
 Every flag has an environment variable (`SEG_INPUT`, `SEG_OUTPUT`, `SEG_MODEL_NAME`,
@@ -121,10 +129,6 @@ CLI's failure policy, and that the Dockerfile label matches `commands/seg-wrapup
 
 ## Not yet
 
-- ROI collection registration for OHIF (`POST /xapi/roi/projects/{p}/sessions/{s}/collections?type=SEG`).
-  Needs project and session, which a wrapup does not receive; the plan is a
-  `--register` mode driven by `XNAT_HOST`/`XNAT_USER`/`XNAT_PASS` plus session and
-  scan passed through parent command-line substitution.
 - RTStruct output.
 - Resampling masks on a different grid (deliberately refused).
 

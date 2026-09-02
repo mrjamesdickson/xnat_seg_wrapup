@@ -44,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--merge", choices=("auto", "yes", "no"), default=os.environ.get("SEG_MERGE", "auto"),
                         help="merge one-file-per-structure binary masks into one label map (auto: when detected)")
     parser.add_argument("--no-dicom-seg", action="store_true", help="skip DICOM SEG even if source DICOM is present")
+    parser.add_argument("--no-register", action="store_true",
+                        help="do not register the DICOM SEG as an XNAT ROI collection even when the context is present")
+    parser.add_argument("--roi-label", default=os.environ.get("SEG_ROI_LABEL", ""),
+                        help="ROI collection label; default <model>_scan<id>_<timestamp>")
     parser.add_argument("--session", default=os.environ.get("SEG_SESSION_LABEL", ""))
     parser.add_argument("--scan", default=os.environ.get("SEG_SCAN_ID", ""))
     return parser
@@ -142,13 +146,16 @@ def run(args: argparse.Namespace) -> int:
     else:
         from .dicomseg import write_dicom_seg
 
+        seg_path = output_dir / "segmentation.seg.dcm"
         try:
             manifest["dicom_seg"] = write_dicom_seg(
-                delivered[0], source_dicom, label_table, output_dir / "segmentation.seg.dcm",
+                delivered[0], source_dicom, label_table, seg_path,
                 model_name=args.model, model_version=args.model_version,
             )
         except Exception as error:  # noqa: BLE001 - SEG is additive; masks and report still ship
             logger.error("DICOM SEG not written for %s: %s", delivered[0].name, error)
+        else:
+            manifest["roi_collection"] = register_if_possible(args, seg_path)
 
     (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
     for result in results:
@@ -156,6 +163,24 @@ def run(args: argparse.Namespace) -> int:
             logger.info("  %s: %s mL (%s voxels)", item["name"], f"{item['volume_ml']:,.2f}", f"{item['voxels']:,}")
     logger.info("delivered %d mask(s) to %s", len(delivered), output_dir)
     return 0
+
+
+def register_if_possible(args: argparse.Namespace, seg_path: Path) -> dict | None:
+    """Register the SEG as an ROI collection when the parent passed the XNAT context. Never raises."""
+    from .register import XnatContext, collection_label, register_roi_collection
+
+    if args.no_register:
+        logger.info("ROI registration skipped by flag")
+        return None
+    context = XnatContext.from_env()
+    if context is None:
+        return None
+    label = args.roi_label.strip() or collection_label(args.model, context.scan or args.scan)
+    try:
+        return register_roi_collection(context, seg_path, label)
+    except RuntimeError as error:
+        logger.error("ROI collection not registered; the SEG file is still in the resource: %s", error)
+        return {"label": label, "error": str(error)}
 
 
 def write_report_files(output_dir: Path, report: dict, label_table: dict, results: list[dict]) -> None:
