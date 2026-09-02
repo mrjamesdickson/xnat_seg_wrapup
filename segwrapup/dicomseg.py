@@ -143,8 +143,11 @@ def write_dicom_seg(
     renumbered; the returned mapping records ``segment_number -> original label``.
     """
     import highdicom as hd
+    from highdicom.color import CIELabColor
     from highdicom.sr.coding import Code
     from pydicom.sr.codedict import codes
+
+    from .labels import label_color
 
     datasets = load_series(dicom_dir)
     ensure_type2_patient_study_attributes(datasets)
@@ -171,6 +174,10 @@ def write_dicom_seg(
                 algorithm_identification=hd.AlgorithmIdentificationSequence(
                     name=model_name[:64], family=codes.DCM.ArtificialIntelligence, version=model_version[:64]
                 ),
+                # RecommendedDisplayCIELabValue: the same colour as the report chips and
+                # the ITK-SNAP / Slicer / BIDS label files, so OHIF and other SEG
+                # consumers show the structure the way the rest of the resource does.
+                display_color=CIELabColor.from_rgb(*label_color(label)),
             )
         )
 

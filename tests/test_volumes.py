@@ -93,3 +93,39 @@ def test_single_multilabel_file_is_not_a_binary_set(tmp_path):
     paths = [write_mask(tmp_path / "seg.nii.gz", data), write_mask(tmp_path / "other.nii.gz", data)]
     assert not volumes.looks_like_binary_set(paths)
     assert not volumes.looks_like_binary_set(paths[:1])
+
+
+def _write_uint16_mask(path, array):
+    import nibabel as nib
+    nib.save(nib.Nifti1Image(array.astype(np.uint16), np.eye(4)), str(path))
+    return path
+
+
+def test_uint8_companion_needed_only_above_255(tmp_path):
+    small = write_mask(tmp_path / "small.nii.gz", np.full((4, 4, 4), 7, dtype=np.uint8))
+    big = _write_uint16_mask(tmp_path / "big.nii.gz", np.full((4, 4, 4), 1101))
+    assert volumes.needs_uint8_companion(small) is False
+    assert volumes.needs_uint8_companion(big) is True
+
+
+def test_uint8_companion_renumbers_sorted_present_labels(tmp_path):
+    data = np.zeros((6, 6, 6), dtype=np.uint16)
+    data[:2] = 7201
+    data[2:4] = 1101
+    data[4:5] = 6121
+    source = _write_uint16_mask(tmp_path / "image_dseg.nii.gz", data)
+
+    mapping = volumes.write_uint8_companion(source, tmp_path / "image_dseg_uint8.nii.gz")
+
+    assert mapping == {1: 1101, 2: 6121, 3: 7201}
+    out, image = volumes.load_label_array(tmp_path / "image_dseg_uint8.nii.gz")
+    assert image.get_data_dtype() == np.uint8
+    assert sorted(int(v) for v in np.unique(out)) == [0, 1, 2, 3]
+    assert (out[:2] == 3).all() and (out[2:4] == 1).all() and (out[4:5] == 2).all()
+
+
+def test_uint8_companion_refuses_more_than_255_labels(tmp_path):
+    data = np.arange(1, 257, dtype=np.uint16).reshape(16, 16, 1) * 10
+    source = _write_uint16_mask(tmp_path / "many.nii.gz", data)
+    with pytest.raises(ValueError, match="more than a byte"):
+        volumes.write_uint8_companion(source, tmp_path / "many_uint8.nii.gz")

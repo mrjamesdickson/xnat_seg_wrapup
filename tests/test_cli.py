@@ -140,3 +140,42 @@ def test_command_json_matches_dockerfile_label():
     assert command["type"] == "docker-wrapup"
     assert command["mounts"] == [] and command["inputs"] == [] and command["outputs"] == []
     assert command["image"].startswith("xnatworks/seg-wrapup:")
+
+
+def test_viewer_sidecars_tsv_and_uint8_companion_for_large_labels(tmp_path):
+    import nibabel as nib
+    inp, out = tmp_path / "in", tmp_path / "out"
+    inp.mkdir()
+    data = np.zeros((8, 8, 8), dtype=np.uint16)
+    data[:4] = 7201
+    data[4:6] = 1101
+    nib.save(nib.Nifti1Image(data, np.eye(4)), str(inp / "image_dseg.nii.gz"))
+    (inp / "labels.json").write_text(json.dumps({"1101": "Left Levator Scapulae", "7201": "Left Adductor Magnus"}))
+
+    assert run_cli("--input", inp, "--output", out, "--model", "MuscleMap") == 0
+
+    names = {p.name for p in out.iterdir()}
+    assert {"image_dseg.tsv", "image_dseg_uint8.nii.gz", "image_dseg_uint8.tsv"} <= names
+    tsv = (out / "image_dseg.tsv").read_text().splitlines()
+    assert tsv[0] == "index\tname\tcolor" and tsv[1].startswith("1101\tLeft Levator Scapulae\t#")
+    uint8_tsv = (out / "image_dseg_uint8.tsv").read_text().splitlines()
+    assert uint8_tsv[1].startswith("1\tLeft Levator Scapulae\t#") and uint8_tsv[2].startswith("2\tLeft Adductor Magnus\t#")
+    assert uint8_tsv[1].split("\t")[2] == tsv[1].split("\t")[2]  # same colour as the original value
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["uint8_companions"]["image_dseg_uint8.nii.gz"]["labels"] == {"1": 1101, "2": 7201}
+
+
+def test_viewer_sidecars_no_companion_for_byte_labels(tmp_path):
+    inp, out = tmp_path / "in", tmp_path / "out"
+    inp.mkdir()
+    data = np.zeros((8, 8, 8), dtype=np.uint8)
+    data[:4] = 2
+    write_mask(inp / "case_seg.nii.gz", data)
+    (inp / "labels.json").write_text(json.dumps({"2": "liver"}))
+
+    assert run_cli("--input", inp, "--output", out) == 0
+
+    names = {p.name for p in out.iterdir()}
+    assert "case_seg.tsv" in names
+    assert not any(n.endswith("_uint8.nii.gz") for n in names)  # control
+    assert "uint8_companions" not in json.loads((out / "wrapup.json").read_text())

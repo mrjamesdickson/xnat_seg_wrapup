@@ -151,3 +151,19 @@ def test_ensure_type2_attributes_reports_missing_and_keeps_present_values(ct_ser
     assert missing == ["PatientBirthDate", "AccessionNumber"]
     assert all(ds.PatientBirthDate == "" and ds.AccessionNumber == "" for ds in datasets)
     assert all(ds.PatientID == "WRAPUP001" for ds in datasets)
+
+
+def test_write_dicom_seg_sets_recommended_display_colour_per_segment(ct_series, tmp_path, read_dicom):
+    directory, _ = ct_series
+    mask = write_mask(tmp_path / "mask.nii.gz", blob_mask(), affine=series_ras_affine())
+    out = tmp_path / "out" / "segmentation.seg.dcm"
+
+    dicomseg.write_dicom_seg(mask, directory, {3: "spleen", 7: "marker"}, out, model_name="m")
+
+    seg = read_dicom(out)
+    colours = [list(s.RecommendedDisplayCIELabValue) for s in seg.SegmentSequence]
+    assert len(colours) == 2 and colours[0] != colours[1]
+    from highdicom.color import CIELabColor
+    from segwrapup.labels import label_color
+    expected = CIELabColor.from_rgb(*label_color(3)).value
+    assert colours[0] == list(expected)

@@ -225,6 +225,24 @@ def slicer_color_table(labels: LabelTable) -> str:
     return "\n".join(lines) + "\n"
 
 
+def bids_dseg_tsv(labels: LabelTable, colour_source: dict[int, int] | None = None) -> str:
+    """BIDS ``_dseg.tsv`` lookup: ``index``, ``name``, ``color`` (#rrggbb).
+
+    This is the sidecar viewers such as the XNAT workbench read automatically for a
+    label map (``foo.nii.gz`` -> ``foo.tsv``). ``colour_source`` maps an index to the
+    label whose colour it should carry, so a renumbered 8-bit map keeps the same
+    colours as the original values in the report and the ITK-SNAP file.
+    """
+    lines = ["index\tname\tcolor"]
+    for label in sorted(labels):
+        if label == 0:
+            continue
+        red, green, blue = label_color(colour_source.get(label, label) if colour_source else label)
+        name = labels[label].replace("\t", " ")
+        lines.append(f"{label}\t{name}\t#{red:02x}{green:02x}{blue:02x}")
+    return "\n".join(lines) + "\n"
+
+
 def collect_labels(declared: LabelTable, results: list[dict]) -> LabelTable:
     """Every declared label plus any the masks actually contain.
 

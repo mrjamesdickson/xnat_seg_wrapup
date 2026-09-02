@@ -182,3 +182,35 @@ def looks_like_binary_set(mask_paths: list[Path]) -> bool:
         if not set(np.unique(data).tolist()) <= {0, 1}:
             return False
     return True
+
+
+UINT8_MAX_LABEL = 255
+
+
+def needs_uint8_companion(mask_path: Path) -> bool:
+    """True when the map holds label values a byte cannot represent (e.g. MuscleMap's 1101..8162)."""
+    data, _ = load_label_array(mask_path)
+    return int(data.max()) > UINT8_MAX_LABEL
+
+
+def write_uint8_companion(mask_path: Path, out_path: Path) -> dict[int, int]:
+    """Write ``mask_path`` renumbered to consecutive 1..N as uint8.
+
+    Viewers whose drawing layer is a byte (the XNAT workbench, ITK-SNAP's 8-bit
+    mode) cannot load sparse or large label values, so ship a companion with the
+    same renumbering the DICOM SEG uses (sorted present labels) and return the
+    ``new -> original`` mapping so a label table can be written beside it.
+    """
+    data, image = load_label_array(mask_path)
+    present = [int(v) for v in np.unique(data) if v != 0]
+    if len(present) > UINT8_MAX_LABEL:
+        raise ValueError(f"{mask_path.name}: {len(present)} labels present, more than a byte can hold")
+    renumbered = np.zeros(data.shape, dtype=np.uint8)
+    mapping: dict[int, int] = {}
+    for new_value, original in enumerate(present, start=1):
+        renumbered[data == original] = new_value
+        mapping[new_value] = original
+    out = nib.Nifti1Image(renumbered, image.affine, image.header)
+    out.set_data_dtype(np.uint8)
+    nib.save(out, str(out_path))
+    return mapping

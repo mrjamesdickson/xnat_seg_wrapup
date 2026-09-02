@@ -10,6 +10,8 @@ Any model container that writes a NIfTI mask gets, without changing its image:
 | `report.html` | Self-contained volumetrics report: total volume, structure count, per-structure table with proportional bars; light and dark |
 | `volumes.json` / `volumes.csv` | Machine-readable volumes, voxel size, matrix, voxel counts |
 | `labels.txt` / `labels.ctbl` | ITK-SNAP label file and 3D Slicer colour table, same indices and colours as the report chips |
+| `<mask>.tsv` | BIDS `_dseg.tsv` lookup (index, name, #colour) beside each label map; what the XNAT workbench reads for a mask |
+| `<mask>_uint8.nii.gz` / `<mask>_uint8.tsv` | Only when the map holds values above 255 (MuscleMap's 1101…8162): the same map renumbered 1..N as a byte, with its lookup carrying the original colours, for viewers whose drawing layer is 8-bit. The `new → original` mapping is in `wrapup.json` |
 | `segmentation.seg.dcm` | DICOM SEG built from the mask and the source series, when the source DICOM is available (see below) |
 | `wrapup.json` | What the wrapup did: inputs, label source, merge, SEG segment mapping |
 
@@ -39,7 +41,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.2.1"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.2.2"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -57,7 +59,9 @@ The mask is aligned to the series grid by axis permutation and flip only, which 
 what a dcm2niix-derived NIfTI needs. A mask on a different grid is refused with a
 clear error rather than resampled; a silently resampled overlay is worse than none.
 Sparse label values are renumbered to consecutive DICOM segment numbers; the mapping
-is in `wrapup.json`.
+is in `wrapup.json`. Every segment carries `RecommendedDisplayCIELabValue`, the same
+colour as the report chips and the label files, so OHIF shows structures in the
+colours the rest of the resource uses.
 
 ### The SEG is registered with OHIF when the context is present
 
@@ -134,8 +138,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.2.1 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.2.1
+docker build -t xnatworks/seg-wrapup:0.2.2 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.2.2
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the

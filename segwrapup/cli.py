@@ -19,9 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
-from .labels import collect_labels, discover_labels, itksnap_label_file, load_labels, sidecar_labels, slicer_color_table
+from .labels import (bids_dseg_tsv, collect_labels, discover_labels, itksnap_label_file, load_labels,
+                     sidecar_labels, slicer_color_table)
 from .report import render_html
-from .volumes import find_masks, looks_like_binary_set, measure_mask, merge_binary_masks, merge_label_maps
+from .volumes import (find_masks, looks_like_binary_set, measure_mask, merge_binary_masks, merge_label_maps,
+                      needs_uint8_companion, write_uint8_companion)
 
 logger = logging.getLogger("seg-wrapup")
 
@@ -154,6 +156,7 @@ def run(args: argparse.Namespace) -> int:
     if results:
         try:
             write_report_files(output_dir, report, label_table, results)
+            write_viewer_sidecars(output_dir, delivered, collect_labels(label_table, results), manifest)
         except OSError as error:
             logger.error("report files not written: %s", error)
     else:
@@ -221,6 +224,36 @@ def write_report_files(output_dir: Path, report: dict, label_table: dict, result
         (output_dir / "labels.ctbl").write_text(slicer_color_table(labels))
     else:
         logger.warning("no labels to describe; label files skipped")
+
+
+def write_viewer_sidecars(output_dir: Path, delivered: list[Path], labels: dict, manifest: dict) -> None:
+    """Per-mask BIDS ``.tsv`` lookups, plus an 8-bit renumbered companion when the values need it.
+
+    ``foo.nii.gz`` gets ``foo.tsv`` (index, name, #colour), which the XNAT workbench reads
+    beside a label map. A map with values above 255 also gets ``foo_uint8.nii.gz`` and
+    ``foo_uint8.tsv`` so byte-only drawing layers can load it; the mapping back to the
+    original values is recorded in ``wrapup.json``.
+    """
+    if not labels:
+        return
+    companions: dict[str, dict] = {}
+    for mask in delivered:
+        stem = mask.name[:-7] if mask.name.endswith(".nii.gz") else mask.stem
+        (output_dir / f"{stem}.tsv").write_text(bids_dseg_tsv(labels))
+        try:
+            if not needs_uint8_companion(mask):
+                continue
+            companion = output_dir / f"{stem}_uint8.nii.gz"
+            mapping = write_uint8_companion(mask, companion)
+        except ValueError as error:
+            logger.warning("8-bit companion not written for %s: %s", mask.name, error)
+            continue
+        renumbered_labels = {new: labels.get(original, f"label {original}") for new, original in mapping.items()}
+        (output_dir / f"{stem}_uint8.tsv").write_text(bids_dseg_tsv(renumbered_labels, colour_source=mapping))
+        companions[companion.name] = {"source": mask.name, "labels": mapping}
+        logger.info("wrote 8-bit companion %s (%d labels renumbered)", companion.name, len(mapping))
+    if companions:
+        manifest["uint8_companions"] = companions
 
 
 def main(argv: list[str] | None = None) -> int:

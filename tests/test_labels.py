@@ -84,3 +84,20 @@ def test_slicer_table_and_collect_labels():
     assert table == {1: "spleen", 2: "liver", 9: "label 9"}
     ctbl = labels.slicer_color_table({1: "kidney left"})
     assert "1 kidney_left" in ctbl and ctbl.startswith("# Color table file")
+
+
+def test_bids_dseg_tsv_has_index_name_hex_colour_and_skips_background():
+    text = labels.bids_dseg_tsv({0: "background", 3: "spleen", 1101: "Left Levator Scapulae"})
+    lines = text.splitlines()
+    red, green, blue = labels.label_color(3)
+    assert lines[0] == "index\tname\tcolor"
+    assert lines[1] == f"3\tspleen\t#{red:02x}{green:02x}{blue:02x}"
+    assert lines[2].startswith("1101\tLeft Levator Scapulae\t#")
+    assert len(lines) == 3
+
+
+def test_bids_dseg_tsv_colour_source_keeps_original_colour_for_renumbered_index():
+    original = labels.label_color(1101)
+    text = labels.bids_dseg_tsv({1: "Left Levator Scapulae"}, colour_source={1: 1101})
+    assert text.splitlines()[1] == "1\tLeft Levator Scapulae\t#%02x%02x%02x" % original
+    assert labels.label_color(1) != original  # control: the index's own colour would differ
