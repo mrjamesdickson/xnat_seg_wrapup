@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -t xnatworks/seg-wrapup:ci .
       - name: Tests inside the image
-        run: docker run --rm --entrypoint python -v "$PWD/tests:/opt/seg-wrapup/tests" -w /opt/seg-wrapup xnatworks/seg-wrapup:ci -m pytest -q
+        run: docker run --rm --entrypoint python -v "$PWD:/repo" -w /repo xnatworks/seg-wrapup:ci -m pytest -q -p no:cacheprovider
       - name: Entrypoint refuses empty input (proves wiring)
         run: |
           mkdir -p /tmp/empty /tmp/out
