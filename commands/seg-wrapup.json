@@ -1,0 +1,12 @@
+{
+  "name": "seg-wrapup",
+  "description": "Post-process segmentation output: volumetrics report, ITK-SNAP/Slicer label files, DICOM SEG when the parent copied its source DICOM to /output/.source_dicom",
+  "version": "0.1.0",
+  "type": "docker-wrapup",
+  "image": "xnatworks/seg-wrapup:0.1.0",
+  "command-line": "seg-wrapup",
+  "mounts": [],
+  "inputs": [],
+  "outputs": [],
+  "xnat": []
+}

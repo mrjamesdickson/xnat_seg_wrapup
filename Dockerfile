@@ -1,0 +1,15 @@
+FROM python:3.12-slim
+
+# Lightweight: no torch. Only what measuring masks and writing DICOM SEG needs.
+RUN pip install --no-cache-dir "nibabel>=5" "numpy>=1.24" "pydicom>=3" "highdicom>=0.24" "pytest>=8"
+
+COPY pyproject.toml README.md /opt/seg-wrapup/
+COPY segwrapup /opt/seg-wrapup/segwrapup
+RUN pip install --no-cache-dir --no-deps /opt/seg-wrapup
+
+# The Container Service reads wrapup command definitions from this label when the
+# image is pulled. Kept byte-identical to commands/seg-wrapup.json by tests/test_cli.py.
+LABEL org.nrg.commands="[{\"name\":\"seg-wrapup\",\"description\":\"Post-process segmentation output: volumetrics report, ITK-SNAP/Slicer label files, DICOM SEG when the parent copied its source DICOM to /output/.source_dicom\",\"version\":\"0.1.0\",\"type\":\"docker-wrapup\",\"image\":\"xnatworks/seg-wrapup:0.1.0\",\"command-line\":\"seg-wrapup\",\"mounts\":[],\"inputs\":[],\"outputs\":[],\"xnat\":[]}]"
+
+RUN mkdir -p /input /output
+ENTRYPOINT ["seg-wrapup"]

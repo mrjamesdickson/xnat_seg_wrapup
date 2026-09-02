@@ -1,0 +1,39 @@
+{
+  "name": "totalsegmentator-ct",
+  "description": "EXAMPLE (not yet run): upstream TotalSegmentator on a DICOM scan with seg-wrapup for report, label files and DICOM SEG",
+  "version": "2.18.0-example",
+  "type": "docker",
+  "image": "wasserth/totalsegmentator:2.18.0",
+  "runtime": "nvidia",
+  "command-line": "sh -c 'TotalSegmentator -i /input -o /output/seg --ml --statistics --task #TASK# && cp -r /input /output/.source_dicom'",
+  "environment-variables": {
+    "SEG_MODEL_NAME": "TotalSegmentator",
+    "SEG_MODEL_VERSION": "2.18.0"
+  },
+  "mounts": [
+    {"name": "input-mount", "writable": false, "path": "/input"},
+    {"name": "output-mount", "writable": true, "path": "/output"}
+  ],
+  "inputs": [
+    {"name": "task", "description": "TotalSegmentator task", "type": "string", "default-value": "total", "replacement-key": "#TASK#"}
+  ],
+  "outputs": [
+    {"name": "segmentation", "description": "Label map, statistics and the copied source series for the wrapup", "mount": "output-mount", "required": true}
+  ],
+  "xnat": [
+    {
+      "name": "totalsegmentator-ct-scan",
+      "description": "Run TotalSegmentator on a scan's DICOM resource",
+      "contexts": ["xnat:imageScanData"],
+      "external-inputs": [
+        {"name": "scan", "type": "Scan", "required": true, "matcher": "'DICOM' in @.resources[*].label"}
+      ],
+      "derived-inputs": [
+        {"name": "dicom", "type": "Resource", "derived-from-wrapper-input": "scan", "provides-files-for-command-mount": "input-mount", "matcher": "@.label == 'DICOM'"}
+      ],
+      "output-handlers": [
+        {"name": "seg-resource", "accepts-command-output": "segmentation", "via-wrapup-command": "xnatworks/seg-wrapup:0.1.0", "as-a-child-of": "scan", "type": "Resource", "label": "TOTALSEG"}
+      ]
+    }
+  ]
+}

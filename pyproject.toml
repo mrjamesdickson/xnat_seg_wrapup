@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xnat-seg-wrapup"
+version = "0.1.0"
+description = "Shared post-processing for XNAT segmentation containers: volumetrics report, viewer label files, DICOM SEG"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = [
+  "nibabel>=5",
+  "numpy>=1.24",
+  "pydicom>=3",
+  "highdicom>=0.24",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+seg-wrapup = "segwrapup.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["segwrapup*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

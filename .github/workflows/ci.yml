@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test]"
+      - run: python -m pytest -v
+      - name: Command JSON is valid JSON and caret-free
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          for path in pathlib.Path("commands").rglob("*.json"):
+              data = json.loads(path.read_text())
+              assert "^" not in json.dumps(data), f"{path}: caret in command JSON (CS mangles it)"
+              print("ok", path)
+          PY
+
+  image:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t xnatworks/seg-wrapup:ci .
+      - name: Tests inside the image
+        run: docker run --rm --entrypoint python -v "$PWD/tests:/opt/seg-wrapup/tests" -w /opt/seg-wrapup xnatworks/seg-wrapup:ci -m pytest -q
+      - name: Entrypoint refuses empty input (proves wiring)
+        run: |
+          mkdir -p /tmp/empty /tmp/out
+          if docker run --rm -v /tmp/empty:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:ci; then
+            echo "expected failure on empty input" && exit 1
+          fi
+      - name: Image label registers the wrapup command
+        run: |
+          docker inspect xnatworks/seg-wrapup:ci --format '{{index .Config.Labels "org.nrg.commands"}}' | python -c 'import json,sys; c=json.load(sys.stdin)[0]; assert c["type"]=="docker-wrapup", c; print("label ok:", c["name"], c["image"])'
