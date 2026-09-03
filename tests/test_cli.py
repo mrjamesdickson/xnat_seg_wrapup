@@ -148,6 +148,10 @@ def test_command_json_matches_dockerfile_label():
     assert command["version"] == version
     assert command["image"] == f"xnatworks/seg-wrapup:{version}"
 
+    # wrapup.json stamps every result resource with this, so it has to track pyproject too.
+    from segwrapup import __version__
+    assert __version__ == version
+
 
 def test_viewer_sidecars_tsv_and_uint8_companion_for_large_labels(tmp_path):
     import nibabel as nib
