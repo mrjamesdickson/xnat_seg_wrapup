@@ -141,6 +141,44 @@ def test_command_json_matches_dockerfile_label():
     assert command["mounts"] == [] and command["inputs"] == [] and command["outputs"] == []
     assert command["image"].startswith("xnatworks/seg-wrapup:")
 
+    # Both must track the package version, or the image advertises a stale version of itself
+    # to the Container Service while shipping newer code.
+    version = next(line.split('"')[1] for line in (root / "pyproject.toml").read_text().splitlines()
+                   if line.startswith("version = "))
+    assert command["version"] == version
+    assert command["image"] == f"xnatworks/seg-wrapup:{version}"
+
+    # wrapup.json stamps every result resource with this, so it has to track pyproject too.
+    from segwrapup import __version__
+    assert __version__ == version
+
+    # Anything that selects the image by tag has to move with it, or a user following the
+    # README or registering the supplied example parent command silently runs the old image.
+    stale = []
+    for path in [root / "README.md", *(root / "commands").rglob("*.json")]:
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            if "xnatworks/seg-wrapup:" in line and f"xnatworks/seg-wrapup:{version}" not in line:
+                stale.append(f"{path.relative_to(root)}:{number}")
+    assert not stale, f"stale seg-wrapup image tags: {stale}"
+
+
+def test_boolean_flags_read_the_environment(monkeypatch):
+    """CS fixes the wrapup command line, so per-run switches can only arrive as env vars."""
+    for name in ("SEG_NO_DICOM_SEG", "SEG_NO_REGISTER", "SEG_KEEP_SEG_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    assert cli.build_parser().parse_args([]).keep_seg_file is False
+
+    monkeypatch.setenv("SEG_KEEP_SEG_FILE", "true")
+    monkeypatch.setenv("SEG_NO_REGISTER", "1")
+    monkeypatch.setenv("SEG_NO_DICOM_SEG", "yes")
+    args = cli.build_parser().parse_args([])
+    assert args.keep_seg_file is True and args.no_register is True and args.no_dicom_seg is True
+
+    monkeypatch.setenv("SEG_KEEP_SEG_FILE", "false")
+    assert cli.build_parser().parse_args([]).keep_seg_file is False
+    # An explicit flag still wins over an unset or falsey environment.
+    assert cli.build_parser().parse_args(["--keep-seg-file"]).keep_seg_file is True
+
 
 def test_viewer_sidecars_tsv_and_uint8_companion_for_large_labels(tmp_path):
     import nibabel as nib

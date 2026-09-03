@@ -12,7 +12,7 @@ Any model container that writes a NIfTI mask gets, without changing its image:
 | `labels.txt` / `labels.ctbl` | ITK-SNAP label file and 3D Slicer colour table, same indices and colours as the report chips |
 | `<mask>.tsv` | BIDS `_dseg.tsv` lookup (index, name, #colour) beside each label map; what the XNAT workbench reads for a mask |
 | `<mask>_uint8.nii.gz` / `<mask>_uint8.tsv` | Only when the map holds values above 255 (MuscleMap's 1101…8162): the same map renumbered 1..N as a byte, with its lookup carrying the original colours, for viewers whose drawing layer is 8-bit. The `new → original` mapping is in `wrapup.json` |
-| `segmentation.seg.dcm` | DICOM SEG built from the mask and the source series, when the source DICOM is available (see below) |
+| `segmentation.seg.dcm` | DICOM SEG built from the mask and the source series, when the source DICOM is available (see below). **Removed from the resource once it has been registered as an ROI collection**, which holds the same bytes; it stays when no collection was created, or with `--keep-seg-file` |
 | `wrapup.json` | What the wrapup did: inputs, label source, merge, SEG segment mapping |
 
 This is the one piece of new code behind the model catalog epic: upstream images
@@ -41,7 +41,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.2.2"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.2.4"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -138,8 +138,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.2.2 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.2.2
+docker build -t xnatworks/seg-wrapup:0.2.4 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.2.4
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
