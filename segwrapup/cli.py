@@ -45,17 +45,28 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"source DICOM series for the DICOM SEG; default <input>/{DEFAULT_SOURCE_DIRNAME}")
     parser.add_argument("--merge", choices=("auto", "yes", "no"), default=os.environ.get("SEG_MERGE", "auto"),
                         help="merge one-file-per-structure binary masks into one label map (auto: when detected)")
-    parser.add_argument("--no-dicom-seg", action="store_true", help="skip DICOM SEG even if source DICOM is present")
-    parser.add_argument("--no-register", action="store_true",
+    parser.add_argument("--no-dicom-seg", action="store_true", default=_env_flag("SEG_NO_DICOM_SEG"), help="skip DICOM SEG even if source DICOM is present")
+    parser.add_argument("--no-register", action="store_true", default=_env_flag("SEG_NO_REGISTER"),
                         help="do not register the DICOM SEG as an XNAT ROI collection even when the context is present")
     parser.add_argument("--roi-label", default=os.environ.get("SEG_ROI_LABEL", ""),
                         help="ROI collection label; default <model>_scan<id>_<timestamp>")
-    parser.add_argument("--keep-seg-file", action="store_true",
+    parser.add_argument("--keep-seg-file", action="store_true", default=_env_flag("SEG_KEEP_SEG_FILE"),
                         help="keep segmentation.seg.dcm in the resource even after the ROI collection "
                              "has been registered with a copy of it")
     parser.add_argument("--session", default=os.environ.get("SEG_SESSION_LABEL", ""))
     parser.add_argument("--scan", default=os.environ.get("SEG_SCAN_ID", ""))
     return parser
+
+
+def _env_flag(name: str) -> bool:
+    """Boolean switches must be settable from the environment.
+
+    The Container Service registers a wrapup with a fixed command line ("seg-wrapup") and
+    passes per-run configuration as inherited environment variables, so a flag with no
+    environment default cannot be changed for a single run without re-registering the
+    globally shared wrapup command.
+    """
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_path(name: str) -> Path | None:

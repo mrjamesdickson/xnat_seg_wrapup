@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir --no-deps /opt/seg-wrapup
 
 # The Container Service reads wrapup command definitions from this label when the
 # image is pulled. Kept byte-identical to commands/seg-wrapup.json by tests/test_cli.py.
-LABEL org.nrg.commands="[{\"name\":\"seg-wrapup\",\"description\":\"Post-process segmentation output: volumetrics report, ITK-SNAP/Slicer label files, DICOM SEG (registered with OHIF when the parent passes SEG_PROJECT/SEG_SESSION_ID) when the parent copied its source DICOM to /output/.source_dicom\",\"version\":\"0.2.3\",\"type\":\"docker-wrapup\",\"image\":\"xnatworks/seg-wrapup:0.2.3\",\"command-line\":\"seg-wrapup\",\"mounts\":[],\"inputs\":[],\"outputs\":[],\"xnat\":[]}]"
+LABEL org.nrg.commands="[{\"name\":\"seg-wrapup\",\"description\":\"Post-process segmentation output: volumetrics report, ITK-SNAP/Slicer label files, DICOM SEG (registered with OHIF when the parent passes SEG_PROJECT/SEG_SESSION_ID) when the parent copied its source DICOM to /output/.source_dicom\",\"version\":\"0.2.4\",\"type\":\"docker-wrapup\",\"image\":\"xnatworks/seg-wrapup:0.2.4\",\"command-line\":\"seg-wrapup\",\"mounts\":[],\"inputs\":[],\"outputs\":[],\"xnat\":[]}]"
 
 RUN mkdir -p /input /output
 # No ENTRYPOINT: the Container Service runs a wrapup with its own command-line
