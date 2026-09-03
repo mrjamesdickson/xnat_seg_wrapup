@@ -141,6 +141,13 @@ def test_command_json_matches_dockerfile_label():
     assert command["mounts"] == [] and command["inputs"] == [] and command["outputs"] == []
     assert command["image"].startswith("xnatworks/seg-wrapup:")
 
+    # Both must track the package version, or the image advertises a stale version of itself
+    # to the Container Service while shipping newer code.
+    version = next(line.split('"')[1] for line in (root / "pyproject.toml").read_text().splitlines()
+                   if line.startswith("version = "))
+    assert command["version"] == version
+    assert command["image"] == f"xnatworks/seg-wrapup:{version}"
+
 
 def test_viewer_sidecars_tsv_and_uint8_companion_for_large_labels(tmp_path):
     import nibabel as nib
