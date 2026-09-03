@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xnat-seg-wrapup"
-version = "0.2.2"
+version = "0.2.3"
 description = "Shared post-processing for XNAT segmentation containers: volumetrics report, viewer label files, DICOM SEG"
 readme = "README.md"
 license = {text = "Apache-2.0"}

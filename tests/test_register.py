@@ -107,13 +107,16 @@ def test_cli_registers_when_parent_context_present(xnat_server, tmp_path, monkey
                        "SEG_SESSION_ID": "XNAT_E1", "SEG_SCAN_ID": "2"}.items():
         monkeypatch.setenv(key, value)
 
-    assert cli.main(["--input", str(inp), "--output", str(out), "--model", "spleen_ct_segmentation"]) == 0
+    assert cli.main(["--input", str(inp), "--output", str(out), "--model", "spleen_ct_segmentation",
+                     "--keep-seg-file"]) == 0
 
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["roi_collection"]["status"] == 200
     assert manifest["roi_collection"]["label"].startswith("spleen_ct_segmentation_scan2_")
     assert handler.calls[0]["path"].startswith("/xapi/roi/projects/P1/sessions/XNAT_E1/collections/spleen_ct_segmentation_scan2_")
+    # --keep-seg-file, so the uploaded bytes can still be compared against the file on disk.
     assert handler.calls[0]["length"] == (out / "segmentation.seg.dcm").stat().st_size
+    assert manifest["dicom_seg"]["retained_in_resource"] is True
 
 
 def test_cli_registration_failure_is_logged_not_fatal(xnat_server, tmp_path, monkeypatch, caplog):
@@ -149,3 +152,52 @@ def test_cli_no_register_flag(xnat_server, tmp_path, monkeypatch):
         monkeypatch.setenv(key, value)
     assert cli.main(["--input", str(inp), "--output", str(out), "--no-register"]) == 0
     assert handler.calls == []
+
+
+def test_cli_drops_seg_from_resource_once_the_collection_holds_it(xnat_server, tmp_path, monkeypatch):
+    """The ROI collection stores a full copy, so the scan resource should not keep a second one."""
+    base, handler = xnat_server
+    inp, out = _wrapup_input_with_seg(tmp_path), tmp_path / "out"
+    for key, value in {"XNAT_HOST": base, "XNAT_USER": "u", "XNAT_PASS": "p", "SEG_PROJECT": "P1",
+                       "SEG_SESSION_ID": "XNAT_E1", "SEG_SCAN_ID": "2"}.items():
+        monkeypatch.setenv(key, value)
+
+    assert cli.main(["--input", str(inp), "--output", str(out), "--model", "demo"]) == 0
+
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["roi_collection"]["status"] == 200
+    assert manifest["dicom_seg"]["retained_in_resource"] is False
+    assert not (out / "segmentation.seg.dcm").exists()
+    # The collection still received the whole file: dropping happens after a successful PUT.
+    assert handler.calls[0]["length"] > 0
+    # Everything else the resource is for is untouched.
+    assert {"volumes.json", "report.html", "wrapup.json"} <= {q.name for q in out.iterdir()}
+
+
+def test_cli_keeps_seg_when_registration_is_skipped_by_flag(xnat_server, tmp_path, monkeypatch):
+    """No collection means the SEG in the resource is the only copy, so it must survive."""
+    base, handler = xnat_server
+    inp, out = _wrapup_input_with_seg(tmp_path), tmp_path / "out"
+    for key, value in {"XNAT_HOST": base, "XNAT_USER": "u", "XNAT_PASS": "p", "SEG_PROJECT": "P1",
+                       "SEG_SESSION_ID": "XNAT_E1"}.items():
+        monkeypatch.setenv(key, value)
+
+    assert cli.main(["--input", str(inp), "--output", str(out), "--no-register"]) == 0
+
+    assert handler.calls == []
+    assert (out / "segmentation.seg.dcm").exists()
+    assert json.loads((out / "wrapup.json").read_text())["dicom_seg"]["retained_in_resource"] is True
+
+
+def test_cli_keeps_seg_when_there_is_no_xnat_context(tmp_path, monkeypatch):
+    """Run outside XNAT: nothing registered the SEG anywhere, so it stays in the output."""
+    for key in ("XNAT_HOST", "XNAT_USER", "XNAT_PASS", "SEG_PROJECT", "SEG_SESSION_ID"):
+        monkeypatch.delenv(key, raising=False)
+    inp, out = _wrapup_input_with_seg(tmp_path), tmp_path / "out"
+
+    assert cli.main(["--input", str(inp), "--output", str(out)]) == 0
+
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["roi_collection"] is None
+    assert manifest["dicom_seg"]["retained_in_resource"] is True
+    assert (out / "segmentation.seg.dcm").exists()

@@ -12,7 +12,7 @@ Any model container that writes a NIfTI mask gets, without changing its image:
 | `labels.txt` / `labels.ctbl` | ITK-SNAP label file and 3D Slicer colour table, same indices and colours as the report chips |
 | `<mask>.tsv` | BIDS `_dseg.tsv` lookup (index, name, #colour) beside each label map; what the XNAT workbench reads for a mask |
 | `<mask>_uint8.nii.gz` / `<mask>_uint8.tsv` | Only when the map holds values above 255 (MuscleMap's 1101…8162): the same map renumbered 1..N as a byte, with its lookup carrying the original colours, for viewers whose drawing layer is 8-bit. The `new → original` mapping is in `wrapup.json` |
-| `segmentation.seg.dcm` | DICOM SEG built from the mask and the source series, when the source DICOM is available (see below) |
+| `segmentation.seg.dcm` | DICOM SEG built from the mask and the source series, when the source DICOM is available (see below). **Removed from the resource once it has been registered as an ROI collection**, which holds the same bytes; it stays when no collection was created, or with `--keep-seg-file` |
 | `wrapup.json` | What the wrapup did: inputs, label source, merge, SEG segment mapping |
 
 This is the one piece of new code behind the model catalog epic: upstream images

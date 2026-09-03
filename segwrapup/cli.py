@@ -50,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="do not register the DICOM SEG as an XNAT ROI collection even when the context is present")
     parser.add_argument("--roi-label", default=os.environ.get("SEG_ROI_LABEL", ""),
                         help="ROI collection label; default <model>_scan<id>_<timestamp>")
+    parser.add_argument("--keep-seg-file", action="store_true",
+                        help="keep segmentation.seg.dcm in the resource even after the ROI collection "
+                             "has been registered with a copy of it")
     parser.add_argument("--session", default=os.environ.get("SEG_SESSION_LABEL", ""))
     parser.add_argument("--scan", default=os.environ.get("SEG_SCAN_ID", ""))
     return parser
@@ -182,6 +185,8 @@ def run(args: argparse.Namespace) -> int:
             logger.error("DICOM SEG not written for %s: %s", delivered[0].name, error)
         else:
             manifest["roi_collection"] = register_if_possible(args, seg_path)
+            dropped = drop_registered_seg(args, seg_path, manifest["roi_collection"])
+            manifest["dicom_seg"]["retained_in_resource"] = not dropped
 
     (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
     for result in results:
@@ -207,6 +212,28 @@ def register_if_possible(args: argparse.Namespace, seg_path: Path) -> dict | Non
     except RuntimeError as error:
         logger.error("ROI collection not registered; the SEG file is still in the resource: %s", error)
         return {"label": label, "error": str(error)}
+
+
+def drop_registered_seg(args: argparse.Namespace, seg_path: Path, roi_collection: dict | None) -> bool:
+    """Remove the SEG from the output once the ROI collection holds the same bytes.
+
+    The collection stores a full copy, so leaving the file in the scan resource duplicates
+    it — around 20 MB a run for a whole-body map. It is only safe to drop when a collection
+    was actually created: if registration was skipped, had no XNAT context, or failed, this
+    file is the only copy of the segmentation and must stay.
+    """
+    if args.keep_seg_file:
+        return False
+    if not roi_collection or roi_collection.get("error"):
+        return False
+    try:
+        seg_path.unlink()
+    except OSError as error:
+        logger.warning("SEG file %s not removed after registration: %s", seg_path, error)
+        return False
+    logger.info("SEG dropped from the resource; ROI collection %s holds it",
+                roi_collection.get("label", "?"))
+    return True
 
 
 def write_report_files(output_dir: Path, report: dict, label_table: dict, results: list[dict]) -> None:
