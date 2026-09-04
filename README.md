@@ -41,7 +41,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.2.4"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.2.5"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -62,6 +62,22 @@ Sparse label values are renumbered to consecutive DICOM segment numbers; the map
 is in `wrapup.json`. Every segment carries `RecommendedDisplayCIELabValue`, the same
 colour as the report chips and the label files, so OHIF shows structures in the
 colours the rest of the resource uses.
+
+### One-segment SEGs need the segment identification per frame
+
+`SegmentIdentificationSequence` is moved out of `SharedFunctionalGroupsSequence` and copied
+into every per-frame group before the SEG is written.
+
+highdicom hoists a functional group macro into the shared groups whenever its value is the
+same for every frame, which for a **one-label mask is always true**. The file is valid
+DICOM either way, but XNAT's ROI plugin reads that macro from the per-frame groups only and
+rejects the collection with `HTTP 500 SegmentIdentification missing`. The effect was
+invisible until the first lesion model: a 95-segment FastSurfer SEG registered fine, because
+its referenced segment number varies per frame and so stayed where XNAT looks.
+
+The macro is moved, not copied — DICOM forbids the same functional group macro appearing in
+both the shared and the per-frame groups. On the multi-segment path there is nothing in the
+shared groups to move and the step is a no-op.
 
 ### The SEG is registered with OHIF when the context is present
 
@@ -138,8 +154,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.2.4 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.2.4
+docker build -t xnatworks/seg-wrapup:0.2.5 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.2.5
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the

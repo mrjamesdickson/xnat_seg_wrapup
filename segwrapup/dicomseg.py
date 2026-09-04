@@ -7,6 +7,7 @@ rather than resampled, because a silently resampled overlay is worse than none.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from pathlib import Path
 
 import nibabel as nib
@@ -128,6 +129,32 @@ def ensure_type2_patient_study_attributes(datasets: list[Dataset]) -> list[str]:
     return missing
 
 
+def unshare_segment_identification(segmentation) -> bool:
+    """Move SegmentIdentificationSequence out of the shared groups and into every frame.
+
+    highdicom hoists a functional group macro into ``SharedFunctionalGroupsSequence`` when
+    its value is the same for every frame. For a one-label mask that is always true of the
+    segment identification macro, so a single-lesion SEG carries it shared. That is legal
+    DICOM, but XNAT's ROI plugin reads the macro from the per-frame groups only and rejects
+    the collection with HTTP 500 "SegmentIdentification missing" -- which made every
+    single-lesion model fail to register while multi-structure models were unaffected.
+
+    The macro must not appear in both places, so it is moved rather than copied. Returns
+    whether anything was moved, and is a no-op on the multi-segment path where highdicom
+    already writes it per frame.
+    """
+    shared = segmentation.SharedFunctionalGroupsSequence[0]
+    if "SegmentIdentificationSequence" not in shared:
+        return False
+    identification = shared.SegmentIdentificationSequence
+    del shared.SegmentIdentificationSequence
+    for frame in segmentation.PerFrameFunctionalGroupsSequence:
+        frame.SegmentIdentificationSequence = deepcopy(identification)
+    logger.info("moved SegmentIdentificationSequence into %d per-frame groups for XNAT's ROI plugin",
+                len(segmentation.PerFrameFunctionalGroupsSequence))
+    return True
+
+
 def write_dicom_seg(
     mask_path: Path,
     dicom_dir: Path,
@@ -197,6 +224,7 @@ def write_dicom_seg(
         series_description=(series_description or f"{model_name} segmentation")[:64],
         omit_empty_frames=True,
     )
+    unshare_segment_identification(segmentation)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     segmentation.save_as(str(out_path))
     logger.info("wrote DICOM SEG %s with %d segments", out_path, len(present))
