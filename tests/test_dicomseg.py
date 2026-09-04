@@ -167,3 +167,41 @@ def test_write_dicom_seg_sets_recommended_display_colour_per_segment(ct_series, 
     from segwrapup.labels import label_color
     expected = CIELabColor.from_rgb(*label_color(3)).value
     assert colours[0] == list(expected)
+
+
+def test_single_segment_seg_carries_segment_identification_per_frame(ct_series, tmp_path, read_dicom):
+    """XNAT's ROI plugin reads SegmentIdentificationSequence from the per-frame groups only.
+
+    highdicom hoists a functional group into SharedFunctionalGroupsSequence when its value
+    is constant across every frame, which for a one-label mask it always is. The result is
+    valid DICOM that XNAT rejects with HTTP 500 "SegmentIdentification missing", so every
+    single-lesion model (DeepWMH and the rest of the disease queue) failed to register its
+    ROI collection while multi-structure models were unaffected.
+    """
+    directory, _ = ct_series
+    lesion = np.zeros((COLS, ROWS, SLICES))
+    lesion[3:7, 3:7, 2:5] = 1
+    mask = write_mask(tmp_path / "lesion.nii.gz", lesion, affine=series_ras_affine())
+    out = tmp_path / "single.seg.dcm"
+    dicomseg.write_dicom_seg(mask, directory, {1: "white matter hyperintensity"}, out, model_name="DeepWMH")
+
+    seg = read_dicom(out)
+    assert len(seg.SegmentSequence) == 1
+    assert "SegmentIdentificationSequence" not in seg.SharedFunctionalGroupsSequence[0], (
+        "the macro must not remain in the shared groups; DICOM forbids it in both places"
+    )
+    for frame in seg.PerFrameFunctionalGroupsSequence:
+        assert frame.SegmentIdentificationSequence[0].ReferencedSegmentNumber == 1
+
+
+def test_multi_segment_seg_keeps_per_frame_segment_identification(ct_series, tmp_path, read_dicom):
+    """Control: the multi-segment path already put the macro per-frame and must not change."""
+    directory, _ = ct_series
+    mask = write_mask(tmp_path / "mask.nii.gz", blob_mask(), affine=series_ras_affine())
+    out = tmp_path / "multi.seg.dcm"
+    dicomseg.write_dicom_seg(mask, directory, {3: "spleen", 7: "marker"}, out, model_name="m")
+
+    seg = read_dicom(out)
+    assert "SegmentIdentificationSequence" not in seg.SharedFunctionalGroupsSequence[0]
+    referenced = {f.SegmentIdentificationSequence[0].ReferencedSegmentNumber for f in seg.PerFrameFunctionalGroupsSequence}
+    assert referenced == {1, 2}
