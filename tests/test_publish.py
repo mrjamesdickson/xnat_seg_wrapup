@@ -171,7 +171,8 @@ def test_collect_files_overlapping_role_globs_assign_each_file_once(tmp_path):
 
 
 @pytest.mark.parametrize("name,fmt", [("a.nii.gz", "NIFTI"), ("a.nii", "NIFTI"), ("a.seg.dcm", "DICOM"),
-                                      ("volumes.json", "JSON"), ("x.stl", "STL"), ("README", "FILE")])
+                                      ("volumes.json", "JSON"), ("x.stl", "STL"), ("README", "FILE"),
+                                      ("artifact.QC result", "QCRESULT"), ("x.a?b#c", "ABC"), ("odd. ", "FILE")])
 def test_upload_format_by_suffix(name, fmt):
     assert upload_format(Path(name)) == fmt
 
@@ -288,6 +289,26 @@ def test_contract_rejects_unsafe_resource_roles(role):
 def test_contract_accepts_lowercase_roles_by_uppercasing():
     contract = RecordContract.from_env({"XNW_CARD_ID": "c", "XNW_RESOURCE_logs": "*.log"})
     assert contract.resources["LOGS"] == ["*.log"]
+
+
+def test_publish_rolls_back_on_an_invalid_upload_url(xnat, tmp_path, monkeypatch):
+    """Codex round 5 on PR #3: urllib's InvalidURL is a ValueError and skipped the rollback."""
+    host, handler = xnat
+    (tmp_path / "volumes.json").write_text("{}")
+    files = collect_files(tmp_path, RecordContract())
+    import segwrapup.publish as publish
+    real_put = publish._put
+
+    def put_raising_invalid_url(context, url, body, content_type, timeout):
+        if "/out/" in url:
+            import http.client
+            raise http.client.InvalidURL("URL can't contain control characters")   # a ValueError subclass
+        return real_put(context, url, body, content_type, timeout)
+
+    monkeypatch.setattr(publish, "_put", put_raising_invalid_url)
+    with pytest.raises(RuntimeError, match=r"control characters; record XNAT_E99999 deleted"):
+        publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", files)
+    assert [c["method"] for c in handler.calls][-1] == "DELETE"
 
 
 def test_record_xml_warns_when_a_delivered_mask_could_not_be_measured():

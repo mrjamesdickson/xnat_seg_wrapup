@@ -188,11 +188,13 @@ def upload_name(path: Path, output_dir: Path | None) -> str:
 
 
 def upload_format(path: Path) -> str:
+    """XNAT ``format`` for the upload: a known name, else the suffix reduced to [A-Z0-9_], else FILE."""
     lower = path.name.lower()
     for suffix, fmt in FORMAT_BY_SUFFIX.items():
         if lower.endswith(suffix):
             return fmt
-    return path.suffix.lstrip(".").upper() or "FILE"
+    inferred = re.sub(r"[^A-Z0-9_]", "", path.suffix.lstrip(".").upper())
+    return inferred or "FILE"
 
 
 def _element(name: str, value) -> str:
@@ -311,10 +313,10 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
                 name = upload_name(path, output_dir)
                 content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
                 url = (f"{record_url}/out/resources/{role}/files/{urllib.parse.quote(name, safe='/')}"
-                       f"?inbody=true&format={upload_format(path)}")
+                       f"?inbody=true&format={urllib.parse.quote(upload_format(path), safe='')}")
                 _put(context, url, path.read_bytes(), content_type, timeout_seconds)
                 uploaded.setdefault(role, []).append(name)
-    except (RuntimeError, OSError) as error:   # OSError: the collected file vanished or is unreadable
+    except (RuntimeError, OSError, ValueError) as error:   # OSError: file vanished; ValueError: urllib InvalidURL
         logger.error("upload to record %s failed after create; deleting the record so no partial record stays: %s",
                      record_id, error)
         try:
