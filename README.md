@@ -206,6 +206,13 @@ CLI's failure policy, and that the Dockerfile label matches `commands/seg-wrapup
 Apache 2.0. This image contains no model weights. Research and decision support
 only; not a medical device.
 
+## Labels
+
+ROI collections and records are XNAT experiments, whose labels are unique per project. The
+default label is `<pipeline>_<session label>_scan<id>_<UTC stamp>` (since 0.4.1; the session
+id when its label cannot be read), so two sessions' runs of one pipeline finishing in the same
+second cannot collide; a 409 on create is retried once with a random suffix.
+
 ## proc-wrapup: the generic wrapup (since 0.4.0)
 
 For cards that are not segmentations (QC pipelines, diffusion, radiomics, anything). Same

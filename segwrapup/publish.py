@@ -28,6 +28,7 @@ import re
 import logging
 import mimetypes
 import os
+import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,7 +38,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from . import __version__
-from .register import XnatContext, auth_headers, collection_label
+from .register import LABEL_MAX, XnatContext, auth_headers, collection_label, fetch_session_label
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +300,11 @@ def _request(context: XnatContext, method: str, url: str, timeout: float) -> int
         raise RuntimeError(f"{method} {url.split('?')[0]} failed: {error}") from error
 
 
+def _relabel(xml: str, label: str) -> str:
+    """The record document carries its label as an attribute; a retried create must match the URL."""
+    return re.sub(r'(<analysis:SessionAnalysis[^>]*?\slabel=")[^"]*(")', lambda m: m.group(1) + escape(label) + m.group(2), xml, count=1)
+
+
 def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, list[Path]],
                    timeout_seconds: float = 300.0, output_dir: Path | None = None) -> dict:
     """Create the record, then upload each role's files to its ``out`` resource. Raises RuntimeError.
@@ -320,7 +326,19 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
                            "not creating, because PUT to an existing label would update it")
     create_url = f"{label_url}?inbody=true"
     logger.info("publishing %s %s", XSI_TYPE, label)
-    status, text = _put(context, create_url, xml.encode(), "application/xml", timeout_seconds)
+    try:
+        status, text = _put(context, create_url, xml.encode(), "application/xml", timeout_seconds)
+    except RuntimeError as error:
+        if "HTTP 409" not in str(error):
+            raise
+        # Labels are unique per project: another session's run of the same pipeline claimed
+        # this one in the same second (the per-session probe above cannot see it). One retry
+        # with a short random suffix; a second 409 is reported.
+        retry = f"{label[:LABEL_MAX - 5]}_{secrets.token_hex(2)}"
+        logger.warning("label %s is taken elsewhere in the project (HTTP 409); retrying once as %s", label, retry)
+        label = retry
+        label_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(label, safe='')}"
+        status, text = _put(context, f"{label_url}?inbody=true", _relabel(xml, retry).encode(), "application/xml", timeout_seconds)
     record_id = text.strip() if text.strip().startswith("XNAT_") else label
     record_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(record_id, safe='')}"
     uploaded: dict[str, list[str]] = {}
@@ -368,7 +386,9 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
     if context is None:
         logger.error("analysis record not published; XNW_CONTRACT is set but the XNAT context is incomplete")
         return {"error": "XNAT context incomplete"}
-    label = (getattr(args, "record_label", "") or "").strip() or collection_label(getattr(args, "model", None) or getattr(args, "pipeline", "run"), context.scan or args.scan)
+    label = (getattr(args, "record_label", "") or "").strip() or collection_label(
+        getattr(args, "model", None) or getattr(args, "pipeline", "run"), context.scan or args.scan,
+        session_label=fetch_session_label(context))
     # Everything from file collection onwards is guarded: a bad contract glob (an absolute
     # pattern makes Path.glob raise NotImplementedError) must be recorded, not abort delivery
     # of the masks, report and ROI collection that are already on disk.
