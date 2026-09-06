@@ -32,11 +32,23 @@ CONTEXT_ENV = {"XNAT_HOST": "http://x", "XNAT_USER": "alias", "XNAT_PASS": "secr
 class _Handler(BaseHTTPRequestHandler):
     calls: list = []
     fail_paths: set = set()
+    existing_labels: set = set()      # GET .../assessors/<label> answers 200 for these
+
+    def do_GET(self):
+        _Handler.calls.append({"path": self.path, "method": "GET", "auth": self.headers.get("Authorization")})
+        label = self.path.split("/assessors/")[-1].split("?")[0]
+        self.send_response(200 if label in _Handler.existing_labels else 404)
+        self.end_headers()
+
+    def do_DELETE(self):
+        _Handler.calls.append({"path": self.path, "method": "DELETE", "auth": self.headers.get("Authorization")})
+        self.send_response(200)
+        self.end_headers()
 
     def do_PUT(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
-        _Handler.calls.append({"path": self.path, "auth": self.headers.get("Authorization"),
+        _Handler.calls.append({"path": self.path, "method": "PUT", "auth": self.headers.get("Authorization"),
                                "content_type": self.headers.get("Content-Type"), "body": body})
         if any(self.path.startswith(p) for p in _Handler.fail_paths):
             self.send_response(500)
@@ -55,7 +67,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def xnat():
-    _Handler.calls, _Handler.fail_paths = [], set()
+    _Handler.calls, _Handler.fail_paths, _Handler.existing_labels = [], set(), set()
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_port}", _Handler
@@ -205,8 +217,10 @@ def test_publish_creates_record_then_uploads_files_to_its_out_resources(xnat, tm
     outcome = publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", files, output_dir=tmp_path)
     assert outcome["id"] == "XNAT_E99999" and outcome["xsi_type"] == XSI_TYPE
     paths = [c["path"] for c in handler.calls]
-    assert paths[0] == "/data/experiments/XNAT_E00018/assessors/DeepWMH_scan2_X?inbody=true"
-    assert handler.calls[0]["content_type"] == "application/xml" and handler.calls[0]["body"] == b"<xml/>"
+    # create-only: existence is checked first, then the create PUT
+    assert paths[0] == "/data/experiments/XNAT_E00018/assessors/DeepWMH_scan2_X?format=json" and handler.calls[0]["method"] == "GET"
+    assert paths[1] == "/data/experiments/XNAT_E00018/assessors/DeepWMH_scan2_X?inbody=true"
+    assert handler.calls[1]["content_type"] == "application/xml" and handler.calls[1]["body"] == b"<xml/>"
     assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/METRICS/files/volumes.json?inbody=true&format=JSON" in paths
     assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/REPORT/files/report.html?inbody=true&format=HTML" in paths
     # the data output rides along under DERIVED, nested paths kept, NIfTI declared as NIFTI
@@ -215,6 +229,37 @@ def test_publish_creates_record_then_uploads_files_to_its_out_resources(xnat, tm
     assert all(c["auth"].startswith("Basic ") for c in handler.calls)
     assert outcome["uploaded"] == {"METRICS": ["volumes.json"], "REPORT": ["report.html"],
                                    "DERIVED": ["segmentation.nii.gz", "sub/part.tsv"]}
+
+
+def test_publish_refuses_a_label_that_already_exists(xnat, tmp_path):
+    """Codex P1 on PR #3: a reused --record-label would turn the create PUT into an update."""
+    host, handler = xnat
+    handler.existing_labels = {"DeepWMH_scan2_X"}
+    with pytest.raises(RuntimeError, match="already exists"):
+        publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", {})
+    assert [c["method"] for c in handler.calls] == ["GET"], "nothing is written when the label exists"
+
+
+def test_publish_deletes_the_record_when_a_file_upload_fails(xnat, tmp_path):
+    """Codex P1 on PR #3: a create followed by a failed upload left a SUCCEEDED-looking partial record."""
+    host, handler = xnat
+    (tmp_path / "volumes.json").write_text("{}")
+    (tmp_path / "report.html").write_text("<html/>")
+    handler.fail_paths = {"/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/REPORT/"}
+    with pytest.raises(RuntimeError, match=r"HTTP 500 boom; record XNAT_E99999 deleted \(HTTP 200\)"):
+        publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", collect_files(tmp_path, RecordContract()))
+    deletes = [c for c in handler.calls if c["method"] == "DELETE"]
+    assert [c["path"] for c in deletes] == ["/data/experiments/XNAT_E00018/assessors/XNAT_E99999?removeFiles=true"]
+
+
+def test_record_xml_warns_when_a_delivered_mask_could_not_be_measured():
+    """Codex P1 on PR #3: one good mask plus one unmeasurable mask must not be auto QC PASS."""
+    xml = build_record_xml(_context("http://x"), RecordContract(), "L", _report(), _results(), {},
+                           source_dicom_present=True, unmeasured_masks=1)
+    assert "<analysis:auto_qc_status>WARN<" in xml and '"unmeasured_masks": 1' in xml
+    xml = build_record_xml(_context("http://x"), RecordContract(), "L", _report(), _results(), {},
+                           source_dicom_present=True, unmeasured_masks=0)
+    assert "<analysis:auto_qc_status>PASS<" in xml
 
 
 def test_publish_raises_with_http_detail(xnat, tmp_path):
@@ -249,7 +294,7 @@ def test_cli_publishes_record_when_contract_and_context_present(xnat, tmp_path, 
     assert record["id"] == "XNAT_E99999" and record["label"].startswith("DeepWMH_scan2_")
     assert "volumes.json" in record["uploaded"]["METRICS"] and "report.html" in record["uploaded"]["REPORT"]
     assert "wrapup.json" in record["uploaded"]["PROVENANCE"]
-    create = handler.calls[0]
+    create = next(c for c in handler.calls if c["method"] == "PUT" and "/assessors/" in c["path"] and "/out/" not in c["path"])
     assert create["path"].endswith(f"/assessors/{record['label']}?inbody=true")
     assert b"<analysis:pipeline_name>DeepWMH</analysis:pipeline_name>" in create["body"]
     assert b"<analysis:card_id>deepwmh</analysis:card_id>" in create["body"]
@@ -271,7 +316,7 @@ def test_cli_record_shares_the_roi_collection_label(xnat, tmp_path, monkeypatch)
     # across experiment types) and XNAT answers 417 "Invalid character in experiment label".
     assert manifest["analysis_record"]["label"] == manifest["roi_collection"]["label"] + "_record"
     roi_puts = [c for c in handler.calls if "/xapi/roi/" in c["path"]]
-    record_puts = [c for c in handler.calls if "/assessors/" in c["path"] and "/out/" not in c["path"]]
+    record_puts = [c for c in handler.calls if c["method"] == "PUT" and "/assessors/" in c["path"] and "/out/" not in c["path"]]
     assert len(roi_puts) == 1 and len(record_puts) == 1
 
 

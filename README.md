@@ -21,17 +21,31 @@ and this wrapup, so every card produces the same resource layout.
 
 ## Analysis record (since 0.3.0)
 
-When the card opts in by setting `XNW_CONTRACT` (JSON; the registry installer writes it from
-the card's `results` block), the wrapup publishes an `analysis:sessionAnalysisData` record on
-the session after the ROI collection: **type, status, QC and provenance**, plus the small
-files (`METRICS`: volumes.json/csv, `REPORT`: report.html, `PROVENANCE`: wrapup.json, label
-files). The masks and SEG stay on the parent's resource; the record's `output_resource_label`
-points at it. No measurement is ever a field on the record: the numbers are in `METRICS`.
+When the card opts in, the wrapup publishes an `analysis:sessionAnalysisData` record on the
+session after the ROI collection. The record's **fields** are type, status, QC and provenance
+only; no measurement is ever a field (the numbers are in `METRICS`). The record's
+**resources carry the entire output of the run**: `METRICS` (volumes.json/csv,
+segmentation.tsv), `REPORT` (report.html), `PROVENANCE` (wrapup.json, label files) and
+`DERIVED`, which takes every other file the wrapup wrote, recursively, masks included. The
+same files are also on the parent's resource (`output_resource_label`) for OHIF and the
+viewer sidecars, so today the data output exists twice; the DICOM SEG registered as a ROI
+collection is not copied again.
 
-No `XNW_CONTRACT`, no record; nothing else changes. Publishing is create-or-fail and additive:
-a failure is logged and written to `wrapup.json` under `analysis_record`, and the masks,
-report and ROI collection still ship. The record label is the ROI collection's sibling
-(`<model>_scan<id>_<UTC stamp>`), overridable with `--record-label` / `SEG_RECORD_LABEL`;
+The card opts in through environment variables on its command, which the registry installer
+writes from the card's `results` block. The Container Service stores each value in a 255-char
+column, so the contract is **discrete variables**: `XNW_CARD_ID`, `XNW_CARD_REVISION`,
+`XNW_CONTRACT_VERSION`, `XNW_ANALYSIS_TYPE`, `XNW_CONTAINER_IMAGE`, `XNW_CONTAINER_DIGEST`,
+`XNW_OUTPUT_RESOURCE_LABEL`, `XNW_SUPERSEDES_ID`, and optional `XNW_RESOURCE_<ROLE>=a,b`
+globs per role (`XNW_RESOURCE_DERIVED` replaces the "everything else" default). A single
+`XNW_CONTRACT` JSON value is still honoured where it fits.
+
+No `XNW_*` variables, no record; nothing else changes. Publishing is create-only and
+additive: a label that already exists on the session is refused before any write, a file
+upload that fails after the create deletes the new record again, and every failure is logged
+and written to `wrapup.json` under `analysis_record` while the masks, report and ROI
+collection still ship. `auto_qc_status` is `WARN` when any delivered mask could not be
+measured. The record label is the ROI collection's label plus `_record`
+(`<model>_scan<id>_<UTC stamp>_record`), overridable with `--record-label` / `SEG_RECORD_LABEL`;
 `--no-publish` / `SEG_NO_PUBLISH` switches it off. The datatype is provided by
 `xnat-analysis-schema-plugin`; design in `development/xnat_genericProcessing_plugin/docs/`.
 

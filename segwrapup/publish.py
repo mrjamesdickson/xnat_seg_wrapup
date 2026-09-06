@@ -191,13 +191,17 @@ def _element(name: str, value) -> str:
 def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
                      report: dict, results: list[dict], files: dict[str, list[Path]],
                      source_dicom_present: bool, when: datetime | None = None,
-                     output_dir: Path | None = None) -> str:
-    """The assessor document XNAT ingests. Fields: type, status, QC, provenance. No measurements."""
+                     output_dir: Path | None = None, unmeasured_masks: int = 0) -> str:
+    """The assessor document XNAT ingests. Fields: type, status, QC, provenance. No measurements.
+
+    ``unmeasured_masks`` is how many delivered masks could not be measured: they still ship
+    under DERIVED, so the record must not claim PASS while carrying an unusable output.
+    """
     now = when or datetime.now(timezone.utc)
     structures = sum(len(r.get("structures", [])) for r in results)
-    auto_qc = "PASS" if results and structures > 0 else "WARN"
+    auto_qc = "PASS" if results and structures > 0 and unmeasured_masks == 0 else "WARN"
     inputs = {"scan": context.scan or report.get("scan") or "", "source_dicom": source_dicom_present,
-              "masks": [r.get("file") for r in results]}
+              "masks": [r.get("file") for r in results], "unmeasured_masks": unmeasured_masks}
     summary = {"model": report.get("model"), "model_version": report.get("model_version"),
                "structures": structures,
                "total_volume_ml": round(sum(r.get("total_volume_ml", 0) for r in results), 2),
@@ -250,26 +254,59 @@ def _put(context: XnatContext, url: str, body: bytes, content_type: str, timeout
         raise RuntimeError(f"PUT {url.split('?')[0]} failed: {error}") from error
 
 
+def _request(context: XnatContext, method: str, url: str, timeout: float) -> int:
+    """Status of a body-less request; HTTP errors return their code instead of raising."""
+    credentials = base64.b64encode(f"{context.user}:{context.password}".encode()).decode()
+    request = urllib.request.Request(url, method=method, headers={"Authorization": f"Basic {credentials}"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise RuntimeError(f"{method} {url.split('?')[0]} failed: {error}") from error
+
+
 def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, list[Path]],
                    timeout_seconds: float = 300.0, output_dir: Path | None = None) -> dict:
     """Create the record, then upload each role's files to its ``out`` resource. Raises RuntimeError.
 
-    File names on the record are paths relative to ``output_dir`` so nested output keeps its shape.
+    Create-only, enforced twice: a label that already exists on the session is refused before
+    any PUT (XNAT would treat the PUT as an update of that object), and if a file upload fails
+    after the create succeeded the new record is deleted again so no searchable, apparently
+    complete record is left behind. File names on the record are paths relative to
+    ``output_dir`` so nested output keeps its shape.
     """
     session = urllib.parse.quote(context.session, safe="")
-    create_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(label, safe='')}?inbody=true"
+    label_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(label, safe='')}"
+    if _request(context, "GET", f"{label_url}?format=json", timeout_seconds) == 200:
+        raise RuntimeError(f"label {label} already exists on {context.session}; the record is create-only, "
+                           "pass a fresh --record-label or let the run stamp one")
+    create_url = f"{label_url}?inbody=true"
     logger.info("publishing %s %s", XSI_TYPE, label)
     status, text = _put(context, create_url, xml.encode(), "application/xml", timeout_seconds)
     record_id = text.strip() if text.strip().startswith("XNAT_") else label
+    record_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(record_id, safe='')}"
     uploaded: dict[str, list[str]] = {}
-    for role, paths in files.items():
-        for path in paths:
-            name = upload_name(path, output_dir)
-            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            url = (f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(record_id, safe='')}"
-                   f"/out/resources/{role}/files/{urllib.parse.quote(name, safe='/')}?inbody=true&format={upload_format(path)}")
-            _put(context, url, path.read_bytes(), content_type, timeout_seconds)
-            uploaded.setdefault(role, []).append(name)
+    try:
+        for role, paths in files.items():
+            for path in paths:
+                name = upload_name(path, output_dir)
+                content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                url = (f"{record_url}/out/resources/{role}/files/{urllib.parse.quote(name, safe='/')}"
+                       f"?inbody=true&format={upload_format(path)}")
+                _put(context, url, path.read_bytes(), content_type, timeout_seconds)
+                uploaded.setdefault(role, []).append(name)
+    except RuntimeError as error:
+        logger.error("upload to record %s failed after create; deleting the record so no partial record stays: %s",
+                     record_id, error)
+        try:
+            code = _request(context, "DELETE", f"{record_url}?removeFiles=true", timeout_seconds)
+            rollback = f"record {record_id} deleted (HTTP {code})" if code < 300 else f"rollback DELETE answered HTTP {code}"
+        except RuntimeError as delete_error:
+            logger.error("rollback of record %s failed: %s", record_id, delete_error)
+            rollback = f"rollback failed: {delete_error}"
+        raise RuntimeError(f"{error}; {rollback}") from error
     logger.info("analysis record %s published as %s with %d file(s)", label, record_id,
                 sum(len(v) for v in uploaded.values()))
     return {"xsi_type": XSI_TYPE, "id": record_id, "label": label, "status": status,
@@ -277,7 +314,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
 
 
 def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict],
-                        source_dicom_present: bool) -> dict | None:
+                        source_dicom_present: bool, unmeasured_masks: int = 0) -> dict | None:
     """Publish when the card opted in and the context is present. Never raises."""
     if getattr(args, "no_publish", False):
         logger.info("analysis record skipped by flag")
@@ -299,7 +336,8 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
     # of the masks, report and ROI collection that are already on disk.
     try:
         files = collect_files(output_dir, contract)
-        xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present, output_dir=output_dir)
+        xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present,
+                               output_dir=output_dir, unmeasured_masks=unmeasured_masks)
         return publish_record(context, label, xml, files, output_dir=output_dir)
     except (RuntimeError, ValueError, NotImplementedError, OSError) as error:
         logger.error("analysis record %s not published; files and ROI collection still delivered: %s: %s",
