@@ -265,7 +265,11 @@ def _put(context: XnatContext, url: str, body: bytes, content_type: str, timeout
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, response.read().decode(errors="replace")[:500]
     except urllib.error.HTTPError as error:
-        raise RuntimeError(f"PUT {url.split('?')[0]} failed: HTTP {error.code} {error.read().decode(errors='replace')[:300]}") from error
+        try:
+            detail = error.read().decode(errors="replace")[:300]
+        except (http.client.HTTPException, OSError, ValueError) as body_error:   # truncated error body
+            detail = f"(error body unreadable: {body_error})"
+        raise RuntimeError(f"PUT {url.split('?')[0]} failed: HTTP {error.code} {detail}") from error
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError) as error:
         # HTTPException covers http.client.InvalidURL (not a ValueError, whatever its message says)
         raise RuntimeError(f"PUT {url.split('?')[0]} failed: {error}") from error

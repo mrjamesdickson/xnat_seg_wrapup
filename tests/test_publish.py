@@ -266,6 +266,25 @@ def test_probe_protocol_error_is_a_runtime_error_the_guard_records(xnat, tmp_pat
         publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", {})
 
 
+def test_truncated_error_body_on_create_is_still_a_runtime_error(xnat, tmp_path, monkeypatch):
+    """Codex round 7 on PR #3: error.read() raising IncompleteRead inside the HTTPError handler escaped."""
+    import http.client, io, urllib.error
+    import segwrapup.publish as publish
+    host, handler = xnat
+
+    class _Truncated(io.BytesIO):
+        def read(self, *args):
+            raise http.client.IncompleteRead(b"partial")
+
+    def urlopen_500_truncated(request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 500, "boom", {}, _Truncated())
+
+    monkeypatch.setattr(publish, "_request", lambda *a, **k: 404)
+    monkeypatch.setattr(publish.urllib.request, "urlopen", urlopen_500_truncated)
+    with pytest.raises(RuntimeError, match=r"HTTP 500 \(error body unreadable: IncompleteRead"):
+        publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", {})
+
+
 def test_publish_deletes_the_record_when_a_file_upload_fails(xnat, tmp_path):
     """Codex P1 on PR #3: a create followed by a failed upload left a SUCCEEDED-looking partial record."""
     host, handler = xnat
