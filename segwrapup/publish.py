@@ -22,6 +22,7 @@ updated; a rerun is a new record whose ``supersedes_id`` may point at the old on
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import re
 import logging
@@ -265,7 +266,8 @@ def _put(context: XnatContext, url: str, body: bytes, content_type: str, timeout
             return response.status, response.read().decode(errors="replace")[:500]
     except urllib.error.HTTPError as error:
         raise RuntimeError(f"PUT {url.split('?')[0]} failed: HTTP {error.code} {error.read().decode(errors='replace')[:300]}") from error
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError) as error:
+        # HTTPException covers http.client.InvalidURL (not a ValueError, whatever its message says)
         raise RuntimeError(f"PUT {url.split('?')[0]} failed: {error}") from error
 
 
@@ -316,7 +318,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
                        f"?inbody=true&format={urllib.parse.quote(upload_format(path), safe='')}")
                 _put(context, url, path.read_bytes(), content_type, timeout_seconds)
                 uploaded.setdefault(role, []).append(name)
-    except (RuntimeError, OSError, ValueError) as error:   # OSError: file vanished; ValueError: urllib InvalidURL
+    except (RuntimeError, OSError, ValueError, http.client.HTTPException) as error:   # any post-create failure
         logger.error("upload to record %s failed after create; deleting the record so no partial record stays: %s",
                      record_id, error)
         try:
