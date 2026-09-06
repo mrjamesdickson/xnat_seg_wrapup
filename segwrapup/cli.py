@@ -208,10 +208,14 @@ def run(args: argparse.Namespace) -> int:
     (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
     from .publish import publish_if_possible
 
-    # Same label as the ROI collection when one was registered: the two are one run's siblings.
+    # Sibling of the ROI collection: same stamp, "_record" suffix. NOT the same label: XNAT
+    # experiment labels are unique per project across every experiment type, and the ROI
+    # collection is itself an assessor experiment, so an identical label turns the record's
+    # create into an update of the collection and XNAT answers a misleading
+    # 417 "Invalid character in experiment label".
     roi = manifest.get("roi_collection") or {}
     if roi.get("label") and not roi.get("error") and not (args.record_label or "").strip():
-        args.record_label = roi["label"]
+        args.record_label = f"{roi['label']}_record"
     manifest["analysis_record"] = publish_if_possible(args, output_dir, report, results, source_dicom.is_dir())
     (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
     for result in results:
