@@ -144,6 +144,19 @@ def test_collect_files_explicit_derived_globs_replace_the_everything_else_defaul
     assert "scratch.bin" not in str(files)
 
 
+def test_collect_files_overlapping_role_globs_assign_each_file_once(tmp_path):
+    """Codex P2 on PR #3: METRICS overridden to *.json also matches wrapup.json, which the default
+    PROVENANCE pattern names too. First role wins; nothing is uploaded twice."""
+    for name in ("volumes.json", "wrapup.json", "report.html"):
+        (tmp_path / name).write_text("x")
+    contract = RecordContract.from_env({"XNW_CARD_ID": "c", "XNW_RESOURCE_METRICS": "*.json"})
+    files = collect_files(tmp_path, contract)
+    assert [p.name for p in files["METRICS"]] == ["volumes.json", "wrapup.json"]
+    assert "PROVENANCE" not in files
+    every = [p for paths in files.values() for p in paths]
+    assert len(every) == len(set(every)) == 3
+
+
 @pytest.mark.parametrize("name,fmt", [("a.nii.gz", "NIFTI"), ("a.nii", "NIFTI"), ("a.seg.dcm", "DICOM"),
                                       ("volumes.json", "JSON"), ("x.stl", "STL"), ("README", "FILE")])
 def test_upload_format_by_suffix(name, fmt):
@@ -280,6 +293,20 @@ def test_cli_publish_failure_is_recorded_not_fatal(xnat, tmp_path, monkeypatch, 
     assert code == 0                                    # masks and report still delivered
     assert (out / "volumes.json").exists()
     assert "error" in manifest["analysis_record"] and "HTTP 500" in manifest["analysis_record"]["error"]
+    assert "not published" in caplog.text
+
+
+def test_cli_bad_contract_glob_is_recorded_not_fatal(xnat, tmp_path, monkeypatch, caplog):
+    """Codex P1 on PR #3: an absolute glob makes Path.glob raise NotImplementedError; that must
+    land in wrapup.json as the record's error, with the masks still delivered."""
+    host, handler = xnat
+    caplog.set_level(logging.ERROR, logger="segwrapup.publish")
+    code, manifest, out = _run_with_masks(tmp_path, monkeypatch, {**CONTEXT_ENV, "XNAT_HOST": host, "XNW_CARD_ID": "deepwmh",
+                                                                  "XNW_RESOURCE_METRICS": "/output/*.json"})
+    assert code == 0
+    assert (out / "segmentation.nii.gz").exists()
+    assert manifest["analysis_record"]["error"].startswith("NotImplementedError")
+    assert not [c for c in handler.calls if "/assessors/" in c["path"]], "nothing was PUT for the record"
     assert "not published" in caplog.text
 
 

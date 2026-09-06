@@ -147,7 +147,9 @@ def collect_files(output_dir: Path, contract: RecordContract) -> dict[str, list[
         paths: list[Path] = []
         for pattern in patterns:
             for path in sorted(output_dir.glob(pattern)):
-                if path.is_file() and path not in paths and not _is_hidden(path, output_dir):
+                # first role to name a file owns it: overlapping globs (METRICS "*.json" and the
+                # default PROVENANCE "wrapup.json") must not upload one file twice
+                if path.is_file() and path not in paths and path not in claimed and not _is_hidden(path, output_dir):
                     paths.append(path)
         if paths:
             found[role] = paths
@@ -292,10 +294,14 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
         logger.error("analysis record not published; XNW_CONTRACT is set but the XNAT context is incomplete")
         return {"error": "XNAT context incomplete"}
     label = (getattr(args, "record_label", "") or "").strip() or collection_label(args.model, context.scan or args.scan)
-    files = collect_files(output_dir, contract)
-    xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present, output_dir=output_dir)
+    # Everything from file collection onwards is guarded: a bad contract glob (an absolute
+    # pattern makes Path.glob raise NotImplementedError) must be recorded, not abort delivery
+    # of the masks, report and ROI collection that are already on disk.
     try:
+        files = collect_files(output_dir, contract)
+        xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present, output_dir=output_dir)
         return publish_record(context, label, xml, files, output_dir=output_dir)
-    except RuntimeError as error:
-        logger.error("analysis record not published; files and ROI collection still delivered: %s", error)
-        return {"label": label, "error": str(error)}
+    except (RuntimeError, ValueError, NotImplementedError, OSError) as error:
+        logger.error("analysis record %s not published; files and ROI collection still delivered: %s: %s",
+                     label, type(error).__name__, error, exc_info=True)
+        return {"label": label, "error": f"{type(error).__name__}: {error}"}
