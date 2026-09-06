@@ -219,7 +219,10 @@ image lineage, entrypoint `proc-wrapup`, image `xnatworks/proc-wrapup:<version>`
   because the Container Service never runs a wrapup after a non-zero exit) and publishes
   `run_status FAILED` / auto QC `FAIL` in that case;
 - fetches the parent container's stdout/stderr and timing from the Container Service into
-  `logs/` (found by the workflow id in `status.json`, else by workflow order);
+  `logs/` (found by the workflow id in `status.json`, else by the mount the two containers
+  share: the Container Service resolves the wrapup's `/input` from the parent's output mount,
+  and never by workflow-id order, which a concurrent run can break); `--no-publish` leaves this
+  capture on and suppresses only the record;
 - writes `report.html` (what ran, how it ended, the files kept, log tails) and `wrapup.json`;
 - publishes the record with the `XNW_*` contract exactly as seg-wrapup does. Default roles:
   `REPORT` report.html, `PROVENANCE` wrapup.json + status.json, `LOGS` logs/*.log, `DERIVED`

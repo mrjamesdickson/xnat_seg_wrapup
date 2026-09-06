@@ -11,12 +11,15 @@ way. This module gathers them for any card:
   (the Container Service never runs a wrapup after a non-zero exit, so a card that wants a
   record on failure writes this file and exits 0).
 - ``fetch_parent_logs``: the parent container's stdout/stderr and timing from the Container
-  Service, found through the workflow id ``status.json`` carries (or the wrapup's own
-  ``XNAT_WORKFLOW_ID`` as a fallback search), written to ``/output/logs/``.
+  Service, found through the workflow id ``status.json`` carries, or through the mounts: the
+  Container Service resolves the wrapup's ``/input`` from the parent's output mount, so the
+  two containers share one ``xnat-host-path`` (verified on demo02, containers 35531/35532).
+  The wrapup's own record is found by ``XNAT_WORKFLOW_ID``. Written to ``/output/logs/``.
 """
 from __future__ import annotations
 
 import datetime as dt
+import http.client
 import json
 import logging
 import os
@@ -96,39 +99,69 @@ def _get_text(context: XnatContext, url: str, timeout: float) -> str:
 
 
 def _duration_seconds(container: dict) -> int | None:
-    """Seconds between the first 'running'-ish and the final status entry of the CS history."""
-    stamps = []
+    """Seconds the parent actually ran: from the docker 'running' event to the docker
+    'complete'/'failed' event when the CS history has them, else first to last entry (which
+    also counts the time the container sat Created and Finalizing)."""
+    stamps: list[tuple[str, dt.datetime]] = []
     for entry in container.get("history") or []:
         when = entry.get("time-recorded") or entry.get("external-timestamp")
         if not when:
             continue
         try:
-            stamps.append(dt.datetime.fromisoformat(str(when).replace("Z", "+00:00")))
+            stamps.append((str(entry.get("status") or "").lower(), dt.datetime.fromisoformat(str(when).replace("Z", "+00:00"))))
         except ValueError:
             continue
     if len(stamps) < 2:
         return None
-    return int((max(stamps) - min(stamps)).total_seconds())
+    started = next((t for status, t in stamps if status == "running"), None)
+    ended = next((t for status, t in stamps if status in ("complete", "failed", "done", "die") and started and t >= started), None)
+    if started and ended:
+        return int((ended - started).total_seconds())
+    times = [t for _, t in stamps]
+    return int((max(times) - min(times)).total_seconds())
+
+
+def _mount_paths(container: dict, writable: bool | None) -> set[str]:
+    """xnat-host-paths of a container's mounts, optionally only the writable (output) or read-only (input) ones."""
+    return {str(m.get("xnat-host-path")) for m in container.get("mounts") or []
+            if isinstance(m, dict) and m.get("xnat-host-path") and (writable is None or bool(m.get("writable")) == writable)}
+
+
+HELPER_SUBTYPES = ("docker-wrapup", "docker-setup")
 
 
 def find_parent_container(context: XnatContext, workflow_id: str | None, own_workflow_id: str | None,
                           timeout: float = 60.0) -> dict | None:
     """The parent (main) container: by the workflow id the parent recorded in status.json, else
-    the docker container whose workflow id precedes the wrapup's own (the Container Service
-    assigns them consecutively when it launches the wrapup at finalisation)."""
+    by the mounts. The Container Service hides the parent link from its REST model, but it
+    resolves the wrapup's input mount from the parent's output mount, so the wrapup's own
+    container (found by ``XNAT_WORKFLOW_ID``) and the parent share an ``xnat-host-path``.
+    Workflow ids are not used for adjacency: on a busy server the id before the wrapup's own
+    belongs to whatever launched while the parent ran."""
     try:
         containers = _get_json(context, f"{context.host}/xapi/containers", timeout)
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, ValueError) as error:
         logger.warning("could not list containers to find the parent run: %s", error)
         return None
-    by_workflow = {str(c.get("workflow-id")): c for c in containers if c.get("workflow-id")}
+    if not isinstance(containers, list):
+        logger.warning("container list is not a list; parent run not found")
+        return None
+    by_workflow = {str(c.get("workflow-id")): c for c in containers if isinstance(c, dict) and c.get("workflow-id")}
     if workflow_id and str(workflow_id) in by_workflow:
         return by_workflow[str(workflow_id)]
-    if own_workflow_id and own_workflow_id.isdigit():
-        candidate = by_workflow.get(str(int(own_workflow_id) - 1))
-        if candidate and candidate.get("subtype") not in ("docker-wrapup", "docker-setup"):
-            return candidate
-    logger.info("parent container not found (status.json workflow_id=%s, own=%s); LOGS skipped", workflow_id, own_workflow_id)
+    own = by_workflow.get(str(own_workflow_id)) if own_workflow_id else None
+    inputs = _mount_paths(own, writable=False) if own else set()
+    if inputs:
+        parents = [c for c in containers if isinstance(c, dict) and c is not own
+                   and c.get("subtype") not in HELPER_SUBTYPES and _mount_paths(c, writable=True) & inputs]
+        if len(parents) == 1:
+            return parents[0]
+        if parents:
+            logger.warning("%d containers write to the wrapup's input mount %s; parent ambiguous, LOGS skipped",
+                           len(parents), sorted(inputs))
+            return None
+    logger.info("parent container not found (status.json workflow_id=%s, own=%s, own container %s); LOGS skipped",
+                workflow_id, own_workflow_id, "found" if own else "not found")
     return None
 
 
@@ -144,7 +177,7 @@ def fetch_parent_logs(context: XnatContext, output_dir: Path, status: dict | Non
     for stream in ("stdout", "stderr"):
         try:
             text = _get_text(context, f"{context.host}/xapi/containers/{parent['id']}/logs/{stream}", timeout)
-        except (urllib.error.URLError, TimeoutError, OSError) as error:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as error:
             logger.warning("could not fetch %s of container %s: %s", stream, parent["id"], error)
             continue
         (logs_dir / f"{stream}.log").write_text(text)

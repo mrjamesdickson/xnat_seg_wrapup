@@ -218,9 +218,11 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
     ``unmeasured_masks`` is how many delivered masks could not be measured: they still ship
     under DERIVED, so the record must not claim PASS while carrying an unusable output.
     ``facts`` lets a generic wrapup override what seg-wrapup derives from masks:
-    ``run_status``, ``auto_qc``, ``container_id``, ``duration_seconds``, ``notes``, ``inputs``.
+    ``run_status``, ``auto_qc``, ``container_id``, ``duration_seconds``, ``notes``, ``inputs``,
+    and ``wrapup`` (the publishing wrapup's name, ``seg-wrapup`` by default).
     """
     facts = facts or {}
+    wrapup_name = facts.get("wrapup") or "seg-wrapup"
     now = when or datetime.now(timezone.utc)
     structures = sum(len(r.get("structures", [])) for r in results)
     auto_qc = facts.get("auto_qc") or ("PASS" if results and structures > 0 and unmeasured_masks == 0 else "WARN")
@@ -240,7 +242,7 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
         _element("card_id", contract.card_id),
         _element("card_revision", contract.card_revision),
         _element("contract_version", contract.contract_version),
-        _element("wrapup_version", f"seg-wrapup {__version__}"),
+        _element("wrapup_version", f"{wrapup_name} {__version__}"),
         _element("run_status", facts.get("run_status") or "SUCCEEDED"),  # a wrapup only runs after the parent succeeded, unless status.json says otherwise
         _element("container_id", facts.get("container_id")),
         _element("duration_seconds", facts.get("duration_seconds")),
@@ -254,7 +256,7 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
         (f"  <analysis:scans><analysis:scan>{escape(context.scan)}</analysis:scan></analysis:scans>\n"
          if context.scan else ""),
         _element("inputs_json", json.dumps(inputs)),
-        _element("notes", facts.get("notes") or f"Published by seg-wrapup {__version__} from the {report.get('model')} run"),
+        _element("notes", facts.get("notes") or f"Published by {wrapup_name} {__version__} from the {report.get('model')} run"),
         _element("results_json", json.dumps(summary)),
     ])
     return (

@@ -88,7 +88,9 @@ def run(args: argparse.Namespace) -> int:
         (output_dir / STATUS_FILENAME).write_text(json.dumps(status, indent=2))
     run_status = run_status_from(status)
 
-    context = XnatContext.from_env() if not args.no_publish else None
+    # The XNAT context serves log capture as well as publishing; --no-publish suppresses only
+    # the record (publish_if_possible checks the flag), never the execution state.
+    context = XnatContext.from_env()
     execution = None
     try:
         if context is not None:
@@ -116,7 +118,7 @@ def run(args: argparse.Namespace) -> int:
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
 
         report = {"model": args.pipeline, "model_version": args.pipeline_version, "scan": args.scan}
-        record_facts = {"run_status": run_status, "auto_qc": "FAIL" if run_status == "FAILED" else "NOT_EVALUATED",
+        record_facts = {"wrapup": "proc-wrapup", "run_status": run_status, "auto_qc": "FAIL" if run_status == "FAILED" else "NOT_EVALUATED",
                         "container_id": (execution or {}).get("container_id"), "duration_seconds": (execution or {}).get("duration_seconds"),
                         "notes": f"Published by proc-wrapup {__version__}; tool output kept verbatim under {RAW_DIRNAME}/; nothing interpreted",
                         "inputs": {"scan": args.scan, "status_json": status is not None, "raw_files": len(copied)}}
