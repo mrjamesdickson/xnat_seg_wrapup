@@ -33,11 +33,12 @@ class _Handler(BaseHTTPRequestHandler):
     calls: list = []
     fail_paths: set = set()
     existing_labels: set = set()      # GET .../assessors/<label> answers 200 for these
+    get_status: int | None = None     # when set, every GET answers this instead
 
     def do_GET(self):
         _Handler.calls.append({"path": self.path, "method": "GET", "auth": self.headers.get("Authorization")})
         label = self.path.split("/assessors/")[-1].split("?")[0]
-        self.send_response(200 if label in _Handler.existing_labels else 404)
+        self.send_response(_Handler.get_status or (200 if label in _Handler.existing_labels else 404))
         self.end_headers()
 
     def do_DELETE(self):
@@ -67,7 +68,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def xnat():
-    _Handler.calls, _Handler.fail_paths, _Handler.existing_labels = [], set(), set()
+    _Handler.calls, _Handler.fail_paths, _Handler.existing_labels, _Handler.get_status = [], set(), set(), None
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_port}", _Handler
@@ -238,6 +239,16 @@ def test_publish_refuses_a_label_that_already_exists(xnat, tmp_path):
     with pytest.raises(RuntimeError, match="already exists"):
         publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", {})
     assert [c["method"] for c in handler.calls] == ["GET"], "nothing is written when the label exists"
+
+
+@pytest.mark.parametrize("status", [401, 403, 500, 503])
+def test_publish_refuses_when_the_existence_check_is_inconclusive(xnat, tmp_path, status):
+    """Codex round 4 on PR #3: anything but 404 must not fall through to a create-or-update PUT."""
+    host, handler = xnat
+    handler.get_status = status
+    with pytest.raises(RuntimeError, match=f"HTTP {status}"):
+        publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", {})
+    assert [c["method"] for c in handler.calls] == ["GET"]
 
 
 def test_publish_deletes_the_record_when_a_file_upload_fails(xnat, tmp_path):

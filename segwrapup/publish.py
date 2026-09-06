@@ -292,9 +292,13 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     """
     session = urllib.parse.quote(context.session, safe="")
     label_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(label, safe='')}"
-    if _request(context, "GET", f"{label_url}?format=json", timeout_seconds) == 200:
+    probe = _request(context, "GET", f"{label_url}?format=json", timeout_seconds)
+    if probe == 200:
         raise RuntimeError(f"label {label} already exists on {context.session}; the record is create-only, "
                            "pass a fresh --record-label or let the run stamp one")
+    if probe != 404:   # 401/403/5xx: cannot prove the label is free, and PUT would update if it is not
+        raise RuntimeError(f"could not verify that label {label} is free (existence check answered HTTP {probe}); "
+                           "not creating, because PUT to an existing label would update it")
     create_url = f"{label_url}?inbody=true"
     logger.info("publishing %s %s", XSI_TYPE, label)
     status, text = _put(context, create_url, xml.encode(), "application/xml", timeout_seconds)
