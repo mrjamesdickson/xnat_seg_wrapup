@@ -158,7 +158,7 @@
         {
           "name": "seg-resource",
           "accepts-command-output": "segmentation",
-          "via-wrapup-command": "xnatworks/seg-wrapup:0.3.1",
+          "via-wrapup-command": "xnatworks/seg-wrapup:0.4.0",
           "as-a-child-of": "scan",
           "type": "Resource",
           "label": "TOTALSEG"

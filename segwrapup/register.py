@@ -50,12 +50,12 @@ class XnatContext:
             "XNAT_HOST": env.get("XNAT_HOST", ""),
             "XNAT_USER": env.get("XNAT_USER", ""),
             "XNAT_PASS": env.get("XNAT_PASS", ""),
-            "SEG_PROJECT": env.get("SEG_PROJECT", ""),
-            "SEG_SESSION_ID": env.get("SEG_SESSION_ID", ""),
+            "SEG_PROJECT": env.get("SEG_PROJECT", "") or env.get("PROC_PROJECT", ""),
+            "SEG_SESSION_ID": env.get("SEG_SESSION_ID", "") or env.get("PROC_SESSION_ID", ""),
         }
         missing = [name for name, value in required.items() if not value.strip()]
         if missing:
-            logger.info("ROI registration skipped; missing %s", ", ".join(missing))
+            logger.info("ROI registration skipped (and publishing); XNAT context missing %s", ", ".join(missing))
             return None
         return cls(
             host=required["XNAT_HOST"].rstrip("/"),
@@ -63,7 +63,7 @@ class XnatContext:
             password=required["XNAT_PASS"],
             project=required["SEG_PROJECT"].strip(),
             session=required["SEG_SESSION_ID"].strip(),
-            scan=env.get("SEG_SCAN_ID", "").strip(),
+            scan=(env.get("SEG_SCAN_ID", "") or env.get("PROC_SCAN_ID", "")).strip(),
         )
 
 

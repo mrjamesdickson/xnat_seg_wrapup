@@ -1,0 +1,12 @@
+{
+  "name": "proc-wrapup",
+  "description": "Generic wrapup: keeps everything the tool wrote (raw/), captures the run's execution state and Container Service logs, writes a report, publishes the analysis:sessionAnalysisData record carrying all of it. Interprets nothing.",
+  "version": "0.4.0",
+  "type": "docker-wrapup",
+  "image": "xnatworks/proc-wrapup:0.4.0",
+  "command-line": "proc-wrapup",
+  "mounts": [],
+  "inputs": [],
+  "outputs": [],
+  "xnat": []
+}

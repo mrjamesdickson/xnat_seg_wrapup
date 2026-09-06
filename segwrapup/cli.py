@@ -156,6 +156,11 @@ def run(args: argparse.Namespace) -> int:
             shutil.copy2(mask, destination)
             delivered.append(destination)
 
+    # Everything else the tool wrote (statistics, labels, logs) is kept verbatim under raw/
+    # (plan D10): the masks are already at the top level, the DICOM copy is already in XNAT.
+    from .execution import copy_raw_output
+    manifest_raw = copy_raw_output(input_dir, output_dir, skip=tuple(masks) + (source_dicom,))
+
     results = []
     for mask in delivered:
         try:
@@ -170,6 +175,7 @@ def run(args: argparse.Namespace) -> int:
         "session": args.session,
         "scan": args.scan,
         "results": results,
+        "raw_files": manifest_raw,
     }
     if results:
         try:

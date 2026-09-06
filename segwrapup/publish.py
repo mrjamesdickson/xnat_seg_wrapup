@@ -94,16 +94,20 @@ class RecordContract:
     }
 
     @classmethod
-    def from_env(cls, environ: dict | None = None) -> "RecordContract | None":
-        """Parse ``XNW_CONTRACT`` (JSON) or the discrete ``XNW_*`` variables; ``None`` when neither is set."""
+    def from_env(cls, environ: dict | None = None, defaults: dict[str, list[str]] | None = None) -> "RecordContract | None":
+        """Parse ``XNW_CONTRACT`` (JSON) or the discrete ``XNW_*`` variables; ``None`` when neither is set.
+
+        ``defaults`` are the role globs used when the card declares none (seg-wrapup's by default;
+        proc-wrapup passes its own)."""
         env = os.environ if environ is None else environ
+        base = dict(defaults if defaults is not None else DEFAULT_RESOURCES)
         raw = env.get("XNW_CONTRACT", "").strip()
         if not raw:
             discrete = {field: env[key].strip() for key, field in cls.DISCRETE_KEYS.items() if env.get(key, "").strip()}
             if not discrete:
                 logger.info("no XNW_CONTRACT or XNW_* variables in the environment; no analysis record will be published")
                 return None
-            resources = dict(DEFAULT_RESOURCES)
+            resources = dict(base)
             for key, value in env.items():
                 if key.startswith("XNW_RESOURCE_") and value.strip():   # XNW_RESOURCE_METRICS="a.json,b.csv"
                     resources[_valid_role(key[len("XNW_RESOURCE_"):])] = [p.strip() for p in value.split(",") if p.strip()]
@@ -114,7 +118,7 @@ class RecordContract:
             raise ValueError(f"XNW_CONTRACT is not valid JSON: {error}") from error
         if not isinstance(data, dict):
             raise ValueError("XNW_CONTRACT must be a JSON object")
-        resources = dict(DEFAULT_RESOURCES)
+        resources = dict(base)
         declared = data.get("resources")
         if isinstance(declared, dict):
             for role, patterns in declared.items():
@@ -207,17 +211,23 @@ def _element(name: str, value) -> str:
 def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
                      report: dict, results: list[dict], files: dict[str, list[Path]],
                      source_dicom_present: bool, when: datetime | None = None,
-                     output_dir: Path | None = None, unmeasured_masks: int = 0) -> str:
+                     output_dir: Path | None = None, unmeasured_masks: int = 0,
+                     facts: dict | None = None) -> str:
     """The assessor document XNAT ingests. Fields: type, status, QC, provenance. No measurements.
 
     ``unmeasured_masks`` is how many delivered masks could not be measured: they still ship
     under DERIVED, so the record must not claim PASS while carrying an unusable output.
+    ``facts`` lets a generic wrapup override what seg-wrapup derives from masks:
+    ``run_status``, ``auto_qc``, ``container_id``, ``duration_seconds``, ``notes``, ``inputs``,
+    and ``wrapup`` (the publishing wrapup's name, ``seg-wrapup`` by default).
     """
+    facts = facts or {}
+    wrapup_name = facts.get("wrapup") or "seg-wrapup"
     now = when or datetime.now(timezone.utc)
     structures = sum(len(r.get("structures", [])) for r in results)
-    auto_qc = "PASS" if results and structures > 0 and unmeasured_masks == 0 else "WARN"
-    inputs = {"scan": context.scan or report.get("scan") or "", "source_dicom": source_dicom_present,
-              "masks": [r.get("file") for r in results], "unmeasured_masks": unmeasured_masks}
+    auto_qc = facts.get("auto_qc") or ("PASS" if results and structures > 0 and unmeasured_masks == 0 else "WARN")
+    inputs = facts.get("inputs") or {"scan": context.scan or report.get("scan") or "", "source_dicom": source_dicom_present,
+                                     "masks": [r.get("file") for r in results], "unmeasured_masks": unmeasured_masks}
     summary = {"model": report.get("model"), "model_version": report.get("model_version"),
                "structures": structures,
                "total_volume_ml": round(sum(r.get("total_volume_ml", 0) for r in results), 2),
@@ -232,8 +242,10 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
         _element("card_id", contract.card_id),
         _element("card_revision", contract.card_revision),
         _element("contract_version", contract.contract_version),
-        _element("wrapup_version", f"seg-wrapup {__version__}"),
-        _element("run_status", "SUCCEEDED"),  # a wrapup only runs after the parent succeeded
+        _element("wrapup_version", f"{wrapup_name} {__version__}"),
+        _element("run_status", facts.get("run_status") or "SUCCEEDED"),  # a wrapup only runs after the parent succeeded, unless status.json says otherwise
+        _element("container_id", facts.get("container_id")),
+        _element("duration_seconds", facts.get("duration_seconds")),
         _element("publication_status", "DRAFT"),
         _element("build_timestamp", now.strftime("%Y-%m-%dT%H:%M:%S")),
         _element("supersedes_id", contract.supersedes_id),
@@ -244,7 +256,7 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
         (f"  <analysis:scans><analysis:scan>{escape(context.scan)}</analysis:scan></analysis:scans>\n"
          if context.scan else ""),
         _element("inputs_json", json.dumps(inputs)),
-        _element("notes", f"Published by seg-wrapup {__version__} from the {report.get('model')} run"),
+        _element("notes", facts.get("notes") or f"Published by {wrapup_name} {__version__} from the {report.get('model')} run"),
         _element("results_json", json.dumps(summary)),
     ])
     return (
@@ -339,13 +351,14 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
 
 def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict],
                         source_dicom_present: bool, unmeasured_masks: int = 0,
-                        context: XnatContext | None = None) -> dict | None:
+                        context: XnatContext | None = None, facts: dict | None = None,
+                        default_resources: dict[str, list[str]] | None = None) -> dict | None:
     """Publish when the card opted in and the context is present. Never raises."""
     if getattr(args, "no_publish", False):
         logger.info("analysis record skipped by flag")
         return None
     try:
-        contract = RecordContract.from_env()
+        contract = RecordContract.from_env(defaults=default_resources)
     except ValueError as error:
         logger.error("analysis record not published; the contract is unusable: %s", error)
         return {"error": str(error)}
@@ -355,14 +368,14 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
     if context is None:
         logger.error("analysis record not published; XNW_CONTRACT is set but the XNAT context is incomplete")
         return {"error": "XNAT context incomplete"}
-    label = (getattr(args, "record_label", "") or "").strip() or collection_label(args.model, context.scan or args.scan)
+    label = (getattr(args, "record_label", "") or "").strip() or collection_label(getattr(args, "model", None) or getattr(args, "pipeline", "run"), context.scan or args.scan)
     # Everything from file collection onwards is guarded: a bad contract glob (an absolute
     # pattern makes Path.glob raise NotImplementedError) must be recorded, not abort delivery
     # of the masks, report and ROI collection that are already on disk.
     try:
         files = collect_files(output_dir, contract)
         xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present,
-                               output_dir=output_dir, unmeasured_masks=unmeasured_masks)
+                               output_dir=output_dir, unmeasured_masks=unmeasured_masks, facts=facts)
         return publish_record(context, label, xml, files, output_dir=output_dir)
     except (RuntimeError, ValueError, NotImplementedError, OSError) as error:
         logger.error("analysis record %s not published; files and ROI collection still delivered: %s: %s",

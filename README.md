@@ -75,7 +75,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.3.1"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.4.0"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -188,8 +188,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.3.1 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.3.1
+docker build -t xnatworks/seg-wrapup:0.4.0 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.4.0
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
@@ -205,3 +205,29 @@ CLI's failure policy, and that the Dockerfile label matches `commands/seg-wrapup
 
 Apache 2.0. This image contains no model weights. Research and decision support
 only; not a medical device.
+
+## proc-wrapup: the generic wrapup (since 0.4.0)
+
+For cards that are not segmentations (QC pipelines, diffusion, radiomics, anything). Same
+image lineage, entrypoint `proc-wrapup`, image `xnatworks/proc-wrapup:<version>`
+(`Dockerfile.proc`). It interprets nothing:
+
+- copies everything the tool wrote to `/output/raw/` (hidden entries such as `.source_dicom`
+  excluded), so the scan/session resource and the record's `DERIVED` carry the whole run;
+- reads `status.json` if the card's command line trapped a failure (`…; rc=$?; echo
+  "{\"exit_code\": $rc, \"workflow_id\": \"$XNAT_WORKFLOW_ID\"}" > /output/status.json; exit 0`,
+  because the Container Service never runs a wrapup after a non-zero exit) and publishes
+  `run_status FAILED` / auto QC `FAIL` in that case;
+- fetches the parent container's stdout/stderr and timing from the Container Service into
+  `logs/` (found by the workflow id in `status.json`, else by the mount the two containers
+  share: the Container Service resolves the wrapup's `/input` from the parent's output mount,
+  and never by workflow-id order, which a concurrent run can break); `--no-publish` leaves this
+  capture on and suppresses only the record;
+- writes `report.html` (what ran, how it ended, the files kept, log tails) and `wrapup.json`;
+- publishes the record with the `XNW_*` contract exactly as seg-wrapup does. Default roles:
+  `REPORT` report.html, `PROVENANCE` wrapup.json + status.json, `LOGS` logs/*.log, `DERIVED`
+  everything else; a card names `METRICS` globs itself (e.g. `XNW_RESOURCE_METRICS=raw/features.csv`).
+
+Environment: `PROC_PIPELINE_NAME` / `PROC_PIPELINE_VERSION` (fallback `SEG_MODEL_*`, then
+`XNW_CARD_ID`/`XNW_CARD_REVISION`), `PROC_PROJECT` / `PROC_SESSION_ID` / `PROC_SCAN_ID` (or the
+`SEG_*` names), `PROC_NO_PUBLISH`, `PROC_RECORD_LABEL`.
