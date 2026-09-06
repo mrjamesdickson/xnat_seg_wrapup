@@ -208,6 +208,10 @@ def run(args: argparse.Namespace) -> int:
     (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
     from .publish import publish_if_possible
 
+    # Same label as the ROI collection when one was registered: the two are one run's siblings.
+    roi = manifest.get("roi_collection") or {}
+    if roi.get("label") and not roi.get("error") and not (args.record_label or "").strip():
+        args.record_label = roi["label"]
     manifest["analysis_record"] = publish_if_possible(args, output_dir, report, results, source_dicom.is_dir())
     (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
     for result in results:

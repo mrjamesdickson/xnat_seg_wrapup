@@ -211,6 +211,24 @@ def test_cli_publishes_record_when_contract_and_context_present(xnat, tmp_path, 
     assert b"<analysis:card_id>deepwmh</analysis:card_id>" in create["body"]
 
 
+def test_cli_record_shares_the_roi_collection_label(xnat, tmp_path, monkeypatch):
+    """One run, one label: the ROI collection and the record must not differ by a clock tick."""
+    host, handler = xnat
+    inp, out = tmp_path / "in", tmp_path / "out"
+    inp.mkdir()
+    write_ct_series(inp / ".source_dicom")
+    write_mask(inp / "segmentation.nii.gz", blob_mask(), affine=series_ras_affine())
+    for key, value in {**CONTEXT_ENV, "XNAT_HOST": host, "XNW_CONTRACT": json.dumps(CONTRACT)}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("SEG_NO_REGISTER", raising=False)
+    assert cli.main(["--input", str(inp), "--output", str(out), "--model", "DeepWMH", "--model-version", "1.0.1"]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["roi_collection"]["label"] == manifest["analysis_record"]["label"]
+    roi_puts = [c for c in handler.calls if "/xapi/roi/" in c["path"]]
+    record_puts = [c for c in handler.calls if "/assessors/" in c["path"] and "/out/" not in c["path"]]
+    assert len(roi_puts) == 1 and len(record_puts) == 1
+
+
 def test_cli_without_contract_publishes_nothing(xnat, tmp_path, monkeypatch, caplog):
     host, handler = xnat
     with caplog.at_level(logging.INFO):
