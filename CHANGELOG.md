@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 (2026-09-06)
+
+The generic-assessor strategy for every card (James, 2026-09-06):
+
+- **proc-wrapup**, a second entrypoint and image (`xnatworks/proc-wrapup`, built from this package): the generic wrapup for any card. Keeps everything the tool wrote under `raw/`, captures the run's execution state (`status.json` from a trapped failure; the parent container's stdout/stderr and timing from the Container Service, into `logs/`), writes a report that interprets nothing, and publishes the `analysis:sessionAnalysisData` record with `LOGS`, `REPORT`, `PROVENANCE` and `DERIVED` resources (plus `METRICS` where the card names globs). `run_status FAILED` / auto QC `FAIL` when the parent recorded a non-zero exit.
+- seg-wrapup also keeps the tool's other output verbatim under `raw/` (statistics, label files, logs were dropped before).
+- One XNAT session per run: login once on the first request, cookie on every call, logout at the end; Basic auth fallback.
+- Record fields `container_id` and `duration_seconds` are filled when the Container Service knows them.
+- `PROC_*` environment names are accepted alongside `SEG_*` for the XNAT context.
+
 ## 0.3.1 (2026-09-06)
 
 Hardening of the analysis-record publisher from the PR #3 review, no new behaviour:
