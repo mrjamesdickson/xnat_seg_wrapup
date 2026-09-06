@@ -19,6 +19,26 @@ This is the one piece of new code behind the model catalog epic: upstream images
 (TotalSegmentator, MOOSE, MuscleMap, MONAI bundles) are wrapped by a `command.json`
 and this wrapup, so every card produces the same resource layout.
 
+## Analysis record (since 0.3.0)
+
+When the card opts in by setting `XNW_CONTRACT` (JSON; the registry installer writes it from
+the card's `results` block), the wrapup publishes an `analysis:sessionAnalysisData` record on
+the session after the ROI collection: **type, status, QC and provenance**, plus the small
+files (`METRICS`: volumes.json/csv, `REPORT`: report.html, `PROVENANCE`: wrapup.json, label
+files). The masks and SEG stay on the parent's resource; the record's `output_resource_label`
+points at it. No measurement is ever a field on the record: the numbers are in `METRICS`.
+
+No `XNW_CONTRACT`, no record; nothing else changes. Publishing is create-or-fail and additive:
+a failure is logged and written to `wrapup.json` under `analysis_record`, and the masks,
+report and ROI collection still ship. The record label is the ROI collection's sibling
+(`<model>_scan<id>_<UTC stamp>`), overridable with `--record-label` / `SEG_RECORD_LABEL`;
+`--no-publish` / `SEG_NO_PUBLISH` switches it off. The datatype is provided by
+`xnat-analysis-schema-plugin`; design in `development/xnat_genericProcessing_plugin/docs/`.
+
+Contract keys: `card_id`, `card_revision`, `contract_version`, `analysis_type`,
+`container_image`, `container_digest`, `output_resource_label`, `supersedes_id`, and
+`resources` (role -> list of file globs, merged over the defaults above).
+
 ## How a wrapup command works
 
 Verified against the Container Service source (`CommandResolutionServiceImpl`,
@@ -41,7 +61,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.2.5"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.3.0"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -154,8 +174,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.2.5 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.2.5
+docker build -t xnatworks/seg-wrapup:0.3.0 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.3.0
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
