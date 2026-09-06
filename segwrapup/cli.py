@@ -48,6 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-dicom-seg", action="store_true", default=_env_flag("SEG_NO_DICOM_SEG"), help="skip DICOM SEG even if source DICOM is present")
     parser.add_argument("--no-register", action="store_true", default=_env_flag("SEG_NO_REGISTER"),
                         help="do not register the DICOM SEG as an XNAT ROI collection even when the context is present")
+    parser.add_argument("--no-publish", action="store_true", default=_env_flag("SEG_NO_PUBLISH"),
+                        help="do not publish an analysis:sessionAnalysisData record even when XNW_CONTRACT is set")
+    parser.add_argument("--record-label", default=os.environ.get("SEG_RECORD_LABEL", ""),
+                        help="label for the analysis record (default: <model>_scan<id>_<UTC stamp>, the ROI collection's sibling)")
     parser.add_argument("--roi-label", default=os.environ.get("SEG_ROI_LABEL", ""),
                         help="ROI collection label; default <model>_scan<id>_<timestamp>")
     parser.add_argument("--keep-seg-file", action="store_true", default=_env_flag("SEG_KEEP_SEG_FILE"),
@@ -199,6 +203,21 @@ def run(args: argparse.Namespace) -> int:
             dropped = drop_registered_seg(args, seg_path, manifest["roi_collection"])
             manifest["dicom_seg"]["retained_in_resource"] = not dropped
 
+    # wrapup.json first so it can ride along in PROVENANCE, then the record, then the manifest
+    # again with the publish outcome (the uploaded copy predates the outcome by design).
+    (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
+    from .publish import publish_if_possible
+
+    # Sibling of the ROI collection: same stamp, "_record" suffix. NOT the same label: XNAT
+    # experiment labels are unique per project across every experiment type, and the ROI
+    # collection is itself an assessor experiment, so an identical label turns the record's
+    # create into an update of the collection and XNAT answers a misleading
+    # 417 "Invalid character in experiment label".
+    roi = manifest.get("roi_collection") or {}
+    if roi.get("label") and not roi.get("error") and not (args.record_label or "").strip():
+        args.record_label = f"{roi['label']}_record"
+    manifest["analysis_record"] = publish_if_possible(args, output_dir, report, results, source_dicom.is_dir(),
+                                                      unmeasured_masks=len(delivered) - len(results))
     (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
     for result in results:
         for item in result["structures"]:

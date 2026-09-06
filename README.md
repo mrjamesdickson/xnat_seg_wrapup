@@ -19,6 +19,40 @@ This is the one piece of new code behind the model catalog epic: upstream images
 (TotalSegmentator, MOOSE, MuscleMap, MONAI bundles) are wrapped by a `command.json`
 and this wrapup, so every card produces the same resource layout.
 
+## Analysis record (since 0.3.0)
+
+When the card opts in, the wrapup publishes an `analysis:sessionAnalysisData` record on the
+session after the ROI collection. The record's **fields** are type, status, QC and provenance
+only; no measurement is ever a field (the numbers are in `METRICS`). The record's
+**resources carry the entire output of the run**: `METRICS` (volumes.json/csv,
+segmentation.tsv), `REPORT` (report.html), `PROVENANCE` (wrapup.json, label files) and
+`DERIVED`, which takes every other file the wrapup wrote, recursively, masks included. The
+same files are also on the parent's resource (`output_resource_label`) for OHIF and the
+viewer sidecars, so today the data output exists twice; the DICOM SEG registered as a ROI
+collection is not copied again.
+
+The card opts in through environment variables on its command, which the registry installer
+writes from the card's `results` block. The Container Service stores each value in a 255-char
+column, so the contract is **discrete variables**: `XNW_CARD_ID`, `XNW_CARD_REVISION`,
+`XNW_CONTRACT_VERSION`, `XNW_ANALYSIS_TYPE`, `XNW_CONTAINER_IMAGE`, `XNW_CONTAINER_DIGEST`,
+`XNW_OUTPUT_RESOURCE_LABEL`, `XNW_SUPERSEDES_ID`, and optional `XNW_RESOURCE_<ROLE>=a,b`
+globs per role (`XNW_RESOURCE_DERIVED` replaces the "everything else" default). A single
+`XNW_CONTRACT` JSON value is still honoured where it fits.
+
+No `XNW_*` variables, no record; nothing else changes. Publishing is create-only and
+additive: a label that already exists on the session is refused before any write, a file
+upload that fails after the create deletes the new record again, and every failure is logged
+and written to `wrapup.json` under `analysis_record` while the masks, report and ROI
+collection still ship. `auto_qc_status` is `WARN` when any delivered mask could not be
+measured. The record label is the ROI collection's label plus `_record`
+(`<model>_scan<id>_<UTC stamp>_record`), overridable with `--record-label` / `SEG_RECORD_LABEL`;
+`--no-publish` / `SEG_NO_PUBLISH` switches it off. The datatype is provided by
+`xnat-analysis-schema-plugin`; design in `development/xnat_genericProcessing_plugin/docs/`.
+
+Contract keys: `card_id`, `card_revision`, `contract_version`, `analysis_type`,
+`container_image`, `container_digest`, `output_resource_label`, `supersedes_id`, and
+`resources` (role -> list of file globs, merged over the defaults above).
+
 ## How a wrapup command works
 
 Verified against the Container Service source (`CommandResolutionServiceImpl`,
@@ -41,7 +75,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.2.5"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.3.0"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -154,8 +188,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.2.5 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.2.5
+docker build -t xnatworks/seg-wrapup:0.3.0 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.3.0
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
