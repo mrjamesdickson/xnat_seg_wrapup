@@ -1,9 +1,11 @@
 """Publish a generic analysis record for the run: ``analysis:sessionAnalysisData``.
 
-The record is the searchable, reviewable XNAT object a catalog card leaves behind next to
-its files. It holds **type, status, QC and provenance** and points at the files; it never
-holds a measurement. What the model measured stays in the ``METRICS`` resource
-(``volumes.json``), exactly as before. Design and rationale:
+The record is the searchable, reviewable XNAT object a catalog card leaves behind. It holds
+**type, status, QC and provenance** as fields, and it carries **the entire output of the run**
+as resources: ``METRICS``, ``REPORT`` and ``PROVENANCE`` for the files the contract names by
+role, and ``DERIVED`` for everything else the wrapup produced (masks, label maps, viewer
+sidecars). A reviewer QCs the run from the record alone. No field ever holds a measurement:
+what the model measured stays in ``METRICS`` (``volumes.json``). Design and rationale:
 ``development/xnat_genericProcessing_plugin/docs/DATATYPE-SPEC.md``.
 
 The wrapup already has everything the record needs: the Container Service injects
@@ -41,13 +43,23 @@ XSI_TYPE = "analysis:sessionAnalysisData"
 ANALYSIS_NS = "http://xnatworks.io/analysis"
 XNAT_NS = "http://nrg.wustl.edu/xnat"
 
-#: Files the record carries, by resource role, when the contract does not say otherwise.
-#: Masks, SEG and label maps stay on the parent's resource: the record points at them.
+#: Files the record carries by named role when the contract does not say otherwise. Every
+#: other file in the output directory goes to ``DERIVED`` (see :data:`DERIVED_ROLE`), so the
+#: record's resources together are the complete run output.
 DEFAULT_RESOURCES: dict[str, list[str]] = {
     "METRICS": ["volumes.json", "volumes.csv", "segmentation.tsv"],
     "REPORT": ["report.html"],
     "PROVENANCE": ["wrapup.json", "labels.txt", "labels.ctbl"],
 }
+
+#: The role for the data output itself (design §6: images, labels, transforms, meshes). Unless a
+#: contract names ``DERIVED`` globs explicitly, it receives every file under the output directory,
+#: recursively, that no other role claimed. Dotfiles and dot-directories are never uploaded.
+DERIVED_ROLE = "DERIVED"
+
+#: Upload ``format`` by extension where the suffix alone would mislead XNAT (``.nii.gz`` -> ``GZ``).
+FORMAT_BY_SUFFIX = {".nii.gz": "NIFTI", ".nii": "NIFTI", ".seg.dcm": "DICOM", ".dcm": "DICOM",
+                    ".tsv": "TSV", ".json": "JSON", ".csv": "CSV", ".html": "HTML", ".txt": "TEXT"}
 
 
 @dataclass(frozen=True)
@@ -115,18 +127,57 @@ class RecordContract:
         )
 
 
+def _is_hidden(path: Path, root: Path) -> bool:
+    return any(part.startswith(".") for part in path.relative_to(root).parts)
+
+
 def collect_files(output_dir: Path, contract: RecordContract) -> dict[str, list[Path]]:
-    """The files that exist in ``output_dir`` for each role, in contract order, no duplicates."""
+    """Every file in ``output_dir`` assigned to exactly one role.
+
+    Named roles first, in contract order, no duplicates. Then ``DERIVED`` takes all remaining
+    files (recursive, dotfiles excluded) unless the contract lists ``DERIVED`` globs itself, in
+    which case only those are taken. The union is the whole run output minus hidden files.
+    """
     found: dict[str, list[Path]] = {}
+    claimed: set[Path] = set()
+    explicit_derived = DERIVED_ROLE in contract.resources
     for role, patterns in contract.resources.items():
+        if role == DERIVED_ROLE:
+            continue
         paths: list[Path] = []
         for pattern in patterns:
             for path in sorted(output_dir.glob(pattern)):
-                if path.is_file() and path not in paths:
+                if path.is_file() and path not in paths and not _is_hidden(path, output_dir):
                     paths.append(path)
         if paths:
             found[role] = paths
+            claimed.update(paths)
+    if explicit_derived:
+        derived = [p for pattern in contract.resources[DERIVED_ROLE] for p in sorted(output_dir.glob(pattern))
+                   if p.is_file() and p not in claimed and not _is_hidden(p, output_dir)]
+    else:
+        derived = [p for p in sorted(output_dir.rglob("*")) if p.is_file() and p not in claimed and not _is_hidden(p, output_dir)]
+    if derived:
+        found[DERIVED_ROLE] = list(dict.fromkeys(derived))
     return found
+
+
+def upload_name(path: Path, output_dir: Path | None) -> str:
+    """The file's name on the record: its path relative to the output directory, POSIX style."""
+    if output_dir is not None:
+        try:
+            return path.relative_to(output_dir).as_posix()
+        except ValueError:
+            pass
+    return path.name
+
+
+def upload_format(path: Path) -> str:
+    lower = path.name.lower()
+    for suffix, fmt in FORMAT_BY_SUFFIX.items():
+        if lower.endswith(suffix):
+            return fmt
+    return path.suffix.lstrip(".").upper() or "FILE"
 
 
 def _element(name: str, value) -> str:
@@ -137,7 +188,8 @@ def _element(name: str, value) -> str:
 
 def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
                      report: dict, results: list[dict], files: dict[str, list[Path]],
-                     source_dicom_present: bool, when: datetime | None = None) -> str:
+                     source_dicom_present: bool, when: datetime | None = None,
+                     output_dir: Path | None = None) -> str:
     """The assessor document XNAT ingests. Fields: type, status, QC, provenance. No measurements."""
     now = when or datetime.now(timezone.utc)
     structures = sum(len(r.get("structures", [])) for r in results)
@@ -147,7 +199,7 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
     summary = {"model": report.get("model"), "model_version": report.get("model_version"),
                "structures": structures,
                "total_volume_ml": round(sum(r.get("total_volume_ml", 0) for r in results), 2),
-               "files": {role: [p.name for p in paths] for role, paths in files.items()}}
+               "files": {role: [upload_name(p, output_dir) for p in paths] for role, paths in files.items()}}
     output_count = sum(len(v) for v in files.values())
     body = "".join([
         _element("analysis_type", contract.analysis_type),
@@ -197,8 +249,11 @@ def _put(context: XnatContext, url: str, body: bytes, content_type: str, timeout
 
 
 def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, list[Path]],
-                   timeout_seconds: float = 300.0) -> dict:
-    """Create the record, then upload each role's files to its ``out`` resource. Raises RuntimeError."""
+                   timeout_seconds: float = 300.0, output_dir: Path | None = None) -> dict:
+    """Create the record, then upload each role's files to its ``out`` resource. Raises RuntimeError.
+
+    File names on the record are paths relative to ``output_dir`` so nested output keeps its shape.
+    """
     session = urllib.parse.quote(context.session, safe="")
     create_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(label, safe='')}?inbody=true"
     logger.info("publishing %s %s", XSI_TYPE, label)
@@ -207,12 +262,12 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     uploaded: dict[str, list[str]] = {}
     for role, paths in files.items():
         for path in paths:
+            name = upload_name(path, output_dir)
             content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            fmt = path.suffix.lstrip(".").upper() or "FILE"
             url = (f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(record_id, safe='')}"
-                   f"/out/resources/{role}/files/{urllib.parse.quote(path.name, safe='')}?inbody=true&format={fmt}")
+                   f"/out/resources/{role}/files/{urllib.parse.quote(name, safe='/')}?inbody=true&format={upload_format(path)}")
             _put(context, url, path.read_bytes(), content_type, timeout_seconds)
-            uploaded.setdefault(role, []).append(path.name)
+            uploaded.setdefault(role, []).append(name)
     logger.info("analysis record %s published as %s with %d file(s)", label, record_id,
                 sum(len(v) for v in uploaded.values()))
     return {"xsi_type": XSI_TYPE, "id": record_id, "label": label, "status": status,
@@ -238,9 +293,9 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
         return {"error": "XNAT context incomplete"}
     label = (getattr(args, "record_label", "") or "").strip() or collection_label(args.model, context.scan or args.scan)
     files = collect_files(output_dir, contract)
-    xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present)
+    xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present, output_dir=output_dir)
     try:
-        return publish_record(context, label, xml, files)
+        return publish_record(context, label, xml, files, output_dir=output_dir)
     except RuntimeError as error:
         logger.error("analysis record not published; files and ROI collection still delivered: %s", error)
         return {"label": label, "error": str(error)}

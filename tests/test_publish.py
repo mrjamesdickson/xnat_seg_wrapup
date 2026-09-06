@@ -14,7 +14,8 @@ import pytest
 
 from segwrapup import __version__, cli
 from segwrapup.publish import (
-    DEFAULT_RESOURCES, XSI_TYPE, RecordContract, build_record_xml, collect_files, publish_record,
+    DEFAULT_RESOURCES, DERIVED_ROLE, XSI_TYPE, RecordContract, build_record_xml, collect_files, publish_record,
+    upload_format,
 )
 from segwrapup.register import XnatContext
 from tests.conftest import blob_mask, series_ras_affine, write_ct_series, write_mask
@@ -117,13 +118,36 @@ def test_contract_rejects_malformed_input(raw):
 
 # ── files and XML ──────────────────────────────────────────────────────────────
 
-def test_collect_files_follows_contract_roles_and_skips_missing(tmp_path):
-    for name in ("volumes.json", "report.html", "wrapup.json", "segmentation.nii.gz"):
+def test_collect_files_named_roles_then_everything_else_is_derived(tmp_path):
+    for name in ("volumes.json", "report.html", "wrapup.json", "segmentation.nii.gz", "segmentation_uint8.nii.gz"):
         (tmp_path / name).write_text("x")
+    (tmp_path / "meshes").mkdir()
+    (tmp_path / "meshes" / "liver.stl").write_text("x")
+    (tmp_path / ".source_dicom").mkdir()
+    (tmp_path / ".source_dicom" / "1.dcm").write_text("x")     # hidden: never uploaded
+    (tmp_path / ".DS_Store").write_text("x")
     files = collect_files(tmp_path, RecordContract())
-    assert {role: [p.name for p in paths] for role, paths in files.items()} == {
-        "METRICS": ["volumes.json"], "REPORT": ["report.html"], "PROVENANCE": ["wrapup.json"]}
-    # the mask is NOT carried: it stays on the parent's resource
+    assert {role: [p.relative_to(tmp_path).as_posix() for p in paths] for role, paths in files.items()} == {
+        "METRICS": ["volumes.json"], "REPORT": ["report.html"], "PROVENANCE": ["wrapup.json"],
+        DERIVED_ROLE: ["meshes/liver.stl", "segmentation.nii.gz", "segmentation_uint8.nii.gz"]}
+    # the whole output is on the record, each file in exactly one role
+    every = [p for paths in files.values() for p in paths]
+    assert len(every) == len(set(every)) == 6
+
+
+def test_collect_files_explicit_derived_globs_replace_the_everything_else_default(tmp_path):
+    for name in ("volumes.json", "segmentation.nii.gz", "scratch.bin"):
+        (tmp_path / name).write_text("x")
+    contract = RecordContract.from_env({"XNW_CARD_ID": "c", "XNW_RESOURCE_DERIVED": "*.nii.gz"})
+    files = collect_files(tmp_path, contract)
+    assert [p.name for p in files[DERIVED_ROLE]] == ["segmentation.nii.gz"]
+    assert "scratch.bin" not in str(files)
+
+
+@pytest.mark.parametrize("name,fmt", [("a.nii.gz", "NIFTI"), ("a.nii", "NIFTI"), ("a.seg.dcm", "DICOM"),
+                                      ("volumes.json", "JSON"), ("x.stl", "STL"), ("README", "FILE")])
+def test_upload_format_by_suffix(name, fmt):
+    assert upload_format(Path(name)) == fmt
 
 
 def test_record_xml_holds_type_status_qc_provenance_and_no_measurement_fields(tmp_path):
@@ -137,7 +161,7 @@ def test_record_xml_holds_type_status_qc_provenance_and_no_measurement_fields(tm
                      "<analysis:container_image>vnmd/deepwmh_1.0.1:20260826<", "<analysis:card_id>deepwmh<",
                      "<analysis:run_status>SUCCEEDED<", "<analysis:publication_status>DRAFT<",
                      "<analysis:review_state>PENDING_REVIEW<", "<analysis:auto_qc_status>PASS<",
-                     "<analysis:output_resource_label>DEEPWMH<", "<analysis:output_file_count>1<",
+                     "<analysis:output_resource_label>DEEPWMH<", "<analysis:output_file_count>1<",  # one file in tmp_path
                      "<analysis:scans><analysis:scan>2</analysis:scan></analysis:scans>",
                      f"<analysis:wrapup_version>seg-wrapup {__version__}<"):
         assert fragment in xml, fragment
@@ -161,16 +185,23 @@ def test_publish_creates_record_then_uploads_files_to_its_out_resources(xnat, tm
     host, handler = xnat
     (tmp_path / "volumes.json").write_text('{"a":1}')
     (tmp_path / "report.html").write_text("<html/>")
+    (tmp_path / "segmentation.nii.gz").write_bytes(b"\x1f\x8b")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "part.tsv").write_text("a\tb")
     files = collect_files(tmp_path, RecordContract())
-    outcome = publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", files)
+    outcome = publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", files, output_dir=tmp_path)
     assert outcome["id"] == "XNAT_E99999" and outcome["xsi_type"] == XSI_TYPE
     paths = [c["path"] for c in handler.calls]
     assert paths[0] == "/data/experiments/XNAT_E00018/assessors/DeepWMH_scan2_X?inbody=true"
     assert handler.calls[0]["content_type"] == "application/xml" and handler.calls[0]["body"] == b"<xml/>"
     assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/METRICS/files/volumes.json?inbody=true&format=JSON" in paths
     assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/REPORT/files/report.html?inbody=true&format=HTML" in paths
+    # the data output rides along under DERIVED, nested paths kept, NIfTI declared as NIFTI
+    assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/DERIVED/files/segmentation.nii.gz?inbody=true&format=NIFTI" in paths
+    assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/DERIVED/files/sub/part.tsv?inbody=true&format=TSV" in paths
     assert all(c["auth"].startswith("Basic ") for c in handler.calls)
-    assert outcome["uploaded"] == {"METRICS": ["volumes.json"], "REPORT": ["report.html"]}
+    assert outcome["uploaded"] == {"METRICS": ["volumes.json"], "REPORT": ["report.html"],
+                                   "DERIVED": ["segmentation.nii.gz", "sub/part.tsv"]}
 
 
 def test_publish_raises_with_http_detail(xnat, tmp_path):
