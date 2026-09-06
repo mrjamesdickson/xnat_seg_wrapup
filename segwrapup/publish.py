@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import logging
 import mimetypes
 import os
@@ -56,6 +57,11 @@ DEFAULT_RESOURCES: dict[str, list[str]] = {
 #: contract names ``DERIVED`` globs explicitly, it receives every file under the output directory,
 #: recursively, that no other role claimed. Dotfiles and dot-directories are never uploaded.
 DERIVED_ROLE = "DERIVED"
+
+#: Resource roles become path segments of the upload URL, so they are validated at parse time
+#: rather than escaped: an unsafe role is a contract error the wrapup records, not a request
+#: that ``urllib`` rejects after the record was created.
+ROLE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
 #: Upload ``format`` by extension where the suffix alone would mislead XNAT (``.nii.gz`` -> ``GZ``).
 FORMAT_BY_SUFFIX = {".nii.gz": "NIFTI", ".nii": "NIFTI", ".seg.dcm": "DICOM", ".dcm": "DICOM",
@@ -99,7 +105,7 @@ class RecordContract:
             resources = dict(DEFAULT_RESOURCES)
             for key, value in env.items():
                 if key.startswith("XNW_RESOURCE_") and value.strip():   # XNW_RESOURCE_METRICS="a.json,b.csv"
-                    resources[key[len("XNW_RESOURCE_"):].upper()] = [p.strip() for p in value.split(",") if p.strip()]
+                    resources[_valid_role(key[len("XNW_RESOURCE_"):])] = [p.strip() for p in value.split(",") if p.strip()]
             return cls(resources=resources, **{k: v for k, v in discrete.items()})
         try:
             data = json.loads(raw)
@@ -113,7 +119,7 @@ class RecordContract:
             for role, patterns in declared.items():
                 if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
                     raise ValueError(f"XNW_CONTRACT resources.{role} must be a list of file patterns")
-                resources[str(role).upper()] = patterns
+                resources[_valid_role(str(role))] = patterns
         return cls(
             card_id=str(data.get("card_id", "")),
             card_revision=str(data.get("card_revision", "")),
@@ -129,6 +135,13 @@ class RecordContract:
 
 def _is_hidden(path: Path, root: Path) -> bool:
     return any(part.startswith(".") for part in path.relative_to(root).parts)
+
+
+def _valid_role(role: str) -> str:
+    upper = role.strip().upper()
+    if not ROLE_PATTERN.match(upper):
+        raise ValueError(f"resource role {role!r} is not a valid XNAT resource label (letters, digits, underscore)")
+    return upper
 
 
 def collect_files(output_dir: Path, contract: RecordContract) -> dict[str, list[Path]]:
@@ -297,7 +310,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
                        f"?inbody=true&format={upload_format(path)}")
                 _put(context, url, path.read_bytes(), content_type, timeout_seconds)
                 uploaded.setdefault(role, []).append(name)
-    except RuntimeError as error:
+    except (RuntimeError, OSError) as error:   # OSError: the collected file vanished or is unreadable
         logger.error("upload to record %s failed after create; deleting the record so no partial record stays: %s",
                      record_id, error)
         try:

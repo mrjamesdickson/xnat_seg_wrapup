@@ -252,6 +252,33 @@ def test_publish_deletes_the_record_when_a_file_upload_fails(xnat, tmp_path):
     assert [c["path"] for c in deletes] == ["/data/experiments/XNAT_E00018/assessors/XNAT_E99999?removeFiles=true"]
 
 
+def test_publish_rolls_back_when_a_collected_file_vanished(xnat, tmp_path):
+    """Codex round 3 on PR #3: read_bytes() raising OSError skipped the rollback."""
+    host, handler = xnat
+    (tmp_path / "volumes.json").write_text("{}")
+    (tmp_path / "report.html").write_text("<html/>")
+    files = collect_files(tmp_path, RecordContract())
+    (tmp_path / "report.html").unlink()          # gone between collection and upload
+    with pytest.raises(RuntimeError, match=r"report.html.*record XNAT_E99999 deleted"):
+        publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", files)
+    assert [c["path"] for c in handler.calls if c["method"] == "DELETE"] == \
+        ["/data/experiments/XNAT_E00018/assessors/XNAT_E99999?removeFiles=true"]
+
+
+@pytest.mark.parametrize("role", ["QC RESULTS", "a/b", "x?y", "#tag", ""])
+def test_contract_rejects_unsafe_resource_roles(role):
+    """Codex round 3 on PR #3: a role with a space reached urllib as a raw path segment."""
+    with pytest.raises(ValueError, match="not a valid XNAT resource label"):
+        RecordContract.from_env({"XNW_CONTRACT": json.dumps({**CONTRACT, "resources": {role: ["*.json"]}})})
+    with pytest.raises(ValueError, match="not a valid XNAT resource label"):
+        RecordContract.from_env({"XNW_CARD_ID": "c", "XNW_RESOURCE_" + role: "*.json"})
+
+
+def test_contract_accepts_lowercase_roles_by_uppercasing():
+    contract = RecordContract.from_env({"XNW_CARD_ID": "c", "XNW_RESOURCE_logs": "*.log"})
+    assert contract.resources["LOGS"] == ["*.log"]
+
+
 def test_record_xml_warns_when_a_delivered_mask_could_not_be_measured():
     """Codex P1 on PR #3: one good mask plus one unmeasurable mask must not be auto QC PASS."""
     xml = build_record_xml(_context("http://x"), RecordContract(), "L", _report(), _results(), {},
