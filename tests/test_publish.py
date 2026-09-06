@@ -35,14 +35,21 @@ class _Handler(BaseHTTPRequestHandler):
     existing_labels: set = set()      # GET .../assessors/<label> answers 200 for these
     get_status: int | None = None     # when set, every GET answers this instead
 
+    def do_POST(self):
+        _Handler.calls.append({"path": self.path, "method": "POST", "auth": self.headers.get("Authorization"), "cookie": self.headers.get("Cookie")})
+        if self.path == "/data/JSESSION" and "/data/JSESSION" not in _Handler.fail_paths:
+            self.send_response(200); self.end_headers(); self.wfile.write(b"FAKESESSION1234")
+        else:
+            self.send_response(500); self.end_headers()
+
     def do_GET(self):
-        _Handler.calls.append({"path": self.path, "method": "GET", "auth": self.headers.get("Authorization")})
+        _Handler.calls.append({"path": self.path, "method": "GET", "auth": self.headers.get("Authorization"), "cookie": self.headers.get("Cookie")})
         label = self.path.split("/assessors/")[-1].split("?")[0]
         self.send_response(_Handler.get_status or (200 if label in _Handler.existing_labels else 404))
         self.end_headers()
 
     def do_DELETE(self):
-        _Handler.calls.append({"path": self.path, "method": "DELETE", "auth": self.headers.get("Authorization")})
+        _Handler.calls.append({"path": self.path, "method": "DELETE", "auth": self.headers.get("Authorization"), "cookie": self.headers.get("Cookie")})
         self.send_response(200)
         self.end_headers()
 
@@ -50,7 +57,7 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
         _Handler.calls.append({"path": self.path, "method": "PUT", "auth": self.headers.get("Authorization"),
-                               "content_type": self.headers.get("Content-Type"), "body": body})
+                               "cookie": self.headers.get("Cookie"), "content_type": self.headers.get("Content-Type"), "body": body})
         if any(self.path.startswith(p) for p in _Handler.fail_paths):
             self.send_response(500)
             self.end_headers()
@@ -218,17 +225,18 @@ def test_publish_creates_record_then_uploads_files_to_its_out_resources(xnat, tm
     files = collect_files(tmp_path, RecordContract())
     outcome = publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", files, output_dir=tmp_path)
     assert outcome["id"] == "XNAT_E99999" and outcome["xsi_type"] == XSI_TYPE
-    paths = [c["path"] for c in handler.calls]
+    calls = [c for c in handler.calls if c["path"] != "/data/JSESSION"]   # the lazy login is not a working request
+    paths = [c["path"] for c in calls]
     # create-only: existence is checked first, then the create PUT
-    assert paths[0] == "/data/experiments/XNAT_E00018/assessors/DeepWMH_scan2_X?format=json" and handler.calls[0]["method"] == "GET"
+    assert paths[0] == "/data/experiments/XNAT_E00018/assessors/DeepWMH_scan2_X?format=json" and calls[0]["method"] == "GET"
     assert paths[1] == "/data/experiments/XNAT_E00018/assessors/DeepWMH_scan2_X?inbody=true"
-    assert handler.calls[1]["content_type"] == "application/xml" and handler.calls[1]["body"] == b"<xml/>"
+    assert calls[1]["content_type"] == "application/xml" and calls[1]["body"] == b"<xml/>"
     assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/METRICS/files/volumes.json?inbody=true&format=JSON" in paths
     assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/REPORT/files/report.html?inbody=true&format=HTML" in paths
     # the data output rides along under DERIVED, nested paths kept, NIfTI declared as NIFTI
     assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/DERIVED/files/segmentation.nii.gz?inbody=true&format=NIFTI" in paths
     assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/DERIVED/files/sub/part.tsv?inbody=true&format=TSV" in paths
-    assert all(c["auth"].startswith("Basic ") for c in handler.calls)
+    assert all(c["cookie"] == "JSESSIONID=FAKESESSION1234" for c in calls)     # every working request on the one session
     assert outcome["uploaded"] == {"METRICS": ["volumes.json"], "REPORT": ["report.html"],
                                    "DERIVED": ["segmentation.nii.gz", "sub/part.tsv"]}
 
@@ -239,7 +247,7 @@ def test_publish_refuses_a_label_that_already_exists(xnat, tmp_path):
     handler.existing_labels = {"DeepWMH_scan2_X"}
     with pytest.raises(RuntimeError, match="already exists"):
         publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", {})
-    assert [c["method"] for c in handler.calls] == ["GET"], "nothing is written when the label exists"
+    assert [c["method"] for c in handler.calls if c["path"] != "/data/JSESSION"] == ["GET"], "nothing is written when the label exists"
 
 
 @pytest.mark.parametrize("status", [401, 403, 500, 503])
@@ -249,7 +257,7 @@ def test_publish_refuses_when_the_existence_check_is_inconclusive(xnat, tmp_path
     handler.get_status = status
     with pytest.raises(RuntimeError, match=f"HTTP {status}"):
         publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", {})
-    assert [c["method"] for c in handler.calls] == ["GET"]
+    assert [c["method"] for c in handler.calls if c["path"] != "/data/JSESSION"] == ["GET"]
 
 
 def test_probe_protocol_error_is_a_runtime_error_the_guard_records(xnat, tmp_path, monkeypatch):
@@ -452,3 +460,57 @@ def test_cli_no_publish_flag(xnat, tmp_path, monkeypatch):
     env = {**CONTEXT_ENV, "XNAT_HOST": host, "XNW_CONTRACT": json.dumps(CONTRACT)}
     code, manifest, _ = _run_with_masks(tmp_path, monkeypatch, env, "--no-publish")
     assert code == 0 and manifest["analysis_record"] is None and handler.calls == []
+
+
+# ── one XNAT session per run ───────────────────────────────────────────────────
+
+def test_cli_opens_one_session_uses_it_everywhere_and_closes_it(xnat, tmp_path, monkeypatch):
+    """James, 2026-09-06: '80 sessions open from 3 IPs'. A run must log in once, send the
+    cookie on every request, and log out at the end, instead of one server session per request."""
+    host, handler = xnat
+    inp, out = tmp_path / "in", tmp_path / "out"
+    inp.mkdir()
+    write_ct_series(inp / ".source_dicom")
+    write_mask(inp / "segmentation.nii.gz", blob_mask(), affine=series_ras_affine())
+    for key, value in {**CONTEXT_ENV, "XNAT_HOST": host, "XNW_CONTRACT": json.dumps(CONTRACT)}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("SEG_NO_REGISTER", raising=False)
+    assert cli.main(["--input", str(inp), "--output", str(out), "--model", "DeepWMH", "--model-version", "1.0.1"]) == 0
+    logins = [c for c in handler.calls if c["method"] == "POST" and c["path"] == "/data/JSESSION"]
+    logouts = [c for c in handler.calls if c["method"] == "DELETE" and c["path"] == "/data/JSESSION"]
+    assert len(logins) == 1 and logins[0]["auth"].startswith("Basic ")
+    assert len(logouts) == 1 and handler.calls[-1] is logouts[0], "logout is the last request"
+    working = [c for c in handler.calls if c["path"] != "/data/JSESSION"]
+    assert len(working) >= 10, "ROI registration, label probe, create and uploads"
+    assert all(c["cookie"] == "JSESSIONID=FAKESESSION1234" and c["auth"] is None for c in working), \
+        "every working request rides the one session, none carries Basic auth"
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E99999" and manifest["roi_collection"]["status"] == 200
+
+
+def test_cli_closes_the_session_even_when_publishing_fails(xnat, tmp_path, monkeypatch):
+    host, handler = xnat
+    handler.fail_paths = {"/data/experiments/XNAT_E00018/assessors/"}
+    env = {**CONTEXT_ENV, "XNAT_HOST": host, "XNW_CONTRACT": json.dumps(CONTRACT)}
+    code, manifest, out = _run_with_masks(tmp_path, monkeypatch, env)
+    assert code == 0 and "error" in manifest["analysis_record"]
+    assert handler.calls[-1]["method"] == "DELETE" and handler.calls[-1]["path"] == "/data/JSESSION"
+
+
+def test_cli_falls_back_to_basic_auth_when_login_fails(xnat, tmp_path, monkeypatch, caplog):
+    host, handler = xnat
+    handler.fail_paths = {"/data/JSESSION"}
+    env = {**CONTEXT_ENV, "XNAT_HOST": host, "XNW_CONTRACT": json.dumps(CONTRACT)}
+    with caplog.at_level(logging.WARNING):
+        code, manifest, out = _run_with_masks(tmp_path, monkeypatch, env)
+    assert code == 0 and manifest["analysis_record"]["id"] == "XNAT_E99999"
+    assert "falling back to Basic auth" in caplog.text
+    working = [c for c in handler.calls if c["path"] != "/data/JSESSION"]
+    assert all((c["auth"] or "").startswith("Basic ") and c["cookie"] is None for c in working)
+    assert not [c for c in handler.calls if c["method"] == "DELETE" and c["path"] == "/data/JSESSION"], "nothing to log out of"
+
+
+def test_cli_without_xnat_context_never_touches_the_session_endpoint(xnat, tmp_path, monkeypatch):
+    host, handler = xnat
+    code, manifest, out = _run_with_masks(tmp_path, monkeypatch, {})
+    assert code == 0 and not [c for c in handler.calls if c["path"] == "/data/JSESSION"]

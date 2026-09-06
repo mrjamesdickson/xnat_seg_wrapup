@@ -37,7 +37,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from . import __version__
-from .register import XnatContext, collection_label
+from .register import XnatContext, auth_headers, collection_label
 
 logger = logging.getLogger(__name__)
 
@@ -258,9 +258,8 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
 
 
 def _put(context: XnatContext, url: str, body: bytes, content_type: str, timeout: float) -> tuple[int, str]:
-    credentials = base64.b64encode(f"{context.user}:{context.password}".encode()).decode()
     request = urllib.request.Request(url, data=body, method="PUT",
-                                     headers={"Authorization": f"Basic {credentials}", "Content-Type": content_type})
+                                     headers={**auth_headers(context), "Content-Type": content_type})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, response.read().decode(errors="replace")[:500]
@@ -277,8 +276,7 @@ def _put(context: XnatContext, url: str, body: bytes, content_type: str, timeout
 
 def _request(context: XnatContext, method: str, url: str, timeout: float) -> int:
     """Status of a body-less request; HTTP errors return their code instead of raising."""
-    credentials = base64.b64encode(f"{context.user}:{context.password}".encode()).decode()
-    request = urllib.request.Request(url, method=method, headers={"Authorization": f"Basic {credentials}"})
+    request = urllib.request.Request(url, method=method, headers=auth_headers(context))
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status
@@ -340,7 +338,8 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
 
 
 def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict],
-                        source_dicom_present: bool, unmeasured_masks: int = 0) -> dict | None:
+                        source_dicom_present: bool, unmeasured_masks: int = 0,
+                        context: XnatContext | None = None) -> dict | None:
     """Publish when the card opted in and the context is present. Never raises."""
     if getattr(args, "no_publish", False):
         logger.info("analysis record skipped by flag")
@@ -352,7 +351,7 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
         return {"error": str(error)}
     if contract is None:
         return None
-    context = XnatContext.from_env()
+    context = context or XnatContext.from_env()
     if context is None:
         logger.error("analysis record not published; XNW_CONTRACT is set but the XNAT context is incomplete")
         return {"error": "XNAT context incomplete"}

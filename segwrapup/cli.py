@@ -181,59 +181,67 @@ def run(args: argparse.Namespace) -> int:
         logger.error("no mask could be measured; report skipped")
 
     manifest["dicom_seg"] = None
-    if args.no_dicom_seg:
-        logger.info("DICOM SEG skipped by flag")
-    elif not source_dicom.is_dir():
-        logger.info("no source DICOM at %s; DICOM SEG skipped", source_dicom)
-    elif len(delivered) != 1:
-        logger.warning("DICOM SEG needs exactly one label map, found %d; skipped", len(delivered))
-    else:
-        from .dicomseg import write_dicom_seg
-
-        seg_path = output_dir / "segmentation.seg.dcm"
-        try:
-            manifest["dicom_seg"] = write_dicom_seg(
-                delivered[0], source_dicom, label_table, seg_path,
-                model_name=args.model, model_version=args.model_version,
-            )
-        except Exception as error:  # noqa: BLE001 - SEG is additive; masks and report still ship
-            logger.error("DICOM SEG not written for %s: %s", delivered[0].name, error)
+    # One XNAT login for the whole run (ROI registration + record + uploads), closed at the
+    # end even when something fails; otherwise every request leaves its own server session.
+    from .register import XnatContext, close_session
+    context = XnatContext.from_env() if not (args.no_register and args.no_publish) else None
+    try:
+        if args.no_dicom_seg:
+            logger.info("DICOM SEG skipped by flag")
+        elif not source_dicom.is_dir():
+            logger.info("no source DICOM at %s; DICOM SEG skipped", source_dicom)
+        elif len(delivered) != 1:
+            logger.warning("DICOM SEG needs exactly one label map, found %d; skipped", len(delivered))
         else:
-            manifest["roi_collection"] = register_if_possible(args, seg_path)
-            dropped = drop_registered_seg(args, seg_path, manifest["roi_collection"])
-            manifest["dicom_seg"]["retained_in_resource"] = not dropped
+            from .dicomseg import write_dicom_seg
 
-    # wrapup.json first so it can ride along in PROVENANCE, then the record, then the manifest
-    # again with the publish outcome (the uploaded copy predates the outcome by design).
-    (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
-    from .publish import publish_if_possible
+            seg_path = output_dir / "segmentation.seg.dcm"
+            try:
+                manifest["dicom_seg"] = write_dicom_seg(
+                    delivered[0], source_dicom, label_table, seg_path,
+                    model_name=args.model, model_version=args.model_version,
+                )
+            except Exception as error:  # noqa: BLE001 - SEG is additive; masks and report still ship
+                logger.error("DICOM SEG not written for %s: %s", delivered[0].name, error)
+            else:
+                manifest["roi_collection"] = register_if_possible(args, seg_path, context)
+                dropped = drop_registered_seg(args, seg_path, manifest["roi_collection"])
+                manifest["dicom_seg"]["retained_in_resource"] = not dropped
 
-    # Sibling of the ROI collection: same stamp, "_record" suffix. NOT the same label: XNAT
-    # experiment labels are unique per project across every experiment type, and the ROI
-    # collection is itself an assessor experiment, so an identical label turns the record's
-    # create into an update of the collection and XNAT answers a misleading
-    # 417 "Invalid character in experiment label".
-    roi = manifest.get("roi_collection") or {}
-    if roi.get("label") and not roi.get("error") and not (args.record_label or "").strip():
-        args.record_label = f"{roi['label']}_record"
-    manifest["analysis_record"] = publish_if_possible(args, output_dir, report, results, source_dicom.is_dir(),
-                                                      unmeasured_masks=len(delivered) - len(results))
-    (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
-    for result in results:
-        for item in result["structures"]:
-            logger.info("  %s: %s mL (%s voxels)", item["name"], f"{item['volume_ml']:,.2f}", f"{item['voxels']:,}")
-    logger.info("delivered %d mask(s) to %s", len(delivered), output_dir)
+        # wrapup.json first so it can ride along in PROVENANCE, then the record, then the manifest
+        # again with the publish outcome (the uploaded copy predates the outcome by design).
+        (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
+        from .publish import publish_if_possible
+
+        # Sibling of the ROI collection: same stamp, "_record" suffix. NOT the same label: XNAT
+        # experiment labels are unique per project across every experiment type, and the ROI
+        # collection is itself an assessor experiment, so an identical label turns the record's
+        # create into an update of the collection and XNAT answers a misleading
+        # 417 "Invalid character in experiment label".
+        roi = manifest.get("roi_collection") or {}
+        if roi.get("label") and not roi.get("error") and not (args.record_label or "").strip():
+            args.record_label = f"{roi['label']}_record"
+        manifest["analysis_record"] = publish_if_possible(args, output_dir, report, results, source_dicom.is_dir(),
+                                                          unmeasured_masks=len(delivered) - len(results), context=context)
+        (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
+        for result in results:
+            for item in result["structures"]:
+                logger.info("  %s: %s mL (%s voxels)", item["name"], f"{item['volume_ml']:,.2f}", f"{item['voxels']:,}")
+        logger.info("delivered %d mask(s) to %s", len(delivered), output_dir)
+    finally:
+        if context is not None:
+            close_session(context)
     return 0
 
 
-def register_if_possible(args: argparse.Namespace, seg_path: Path) -> dict | None:
+def register_if_possible(args: argparse.Namespace, seg_path: Path, context=None) -> dict | None:
     """Register the SEG as an ROI collection when the parent passed the XNAT context. Never raises."""
     from .register import XnatContext, collection_label, register_roi_collection
 
     if args.no_register:
         logger.info("ROI registration skipped by flag")
         return None
-    context = XnatContext.from_env()
+    context = context or XnatContext.from_env()
     if context is None:
         return None
     label = args.roi_label.strip() or collection_label(args.model, context.scan or args.scan)
