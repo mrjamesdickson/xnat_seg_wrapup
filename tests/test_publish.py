@@ -14,7 +14,7 @@ import pytest
 
 from segwrapup import __version__, cli
 from segwrapup.publish import (
-    XSI_TYPE, RecordContract, build_record_xml, collect_files, publish_record,
+    DEFAULT_RESOURCES, XSI_TYPE, RecordContract, build_record_xml, collect_files, publish_record,
 )
 from segwrapup.register import XnatContext
 from tests.conftest import blob_mask, series_ras_affine, write_ct_series, write_mask
@@ -89,6 +89,24 @@ def test_contract_parses_fields_and_resource_overrides():
     assert contract.resources["METRICS"] == ["*.json"]          # override, upper-cased role
     assert contract.resources["LOGS"] == ["*.log"]              # new role
     assert contract.resources["REPORT"] == ["report.html"]      # default kept
+
+
+def test_contract_from_discrete_variables_the_container_service_can_store():
+    # CS caps each environment value at 255 chars, so the installer sets XNW_* variables.
+    env = {"XNW_CARD_ID": "deepwmh", "XNW_CARD_REVISION": "1.1.0", "XNW_CONTAINER_DIGEST": "sha256:" + "b" * 64,
+           "XNW_OUTPUT_RESOURCE_LABEL": "DEEPWMH", "XNW_RESOURCE_LOGS": "run.log, stderr.txt"}
+    contract = RecordContract.from_env(env)
+    assert contract.card_id == "deepwmh" and contract.card_revision == "1.1.0"
+    assert contract.container_digest.endswith("b" * 64) and contract.output_resource_label == "DEEPWMH"
+    assert contract.analysis_type == "segmentation"                  # default kept
+    assert contract.resources["LOGS"] == ["run.log", "stderr.txt"]   # extra role from XNW_RESOURCE_LOGS
+    assert contract.resources["METRICS"] == DEFAULT_RESOURCES["METRICS"]
+    assert all(len(v) <= 255 for v in env.values())
+
+
+def test_json_contract_wins_over_discrete_variables():
+    env = {"XNW_CONTRACT": json.dumps({"card_id": "from-json"}), "XNW_CARD_ID": "from-discrete"}
+    assert RecordContract.from_env(env).card_id == "from-json"
 
 
 @pytest.mark.parametrize("raw", ["not json", "[1,2]", json.dumps({"resources": {"METRICS": "volumes.json"}})])
@@ -169,7 +187,7 @@ def _run_with_masks(tmp_path, monkeypatch, env, *extra):
     inp.mkdir()
     write_ct_series(inp / ".source_dicom")
     write_mask(inp / "segmentation.nii.gz", blob_mask(), affine=series_ras_affine())
-    for key in list(CONTEXT_ENV) + ["XNW_CONTRACT", "SEG_NO_REGISTER", "SEG_NO_PUBLISH"]:
+    for key in list(CONTEXT_ENV) + ["XNW_CONTRACT", "SEG_NO_REGISTER", "SEG_NO_PUBLISH"] + list(RecordContract.DISCRETE_KEYS):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)

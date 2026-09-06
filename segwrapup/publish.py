@@ -9,8 +9,9 @@ holds a measurement. What the model measured stays in the ``METRICS`` resource
 The wrapup already has everything the record needs: the Container Service injects
 ``XNAT_HOST``/``XNAT_USER``/``XNAT_PASS`` (an alias token) and the parent command passes
 ``SEG_PROJECT``/``SEG_SESSION_ID``/``SEG_SCAN_ID``. The card's results contract arrives as
-the ``XNW_CONTRACT`` environment variable (JSON, set by the registry installer from the
-card's ``results`` block). **No contract, no record**: cards opt in, nothing else changes.
+discrete ``XNW_*`` environment variables (``XNW_CARD_ID``, ``XNW_CONTAINER_DIGEST``, ...; set
+by the registry installer from the card's ``results`` block) or, where 255 characters suffice,
+as one ``XNW_CONTRACT`` JSON value. **No contract, no record**: cards opt in, nothing else changes.
 
 Publishing is create-or-fail and additive: a failure is logged and recorded in
 ``wrapup.json`` and the masks, report and ROI collection still ship. The record is never
@@ -63,14 +64,31 @@ class RecordContract:
     supersedes_id: str = ""
     resources: dict[str, list[str]] = field(default_factory=lambda: dict(DEFAULT_RESOURCES))
 
+    #: Discrete environment variables, the form the Container Service can actually store: its
+    #: command table caps each environment value at 255 characters, so a JSON contract does not
+    #: fit once it carries an image digest. ``XNW_CONTRACT`` (JSON) is still honoured when present.
+    DISCRETE_KEYS = {
+        "XNW_CARD_ID": "card_id", "XNW_CARD_REVISION": "card_revision",
+        "XNW_CONTRACT_VERSION": "contract_version", "XNW_ANALYSIS_TYPE": "analysis_type",
+        "XNW_CONTAINER_IMAGE": "container_image", "XNW_CONTAINER_DIGEST": "container_digest",
+        "XNW_OUTPUT_RESOURCE_LABEL": "output_resource_label", "XNW_SUPERSEDES_ID": "supersedes_id",
+    }
+
     @classmethod
     def from_env(cls, environ: dict | None = None) -> "RecordContract | None":
-        """Parse ``XNW_CONTRACT``; ``None`` (with a log line) when absent, an error when malformed."""
+        """Parse ``XNW_CONTRACT`` (JSON) or the discrete ``XNW_*`` variables; ``None`` when neither is set."""
         env = os.environ if environ is None else environ
         raw = env.get("XNW_CONTRACT", "").strip()
         if not raw:
-            logger.info("no XNW_CONTRACT in the environment; no analysis record will be published")
-            return None
+            discrete = {field: env[key].strip() for key, field in cls.DISCRETE_KEYS.items() if env.get(key, "").strip()}
+            if not discrete:
+                logger.info("no XNW_CONTRACT or XNW_* variables in the environment; no analysis record will be published")
+                return None
+            resources = dict(DEFAULT_RESOURCES)
+            for key, value in env.items():
+                if key.startswith("XNW_RESOURCE_") and value.strip():   # XNW_RESOURCE_METRICS="a.json,b.csv"
+                    resources[key[len("XNW_RESOURCE_"):].upper()] = [p.strip() for p in value.split(",") if p.strip()]
+            return cls(resources=resources, **{k: v for k, v in discrete.items()})
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as error:
