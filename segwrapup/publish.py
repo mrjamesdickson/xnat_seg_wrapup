@@ -280,7 +280,8 @@ def _request(context: XnatContext, method: str, url: str, timeout: float) -> int
             return response.status
     except urllib.error.HTTPError as error:
         return error.code
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError) as error:
+        # BadStatusLine/IncompleteRead/InvalidURL are HTTPExceptions; a bad XNAT_HOST can be a ValueError
         raise RuntimeError(f"{method} {url.split('?')[0]} failed: {error}") from error
 
 

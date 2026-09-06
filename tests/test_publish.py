@@ -252,6 +252,20 @@ def test_publish_refuses_when_the_existence_check_is_inconclusive(xnat, tmp_path
     assert [c["method"] for c in handler.calls] == ["GET"]
 
 
+def test_probe_protocol_error_is_a_runtime_error_the_guard_records(xnat, tmp_path, monkeypatch):
+    """Codex round 6 on PR #3: a malformed response to the existence probe escaped as HTTPException."""
+    import http.client
+    import segwrapup.publish as publish
+    host, handler = xnat
+
+    def urlopen_bad_status(request, timeout=None):
+        raise http.client.BadStatusLine("garbage")
+
+    monkeypatch.setattr(publish.urllib.request, "urlopen", urlopen_bad_status)
+    with pytest.raises(RuntimeError, match=r"GET .*assessors/DeepWMH_scan2_X failed: garbage"):
+        publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", {})
+
+
 def test_publish_deletes_the_record_when_a_file_upload_fails(xnat, tmp_path):
     """Codex P1 on PR #3: a create followed by a failed upload left a SUCCEEDED-looking partial record."""
     host, handler = xnat
