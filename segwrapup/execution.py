@@ -147,14 +147,19 @@ def _phase(container: dict | None, now: dt.datetime | None = None) -> dict | Non
     stamps = _stamps(container)
     created = _first(stamps, "created")
     started = _first(stamps, "running")
+    timed_from = "running"
+    if started is None and created is not None:
+        # Short swarm tasks (a setup that finishes in seconds) get no docker 'running' event in
+        # the CS history; Created -> complete is then the honest upper bound (demo02, 2026-09-07).
+        started, timed_from = created, "created"
     finished = _first(stamps, "complete", "failed", "done", "die", after=started) if started else None
     if started and not finished and now is not None:       # the wrapup itself, still running
         finished = now
-    out = {"container_id": container.get("id"),
+    out = {"container_id": container.get("id"), "timed_from": timed_from,
            "created": created.isoformat() if created else None, "started": started.isoformat() if started else None,
            "finished": finished.isoformat() if finished else None,
            "seconds": int((finished - started).total_seconds()) if started and finished else None}
-    if created and started:
+    if created and started and timed_from == "running":
         out["queue_wait_seconds"] = int((started - created).total_seconds())
     return out
 

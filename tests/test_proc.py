@@ -349,7 +349,8 @@ def test_proc_wrapup_records_node_envelope_and_phase_timings_for_billing(cs, tmp
     assert config["envelope"] == {"reserve_memory_mib": 256, "limit_memory_mib": 1024, "limit_cpu": 1.0, "generic_resources": {"GPU": "1"}, "swarm_constraints": []}
     main = config["phases"]["main"]
     assert (main["container_id"], main["seconds"], main["queue_wait_seconds"]) == (900, 120, 20)
-    assert [ (p["container_id"], p["seconds"]) for p in config["phases"]["setup"] ] == [(899, 6)]      # found by the shared mount
+    assert [ (p["container_id"], p["seconds"], p["timed_from"]) for p in config["phases"]["setup"] ] == [(899, 6, "running")]      # found by the shared mount
+    assert main["timed_from"] == "running"
     assert config["phases"]["wrapup"]["container_id"] == 901 and config["phases"]["wrapup"]["seconds"] is not None   # still running: to now
     assert config["total_seconds"] == 120 + 6 + config["phases"]["wrapup"]["seconds"]
     assert "measured usage" in config["billing_note"]
@@ -372,3 +373,13 @@ def test_pointer_only_keeps_files_an_explicit_derived_contract_left_off_the_reco
     assert (out / "raw" / "sub" / "log.txt").exists()                          # so it stays in the output
     assert not (out / "raw" / "features.csv").exists()                        # what the record holds is removed
     assert "2 file(s) are not on record XNAT_E77777 (outside the contract) and stay in the output: raw/status.json, raw/sub/log.txt" in caplog.text
+
+
+def test_phase_without_a_running_event_is_timed_from_created():
+    """demo02 2026-09-07: setup containers that finish in seconds have no 'running' entry in the CS history."""
+    from segwrapup.execution import _phase
+    phase = _phase({"id": 7, "history": [{"status": "Created", "time-recorded": "2026-09-07T18:40:25.832+0000"},
+                                         {"status": "complete", "time-recorded": "2026-09-07T18:40:34.665+0000"},
+                                         {"status": "Complete", "time-recorded": "2026-09-07T18:40:35.107+0000"}]})
+    assert (phase["seconds"], phase["timed_from"]) == (8, "created") and "queue_wait_seconds" not in phase
+    assert _phase({"id": 8, "history": []})["seconds"] is None
