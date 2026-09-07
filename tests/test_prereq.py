@@ -124,6 +124,16 @@ def test_parse_specs_and_reject_empty():
     assert [p.name for p in prerequisites_from_env({"XNW_PREREQ_B": "resource=BIDS", "XNW_PREREQ_A": "pipeline=x", "OTHER": "1"})] == ["a", "b"]
 
 
+def test_prerequisite_name_is_one_safe_path_component():
+    """Codex P2 (PR #10): the name becomes prereq/<name>/, so '..' or a slash would escape the output."""
+    for bad in ("..", "a/b", "a\\b", "", "1abc", "a b", "a-b", "x" * 65):
+        with pytest.raises(ValueError, match="prerequisite name must match"):
+            Prerequisite.parse(bad, "resource=BIDS")
+    assert Prerequisite.parse("T1_DICOM", "resource=DICOM;scope=scan").name == "t1_dicom"
+    with pytest.raises(ValueError, match="both name the prerequisite 'bids'"):
+        prerequisites_from_env({"XNW_PREREQ_BIDS": "resource=BIDS", "XNW_PREREQ_bids": "resource=BIDS2"})
+
+
 def test_choose_record_newest_succeeded_then_accepted_then_version_then_explicit():
     records = flat(RECORDS)
     newest, why = choose_record(Prerequisite.parse("q", "pipeline=qsiprep"), records)
@@ -231,6 +241,28 @@ def test_unmet_prerequisite_is_recorded_as_a_failed_record_with_the_reason(xnat,
     assert "no SUCCEEDED record at version >= 2.0" in inputs["prerequisites"][1]["error"]
     assert "failure recorded as analysis record XNAT_E77" in caplog.text
     assert handler.calls[-1][:2] == ("DELETE", "/data/JSESSION")
+
+
+def test_failure_record_uses_the_seg_variables_then_the_contract_for_the_pipeline(xnat, tmp_path, monkeypatch):
+    """Codex P2 (PR #10): a segmentation card sets SEG_MODEL_NAME/VERSION, not PROC_*; the failure
+    record must name the same pipeline seg-wrapup would, and fall back to the card contract last."""
+    host, handler = xnat
+    inp = tmp_path / "in"; inp.mkdir()
+    for k, v in CONTRACT_ENV.items(): monkeypatch.setenv(k, v)
+    monkeypatch.delenv("PROC_PIPELINE_NAME"); monkeypatch.delenv("PROC_PIPELINE_VERSION")
+    monkeypatch.setenv("SEG_MODEL_NAME", "deepwmh"); monkeypatch.setenv("SEG_MODEL_VERSION", "1.0.1")
+    monkeypatch.setenv("XNW_PREREQ_PREPROC", "pipeline=qsiprep;min=9.0")
+    assert prereq.main(["--input", str(inp), "--output", str(tmp_path / "out")]) == 3
+    xml = next(c for c in handler.calls if c[0] == "PUT" and "/out/" not in c[1])[3].decode()
+    assert "<analysis:pipeline_name>deepwmh</analysis:pipeline_name>" in xml
+    assert "<analysis:pipeline_version>1.0.1</analysis:pipeline_version>" in xml
+    assert "deepwmh 1.0.1 did not run on session S1" in xml
+    handler.calls.clear()
+    monkeypatch.delenv("SEG_MODEL_NAME"); monkeypatch.delenv("SEG_MODEL_VERSION")
+    assert prereq.main(["--input", str(inp), "--output", str(tmp_path / "out2")]) == 3
+    xml = next(c for c in handler.calls if c[0] == "PUT" and "/out/" not in c[1])[3].decode()
+    assert "<analysis:pipeline_name>fake-recon</analysis:pipeline_name>" in xml
+    assert "<analysis:pipeline_version>0.1.0</analysis:pipeline_version>" in xml
 
 
 def test_unmet_prerequisite_without_a_contract_records_nothing(xnat, tmp_path, monkeypatch, caplog):

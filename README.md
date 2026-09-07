@@ -226,7 +226,9 @@ says what was chosen, and an unmet prerequisite exits 3 so the Container Service
 orchestration or from an event rule and always finds its own inputs.
 
 Clause reference (`XNW_PREREQ_<NAME>` = `key=value;…`; unknown keys and malformed clauses are
-refused at parse time so a misspelling can never widen the match):
+refused at parse time so a misspelling can never widen the match). `<NAME>` is a letter followed
+by letters, digits or underscores (at most 64 characters), lowercased into `prereq/<name>/`; two
+names that differ only in case are refused:
 
 | Key | Meaning | Default |
 |---|---|---|

@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 RECORD_TYPE = "analysis:sessionAnalysisData"
 PREFIX = "XNW_PREREQ_"
+NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
 MANIFEST = "prereq.json"
 RECORD_COLUMNS = ["ID", "label", "insert_date", "imagesession_id", "pipeline_name", "pipeline_version",
                   "analysis_type", "review_state", "run_status", "publication_status"]
@@ -71,6 +72,11 @@ class Prerequisite:
 
     @classmethod
     def parse(cls, name: str, spec: str) -> "Prerequisite":
+        # The name becomes the directory ``prereq/<name>/`` under the output, so it must be one
+        # safe path component: no separators, no ``..``, nothing outside [a-z0-9_] (Codex P2, PR #10).
+        if not NAME_RE.fullmatch(name):
+            raise ValueError(f"{PREFIX}{name}: the prerequisite name must match {NAME_RE.pattern} "
+                             f"(one path component; it becomes prereq/<name>/)")
         fields: dict[str, str] = {}
         for part in spec.split(";"):
             if not part.strip():
@@ -128,10 +134,16 @@ def _parse_bool(name: str, key: str, value: str) -> bool:
 
 def prerequisites_from_env(environ: dict | None = None) -> list[Prerequisite]:
     env = os.environ if environ is None else environ
-    out = []
+    out: list[Prerequisite] = []
+    seen: dict[str, str] = {}
     for key in sorted(env):
         if key.startswith(PREFIX) and env[key].strip():
-            out.append(Prerequisite.parse(key[len(PREFIX):], env[key]))
+            p = Prerequisite.parse(key[len(PREFIX):], env[key])
+            if p.name in seen:
+                # Two variables that differ only in case would share prereq/<name>/ (Codex P2, PR #10).
+                raise ValueError(f"{key} and {seen[p.name]} both name the prerequisite {p.name!r}")
+            seen[p.name] = key
+            out.append(p)
     return out
 
 
@@ -376,8 +388,12 @@ def publish_failure_record(context: XnatContext, resolutions: list["Resolution"]
     if contract is None:
         logger.info("no XNW_* contract in the environment: the failure is not recorded as an analysis record")
         return None
-    pipeline = os.environ.get("PROC_PIPELINE_NAME") or contract.card_id or "run"
-    version = os.environ.get("PROC_PIPELINE_VERSION", "")
+    # Same PROC -> SEG -> contract chain as proc-wrapup and seg-wrapup, so a setup failure on a
+    # segmentation card names the same pipeline its successful runs would (Codex P2, PR #10).
+    pipeline = (os.environ.get("PROC_PIPELINE_NAME") or os.environ.get("SEG_MODEL_NAME")
+                or contract.card_id or "run")
+    version = (os.environ.get("PROC_PIPELINE_VERSION") or os.environ.get("SEG_MODEL_VERSION")
+               or contract.card_revision or "")
     reasons = " | ".join(f"prerequisite '{r.name}' {r.error}" for r in resolutions if r.error)
     session_label = fetch_session_label(context)
     label = collection_label(pipeline, context.scan, session_label=session_label) + "_record"
