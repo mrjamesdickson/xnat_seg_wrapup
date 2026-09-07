@@ -37,6 +37,7 @@ CONTAINERS = [
                  {"status": "complete", "time-recorded": "2026-09-06T10:02:20.000+0000"},
                  {"status": "Complete", "time-recorded": "2026-09-06T10:02:30.000+0000"}]},
     {"id": 899, "workflow-id": "4991", "subtype": "docker-setup", "status": "Complete", "docker-image": "xnatworks/record-fetch:0.5.0",
+     "reserve-memory": 1024, "limit-memory": 4096, "limit-cpu": 2.0,
      "mounts": [{"name": "input", "writable": False, "xnat-host-path": "/data/xnat/archive/P/arc001/S/SCANS/3/NIFTI"},
                 {"name": "output", "writable": True, "xnat-host-path": SETUP_OUT}],
      "history": [{"status": "Created", "time-recorded": "2026-09-06T09:59:50.000+0000"},
@@ -350,10 +351,13 @@ def test_proc_wrapup_records_node_envelope_and_phase_timings_for_billing(cs, tmp
     main = config["phases"]["main"]
     assert (main["container_id"], main["seconds"], main["queue_wait_seconds"]) == (900, 120, 20)
     assert [ (p["container_id"], p["seconds"], p["timed_from"]) for p in config["phases"]["setup"] ] == [(899, 6, "running")]      # found by the shared mount
-    assert main["timed_from"] == "running"
-    assert config["phases"]["wrapup"]["container_id"] == 901 and config["phases"]["wrapup"]["seconds"] is not None   # still running: to now
-    assert config["total_seconds"] == 120 + 6 + config["phases"]["wrapup"]["seconds"]
-    assert "measured usage" in config["billing_note"]
+    assert main["timed_from"] == "running" and main["envelope"]["reserve_memory_mib"] == 256
+    assert config["phases"]["setup"][0]["envelope"]["reserve_memory_mib"] == 1024                 # each phase carries its own envelope (Codex P2)
+    wrapup = config["phases"]["wrapup"]
+    assert wrapup["container_id"] == 901 and wrapup["seconds"] is None and wrapup["finished"] is None   # still running: not stamped as finished
+    assert wrapup["in_progress"] is True and wrapup["elapsed_seconds_at_record"] >= 0
+    assert config["total_seconds"] == 120 + 6                                                    # finished phases only
+    assert "measured usage" in config["billing_note"] and "wrapup" in config["billing_note"]
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["execution"]["facts"]["node_id"] == "laz2ephdgvajpbg96rhc6lfmn"
     report = (out / "report.html").read_text()
@@ -383,3 +387,15 @@ def test_phase_without_a_running_event_is_timed_from_created():
                                          {"status": "Complete", "time-recorded": "2026-09-07T18:40:35.107+0000"}]})
     assert (phase["seconds"], phase["timed_from"]) == (8, "created") and "queue_wait_seconds" not in phase
     assert _phase({"id": 8, "history": []})["seconds"] is None
+
+
+def test_pointer_only_exempts_only_the_root_manifest(cs, tmp_path, monkeypatch):
+    """Codex P2 on PR #10: a nested wrapup.json from a previous run is data, not the pointer."""
+    host, handler = cs
+    inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
+    (inp / "previous").mkdir(); (inp / "previous" / "wrapup.json").write_text('{"old": true}')
+    out = tmp_path / "out"
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "pyradiomics"})
+    assert proc.main(["--input", str(inp), "--output", str(out), "--pointer-only"]) == 0
+    assert [p.relative_to(out).as_posix() for p in out.rglob("*") if p.is_file()] == ["wrapup.json"]
+    assert any("DERIVED/files/raw/previous/wrapup.json" in c["path"] for c in handler.calls)   # it went to the record

@@ -114,6 +114,10 @@ def test_parse_specs_and_reject_empty():
     assert Prerequisite.parse("BIDS", "resource=BIDS").is_resource
     with pytest.raises(ValueError):
         Prerequisite.parse("X", "role=DERIVED")
+    with pytest.raises(ValueError, match="unknown clause 'pipline'"):                       # Codex P1: a misspelt key must not widen the match
+        Prerequisite.parse("X", "type=qc;pipline=mriqc")
+    with pytest.raises(ValueError, match="is not key=value"):
+        Prerequisite.parse("X", "type=qc;accepted")
     with pytest.raises(ValueError, match="accepted= must be true or false, not 'ture'"):   # Codex P1: a typo must not disable the gate
         Prerequisite.parse("X", "pipeline=qsiprep;accepted=ture")
     assert Prerequisite.parse("X", "pipeline=qsiprep;accepted=0").accepted is False
@@ -263,6 +267,7 @@ def test_scan_scope_on_a_scan_level_run_takes_the_runs_scan(xnat, tmp_path, monk
     m = json.loads((out / "prereq.json").read_text())["prerequisites"][0]
     assert m["kind"] == "scan-resource" and m["scans"] == ["2"] and m["files"] == 2 and m["resource"] == "DICOM"
     assert not [c for c in handler.calls if c[1].endswith("/scans?format=json")], "no scan listing needed on a scan-level run"
+    assert not [c for c in handler.calls if "xsiType=analysis:sessionAnalysisData" in c[1]], "no record listing when no prerequisite is a record"
 
 
 def test_scan_scope_on_a_session_level_run_selects_scans_by_type(xnat, tmp_path, monkeypatch, caplog):

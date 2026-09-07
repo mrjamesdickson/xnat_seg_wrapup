@@ -225,6 +225,26 @@ says what was chosen, and an unmet prerequisite exits 3 so the Container Service
 `Failed (Setup)` and never starts the tool. The same card therefore runs by hand, in an
 orchestration or from an event rule and always finds its own inputs.
 
+Clause reference (`XNW_PREREQ_<NAME>` = `key=value;…`; unknown keys and malformed clauses are
+refused at parse time so a misspelling can never widen the match):
+
+| Key | Meaning | Default |
+|---|---|---|
+| `type=` | record `analysis_type` to match | any |
+| `pipeline=` | record `pipeline_name` to match | any |
+| `min=` | minimum `pipeline_version` (numeric-aware compare) | none |
+| `accepted=` | `true`: only records with `review_state ACCEPTED`; `false`: newest SUCCEEDED | `false` |
+| `id=` | one explicit record id; wins over the rules above | none |
+| `role=` | the record's `out` resource to copy (`DERIVED`, `METRICS`, `REPORT`, `LOGS`, `PROVENANCE`) | `DERIVED` |
+| `resource=` | a session (or scan) resource label instead of a record | none |
+| `scope=` | `session` or `scan` (with `resource=`) | `session` |
+| `scan_type=` | with `scope=scan` on a session-level run: glob over scan `type` (`T1*`) | the run's scan |
+
+A prerequisite needs at least one of `resource=`, `id=`, `type=`, `pipeline=`. Only SUCCEEDED
+records are ever chosen; FAILED records (including the failure records record-fetch itself
+writes) never satisfy a prerequisite. The card's own `metadata.json` uses the same fields in
+camelCase (`analysisType`, `minVersion`, `scanType`); the installer writes the variables.
+
 `resource=LABEL;scope=scan` takes the resource from a **scan** instead (dcm2niix needs the
 scan's `DICOM`): on a scan-level run the run's scan (`PROC_SCAN_ID`); on a session-level run
 `scan_type=<glob>` selects the scans (`T1*`, `BOLD`), each landing under `prereq/<name>/<scan>/`.

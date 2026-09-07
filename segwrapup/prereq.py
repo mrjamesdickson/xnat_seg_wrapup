@@ -67,13 +67,22 @@ class Prerequisite:
     scan_type: str = ""             # scope=scan on a session-level run: the scans whose type matches this glob
     raw: str = ""
 
+    KEYS = ("type", "pipeline", "min", "role", "accepted", "id", "resource", "scope", "scan_type")
+
     @classmethod
     def parse(cls, name: str, spec: str) -> "Prerequisite":
         fields: dict[str, str] = {}
         for part in spec.split(";"):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                fields[k.strip().lower()] = v.strip()
+            if not part.strip():
+                continue
+            if "=" not in part:
+                raise ValueError(f"{PREFIX}{name}: clause {part.strip()!r} is not key=value ({spec!r})")
+            k, v = part.split("=", 1)
+            k = k.strip().lower()
+            if k not in cls.KEYS:
+                # A misspelling (pipline=) must not silently widen the selection (Codex P1, PR #10).
+                raise ValueError(f"{PREFIX}{name}: unknown clause {k!r}; known: {', '.join(cls.KEYS)} ({spec!r})")
+            fields[k] = v.strip()
         p = cls(name=name.lower(), analysis_type=fields.get("type", ""), pipeline=fields.get("pipeline", ""),
                 min_version=fields.get("min", ""), role=(fields.get("role") or "DERIVED").upper(),
                 accepted=_parse_bool(name, "accepted", fields.get("accepted", "false")),
@@ -282,7 +291,9 @@ class Resolution:
 
 def resolve(context: XnatContext, prereqs: list[Prerequisite], records: list[dict] | None = None) -> list[Resolution]:
     """Decide, without downloading, which record or resource satisfies each prerequisite."""
-    records = list_session_records(context) if records is None else records
+    if records is None and any(not p.is_resource for p in prereqs):
+        records = list_session_records(context)          # only when a record prerequisite needs it (Codex P2, PR #10)
+    records = records or []
     out: list[Resolution] = []
     scans: list[dict] | None = None
     for p in prereqs:

@@ -168,7 +168,7 @@ def run(args: argparse.Namespace) -> int:
             uploaded = {name for names in (manifest["analysis_record"].get("uploaded") or {}).values() for name in names}
             kept = []
             for path in sorted(output_dir.rglob("*"), reverse=True):
-                if path.is_file() and path.name != "wrapup.json":
+                if path.is_file() and path != output_dir / "wrapup.json":      # only the root manifest is the pointer
                     if path.relative_to(output_dir).as_posix() in uploaded:
                         path.unlink()
                     else:

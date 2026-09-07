@@ -153,15 +153,27 @@ def _phase(container: dict | None, now: dt.datetime | None = None) -> dict | Non
         # the CS history; Created -> complete is then the honest upper bound (demo02, 2026-09-07).
         started, timed_from = created, "created"
     finished = _first(stamps, "complete", "failed", "done", "die", after=started) if started else None
-    if started and not finished and now is not None:       # the wrapup itself, still running
-        finished = now
     out = {"container_id": container.get("id"), "timed_from": timed_from,
            "created": created.isoformat() if created else None, "started": started.isoformat() if started else None,
            "finished": finished.isoformat() if finished else None,
-           "seconds": int((finished - started).total_seconds()) if started and finished else None}
+           "seconds": int((finished - started).total_seconds()) if started and finished else None,
+           "envelope": _envelope(container)}
+    if started and not finished and now is not None:
+        # The wrapup itself: still running while it writes this, so its end is unknown. Record
+        # what has elapsed and say so; the CS history holds the final figure (Codex P2, PR #10).
+        out["in_progress"] = True
+        out["elapsed_seconds_at_record"] = int((now - started).total_seconds())
     if created and started and timed_from == "running":
         out["queue_wait_seconds"] = int((started - created).total_seconds())
     return out
+
+
+def _envelope(container: dict) -> dict:
+    """What the card reserved for this container; every phase has its own (setup and wrapup
+    images declare different limits from the tool)."""
+    return {"reserve_memory_mib": container.get("reserve-memory"), "limit_memory_mib": container.get("limit-memory"),
+            "limit_cpu": container.get("limit-cpu"), "generic_resources": container.get("generic-resources") or {},
+            "swarm_constraints": container.get("swarm-constraints") or []}
 
 
 def describe_execution(containers: list, parent: dict, own: dict | None, now: dt.datetime | None = None) -> dict:
@@ -173,15 +185,16 @@ def describe_execution(containers: list, parent: dict, own: dict | None, now: dt
     inputs = _mount_paths(parent, writable=False)
     setups = [c for c in containers if isinstance(c, dict) and c.get("subtype") == "docker-setup" and _mount_paths(c, writable=True) & inputs]
     phases = {"setup": [_phase(c) for c in setups], "main": _phase(parent), "wrapup": _phase(own, now=now)}
-    total = sum(p["seconds"] for p in ([phases["main"], phases["wrapup"]] + phases["setup"]) if p and p.get("seconds") is not None)
-    envelope = {"reserve_memory_mib": parent.get("reserve-memory"), "limit_memory_mib": parent.get("limit-memory"),
-                "limit_cpu": parent.get("limit-cpu"), "generic_resources": parent.get("generic-resources") or {},
-                "swarm_constraints": parent.get("swarm-constraints") or []}
+    finished_phases = [p for p in ([phases["main"]] + phases["setup"]) if p and p.get("seconds") is not None]
+    total = sum(p["seconds"] for p in finished_phases)
     return {"backend": parent.get("backend"), "node_id": parent.get("node-id"), "service_id": parent.get("service-id"),
             "task_id": parent.get("task-id"), "docker_container_id": parent.get("container-id"),
             "image": parent.get("docker-image"), "user": parent.get("user-id"),
-            "envelope": envelope, "phases": phases, "total_seconds": total,
-            "billing_note": "reserved envelope x wall clock per phase; the Container Service records no measured usage"}
+            "envelope": _envelope(parent), "phases": phases,
+            "total_seconds": total,
+            "billing_note": ("total_seconds = setup + main wall clock; each phase carries its own reserved envelope; the wrapup "
+                             "is still running when this is written (elapsed_seconds_at_record), its final time is in the "
+                             "Container Service history; no measured usage is recorded")}
 
 
 def find_parent_container(context: XnatContext, workflow_id: str | None, own_workflow_id: str | None,
