@@ -1,5 +1,5 @@
 # proc-wrapup: the generic wrapup for any card (same package as seg-wrapup, a different entrypoint).
-ARG SEG_WRAPUP_VERSION=0.4.0
+ARG SEG_WRAPUP_VERSION=0.4.1
 FROM xnatworks/seg-wrapup:${SEG_WRAPUP_VERSION}
-LABEL org.nrg.commands="[{\"name\":\"proc-wrapup\",\"description\":\"Generic wrapup: keeps everything the tool wrote (raw/), captures the run's execution state and Container Service logs, writes a report, publishes the analysis:sessionAnalysisData record carrying all of it. Interprets nothing.\",\"version\":\"0.4.0\",\"type\":\"docker-wrapup\",\"image\":\"xnatworks/proc-wrapup:0.4.0\",\"command-line\":\"proc-wrapup\",\"mounts\":[],\"inputs\":[],\"outputs\":[],\"xnat\":[]}]"
+LABEL org.nrg.commands="[{\"name\":\"proc-wrapup\",\"description\":\"Generic wrapup: keeps everything the tool wrote (raw/), captures the run's execution state and Container Service logs, writes a report, publishes the analysis:sessionAnalysisData record carrying all of it. Interprets nothing.\",\"version\":\"0.4.1\",\"type\":\"docker-wrapup\",\"image\":\"xnatworks/proc-wrapup:0.4.1\",\"command-line\":\"proc-wrapup\",\"mounts\":[],\"inputs\":[],\"outputs\":[],\"xnat\":[],\"reserve-memory\":1024,\"limit-memory\":8192,\"limit-cpu\":2}]"
 CMD ["proc-wrapup"]

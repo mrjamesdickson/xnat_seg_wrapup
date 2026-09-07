@@ -1,12 +1,15 @@
 {
   "name": "seg-wrapup",
   "description": "Post-process segmentation output: volumetrics report, ITK-SNAP/Slicer label files, DICOM SEG (registered with OHIF when the parent passes SEG_PROJECT/SEG_SESSION_ID) when the parent copied its source DICOM to /output/.source_dicom",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "type": "docker-wrapup",
-  "image": "xnatworks/seg-wrapup:0.4.0",
+  "image": "xnatworks/seg-wrapup:0.4.1",
   "command-line": "seg-wrapup",
   "mounts": [],
   "inputs": [],
   "outputs": [],
-  "xnat": []
+  "xnat": [],
+  "reserve-memory": 1024,
+  "limit-memory": 8192,
+  "limit-cpu": 2
 }
