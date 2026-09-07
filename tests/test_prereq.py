@@ -64,12 +64,13 @@ class _Xnat(BaseHTTPRequestHandler):
             return self._json({"ResultSet": {"Result": RECORDS}})
         if p == "/data/experiments/XNAT_E1?format=json":                      # session label for the record label
             return self._json({"items": [{"data_fields": {"label": "S1"}}]})
-        if "/assessors/" in p:                                               # label probe: free
+        if "/assessors/" in p and "/out/" not in p:                          # label probe: free
             self.send_response(404); self.end_headers(); return
         if "/out/resources/" in p and p.endswith("/files?format=json"):
-            rid = p.split("/experiments/")[1].split("/")[0]; role = p.split("/out/resources/")[1].split("/")[0]
+            assert p.startswith("/data/experiments/XNAT_E1/assessors/"), "record files are listed assessor-scoped (experiment-scoped answers the document)"
+            rid = p.split("/assessors/")[1].split("/")[0]; role = p.split("/out/resources/")[1].split("/")[0]
             names = FILES.get(rid, {}).get(role, [])
-            return self._json({"ResultSet": {"Result": [{"Name": n.rsplit("/", 1)[-1], "URI": f"/data/experiments/{rid}/out/resources/{role}/files/{n}", "Size": 3} for n in names]}})
+            return self._json({"ResultSet": {"Result": [{"Name": n.rsplit("/", 1)[-1], "URI": f"/data/experiments/XNAT_E1/assessors/{rid}/out/resources/{role}/files/{n}", "Size": 3} for n in names]}})
         if p == "/data/experiments/XNAT_E1/scans?format=json":
             return self._json({"ResultSet": {"Result": [{"ID": k, "type": v["type"], "series_description": v["type"]} for k, v in SCANS.items()]}})
         if "/data/experiments/XNAT_E1/scans/" in p and p.endswith("/files?format=json"):

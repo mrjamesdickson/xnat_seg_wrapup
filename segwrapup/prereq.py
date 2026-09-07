@@ -162,7 +162,11 @@ def choose_record(prereq: Prerequisite, records: list[dict]) -> tuple[dict | Non
 def download_role(context: XnatContext, record_id: str, role: str, dest: Path, timeout: float = 300.0) -> list[str]:
     """Copy every file of the record's ``out`` resource ``role`` into ``dest`` keeping the paths."""
     rid = urllib.parse.quote(record_id, safe="")
-    listing = _get_json(context, f"{context.host}/data/experiments/{rid}/out/resources/{urllib.parse.quote(role, safe='')}/files?format=json", timeout)
+    # Assessor-scoped: ``/data/experiments/<record>/out/resources/<role>/files`` answers with the
+    # record document, not a file list (demo02, 2026-09-07), and the listing then looks empty.
+    sid = urllib.parse.quote(context.session, safe="")
+    listing = _get_json(context, f"{context.host}/data/experiments/{sid}/assessors/{rid}/out/resources/"
+                                 f"{urllib.parse.quote(role, safe='')}/files?format=json", timeout)
     files = listing.get("ResultSet", {}).get("Result", []) if isinstance(listing, dict) else []
     written: list[str] = []
     for f in files:
