@@ -403,9 +403,18 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
     # of the masks, report and ROI collection that are already on disk.
     try:
         files = collect_files(output_dir, contract)
+        # Zero-byte files are dropped here, before the document is built, so output_file_count
+        # and results_json never claim a file the upload would skip (Codex P2 on PR #10).
+        empties = [upload_name(p, output_dir) for paths in files.values() for p in paths if p.stat().st_size == 0]
+        files = {role: [p for p in paths if p.stat().st_size > 0] for role, paths in files.items()}
+        files = {role: paths for role, paths in files.items() if paths}
+        for name in empties:
+            logger.warning("%s is empty; left off the record (XNAT refuses zero-byte in-body files)", name)
         xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present,
                                output_dir=output_dir, unmeasured_masks=unmeasured_masks, facts=facts)
-        return publish_record(context, label, xml, files, output_dir=output_dir)
+        outcome = publish_record(context, label, xml, files, output_dir=output_dir)
+        outcome["skipped_empty"] = sorted(set(outcome.get("skipped_empty") or []) | set(empties))
+        return outcome
     except (RuntimeError, ValueError, NotImplementedError, OSError) as error:
         logger.error("analysis record %s not published; files and ROI collection still delivered: %s: %s",
                      label, type(error).__name__, error, exc_info=True)

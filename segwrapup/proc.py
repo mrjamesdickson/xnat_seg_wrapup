@@ -163,12 +163,23 @@ def run(args: argparse.Namespace) -> int:
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
         if args.pointer_only and (manifest.get("analysis_record") or {}).get("id"):
             # The record owns the bytes; the output handler gets a one-file pointer resource.
+            # Only files the record confirmed uploaded are removed: an explicit DERIVED contract
+            # can leave outputs off the record, and those must stay on the session (Codex P1, PR #10).
+            uploaded = {name for names in (manifest["analysis_record"].get("uploaded") or {}).values() for name in names}
+            kept = []
             for path in sorted(output_dir.rglob("*"), reverse=True):
                 if path.is_file() and path.name != "wrapup.json":
-                    path.unlink()
+                    if path.relative_to(output_dir).as_posix() in uploaded:
+                        path.unlink()
+                    else:
+                        kept.append(path.relative_to(output_dir).as_posix())
                 elif path.is_dir() and not any(path.iterdir()):
                     path.rmdir()
-            logger.info("pointer-only: output reduced to wrapup.json; record %s holds the files", manifest["analysis_record"]["id"])
+            if kept:
+                logger.warning("pointer-only: %d file(s) are not on record %s (outside the contract) and stay in the output: %s",
+                               len(kept), manifest["analysis_record"]["id"], ", ".join(sorted(kept)))
+            else:
+                logger.info("pointer-only: output reduced to wrapup.json; record %s holds the files", manifest["analysis_record"]["id"])
     finally:
         if context is not None:
             close_session(context)

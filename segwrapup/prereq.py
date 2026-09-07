@@ -76,7 +76,7 @@ class Prerequisite:
                 fields[k.strip().lower()] = v.strip()
         p = cls(name=name.lower(), analysis_type=fields.get("type", ""), pipeline=fields.get("pipeline", ""),
                 min_version=fields.get("min", ""), role=(fields.get("role") or "DERIVED").upper(),
-                accepted=fields.get("accepted", "false").lower() in ("1", "true", "yes"),
+                accepted=_parse_bool(name, "accepted", fields.get("accepted", "false")),
                 record_id=fields.get("id", ""), resource=fields.get("resource", ""),
                 scope=(fields.get("scope") or "session").lower(), scan_type=fields.get("scan_type", ""), raw=spec)
         if not (p.resource or p.record_id or p.analysis_type or p.pipeline):
@@ -90,6 +90,31 @@ class Prerequisite:
     @property
     def is_resource(self) -> bool:
         return bool(self.resource)
+
+    def describe(self) -> str:
+        """What the card asks for, in words a reviewer can act on."""
+        if self.resource and self.scope == "scan":
+            which = f"of scans of type '{self.scan_type}'" if self.scan_type else "of the run's scan"
+            return f"the {self.resource} resource {which}"
+        if self.resource:
+            return f"the session resource {self.resource}"
+        if self.record_id:
+            return f"record {self.record_id} (files from its {self.role} resource)"
+        what = " ".join(x for x in [f"a {self.analysis_type}" if self.analysis_type else "a", "record",
+                                     f"from pipeline {self.pipeline}" if self.pipeline else "from any pipeline"] if x)
+        conds = [f"version >= {self.min_version}" if self.min_version else "any version",
+                 "ACCEPTED in review" if self.accepted else "review not required", "run SUCCEEDED"]
+        return f"{what} ({', '.join(conds)}), files from its {self.role} resource"
+
+
+def _parse_bool(name: str, key: str, value: str) -> bool:
+    """true/false only. A typo (``accepted=ture``) must not silently disable the review gate."""
+    v = value.strip().lower()
+    if v in ("1", "true", "yes"):
+        return True
+    if v in ("0", "false", "no", ""):
+        return False
+    raise ValueError(f"{PREFIX}{name}: {key}= must be true or false, not {value!r}")
 
 
 def prerequisites_from_env(environ: dict | None = None) -> list[Prerequisite]:
@@ -133,9 +158,13 @@ def list_session_records(context: XnatContext, timeout: float = 60.0) -> list[di
 def choose_record(prereq: Prerequisite, records: list[dict]) -> tuple[dict | None, str]:
     """The record that satisfies ``prereq`` or (None, reason). Explicit id wins; else the newest
     SUCCEEDED (and ACCEPTED when required) record of the type/pipeline at or above min version."""
+    def seen(rs: list[dict]) -> str:
+        return "; ".join(f"{r.get('ID')} ({r.get('pipeline_name')} {r.get('pipeline_version')}, {r.get('run_status')}, {r.get('review_state')})"
+                         for r in rs[:5]) + (f"; and {len(rs) - 5} more" if len(rs) > 5 else "")
     if prereq.record_id:
         hit = next((r for r in records if r.get("ID") == prereq.record_id), None)
-        return (hit, "") if hit else (None, f"record {prereq.record_id} is not on this session")
+        return (hit, "") if hit else (None, f"needs {prereq.describe()}; record {prereq.record_id} is not on this session "
+                                            f"(the session's records: {seen(records) or 'none'})")
     candidates = []
     for r in records:
         if prereq.analysis_type and str(r.get("analysis_type", "")).lower() != prereq.analysis_type.lower():
@@ -144,18 +173,21 @@ def choose_record(prereq: Prerequisite, records: list[dict]) -> tuple[dict | Non
             continue
         candidates.append(r)
     if not candidates:
-        return None, f"no {prereq.analysis_type or 'any-type'}/{prereq.pipeline or 'any-pipeline'} record on this session"
+        return None, (f"needs {prereq.describe()}; this session has no such record "
+                      f"(its records: {seen(records) or 'none'})")
     ok = [r for r in candidates if str(r.get("run_status", "")).upper() == "SUCCEEDED"]
     if not ok:
-        return None, f"{len(candidates)} matching record(s) but none SUCCEEDED"
+        return None, f"needs {prereq.describe()}; {len(candidates)} matching record(s) but none SUCCEEDED: {seen(candidates)}"
     if prereq.min_version:
         ok = [r for r in ok if _version_tuple(str(r.get("pipeline_version", "0"))) >= _version_tuple(prereq.min_version)]
         if not ok:
-            return None, f"no SUCCEEDED record at version >= {prereq.min_version}"
+            return None, f"needs {prereq.describe()}; no SUCCEEDED record at version >= {prereq.min_version}: {seen(candidates)}"
     if prereq.accepted:
-        ok = [r for r in ok if str(r.get("review_state", "")).upper() == "ACCEPTED"]
-        if not ok:
-            return None, "no ACCEPTED record (the card requires review before use)"
+        accepted = [r for r in ok if str(r.get("review_state", "")).upper() == "ACCEPTED"]
+        if not accepted:
+            return None, (f"needs {prereq.describe()}; none of the {len(ok)} SUCCEEDED record(s) is ACCEPTED, "
+                          f"review one first: {seen(ok)}")
+        ok = accepted
     return ok[0], ""
 
 
@@ -261,11 +293,11 @@ def resolve(context: XnatContext, prereqs: list[Prerequisite], records: list[dic
                 scans = list_scans(context) if scans is None else scans
                 hits = [s["ID"] for s in scans if fnmatch.fnmatchcase(s["type"], p.scan_type)]
                 out.append(Resolution(name=p.name, kind="scan-resource", resource=p.resource, scans=hits,
-                                      error="" if hits else f"no scan of type {p.scan_type!r} on this session "
-                                                            f"(scan types: {sorted({s['type'] for s in scans}) or 'none'})"))
+                                      error="" if hits else f"needs {p.describe()}; no scan of type {p.scan_type!r} on this session "
+                                                            f"(scan types present: {sorted({s['type'] for s in scans}) or 'none'})"))
             else:
                 out.append(Resolution(name=p.name, kind="scan-resource", resource=p.resource,
-                                      error="scope=scan needs a scan-level run (PROC_SCAN_ID) or scan_type=<glob>"))
+                                      error=f"needs {p.describe()}; scope=scan needs a scan-level run (PROC_SCAN_ID) or scan_type=<glob> in the card"))
             continue
         if p.is_resource:
             out.append(Resolution(name=p.name, kind="resource", resource=p.resource))
@@ -275,29 +307,46 @@ def resolve(context: XnatContext, prereqs: list[Prerequisite], records: list[dic
     return out
 
 
-def materialise(context: XnatContext, resolutions: list[Resolution], output_dir: Path) -> None:
+def materialise(context: XnatContext, resolutions: list[Resolution], output_dir: Path,
+                prereqs: list[Prerequisite] | None = None) -> None:
+    wanted = {p.name: p for p in prereqs or []}
     for r in resolutions:
         if r.error:
             continue
+        needs = f"needs {wanted[r.name].describe()}; " if r.name in wanted else ""
         dest = output_dir / "prereq" / r.name
         dest.mkdir(parents=True, exist_ok=True)
         r.path = f"prereq/{r.name}"
-        if r.kind == "scan-resource":
-            missing = []
-            for scan in r.scans:
-                got = download_scan_resource(context, scan, r.resource, dest / scan)
-                r.files.extend(f"{scan}/{f}" for f in got)
-                if not got:
-                    missing.append(scan)
-            if missing:
-                r.error = f"scan {', '.join(missing)}: no files in resource {r.resource}"
+        try:
+            if r.kind == "scan-resource":
+                missing = []
+                for scan in r.scans:
+                    got = download_scan_resource(context, scan, r.resource, dest / scan)
+                    r.files.extend(f"{scan}/{f}" for f in got)
+                    if not got:
+                        missing.append(scan)
+                if missing:
+                    r.error = f"{needs}scan {', '.join(missing)} has no files in its {r.resource} resource"
+                continue
+            if r.kind == "resource":
+                r.files = download_session_resource(context, r.resource, dest)
+            else:
+                r.files = download_role(context, r.record["ID"], r.role, dest)
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+            # A declared resource or role that does not exist is an unmet prerequisite with a
+            # reason, not a transport failure (Codex P2 on PR #10).
+            what = (f"record {r.record.get('ID')} has no {r.role} resource" if r.record
+                    else f"the {r.resource} resource does not exist" + (f" on scan(s) {', '.join(r.scans)}" if r.scans else " on this session"))
+            r.error = f"{needs}{what} (XNAT answered 404)"
             continue
-        if r.kind == "resource":
-            r.files = download_session_resource(context, r.resource, dest)
-        else:
-            r.files = download_role(context, r.record["ID"], r.role, dest)
         if not r.files:
-            r.error = f"{r.kind} {r.resource or r.record.get('ID')} has no files in {r.role or 'the resource'}"
+            if r.record:
+                r.error = (f"{needs}chose {r.record.get('ID')} ({r.record.get('pipeline_name')} {r.record.get('pipeline_version')}, "
+                           f"{r.record.get('run_status')}, {r.record.get('review_state')}) but its {r.role} resource holds no files")
+            else:
+                r.error = f"{needs}session resource {r.resource} holds no files"
 
 
 def publish_failure_record(context: XnatContext, resolutions: list["Resolution"], output_dir: Path) -> dict | None:
@@ -318,10 +367,13 @@ def publish_failure_record(context: XnatContext, resolutions: list["Resolution"]
         return None
     pipeline = os.environ.get("PROC_PIPELINE_NAME") or contract.card_id or "run"
     version = os.environ.get("PROC_PIPELINE_VERSION", "")
-    reasons = "; ".join(f"{r.name}: {r.error}" for r in resolutions if r.error)
-    label = collection_label(pipeline, context.scan, session_label=fetch_session_label(context)) + "_record"
+    reasons = " | ".join(f"prerequisite '{r.name}' {r.error}" for r in resolutions if r.error)
+    session_label = fetch_session_label(context)
+    label = collection_label(pipeline, context.scan, session_label=session_label) + "_record"
     facts = {"wrapup": "record-fetch", "run_status": "FAILED", "auto_qc": "FAIL",
-             "notes": f"Not run: prerequisite(s) unmet at setup: {reasons}. No compute ran; recorded by record-fetch {__version__}.",
+             "notes": (f"{pipeline} {version} did not run on session {session_label}"
+                       + (f" scan {context.scan}" if context.scan else "") + f": {reasons}. "
+                       f"Nothing was computed; recorded at setup by record-fetch {__version__}."),
              "inputs": {"scan": context.scan, "stage": "setup", "prerequisites": [r.as_dict() for r in resolutions]}}
     files = {"PROVENANCE": [output_dir / MANIFEST]}
     try:
@@ -331,7 +383,7 @@ def publish_failure_record(context: XnatContext, resolutions: list["Resolution"]
     except (RuntimeError, ValueError, OSError) as error:
         logger.error("failure record %s not published: %s: %s", label, type(error).__name__, error, exc_info=True)
         return {"label": label, "error": f"{type(error).__name__}: {error}"}
-    logger.info("failure recorded as analysis record %s (%s): %s", record["id"], label, reasons)
+    logger.info("failure recorded as analysis record %s (%s)", record["id"], label)
     return record
 
 
@@ -378,7 +430,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         try:
             resolutions = resolve(context, prereqs)
-            materialise(context, resolutions, args.output)
+            materialise(context, resolutions, args.output, prereqs)
         except (urllib.error.URLError, OSError, ValueError) as error:
             logger.error("could not resolve prerequisites: %s", error)
             return 2

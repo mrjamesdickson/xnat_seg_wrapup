@@ -78,7 +78,10 @@ class _Xnat(BaseHTTPRequestHandler):
             names = SCANS.get(scan, {}).get(label, [])
             return self._json({"ResultSet": {"Result": [{"Name": n, "URI": f"/data/experiments/XNAT_E1/scans/{scan}/resources/{label}/files/{n}", "Size": 3} for n in names]}})
         if "/data/experiments/XNAT_E1/resources/" in p and p.endswith("/files?format=json"):
-            label = p.split("/resources/")[1].split("/")[0]; names = SESSION_RESOURCES.get(label, [])
+            label = p.split("/resources/")[1].split("/")[0]
+            if label not in SESSION_RESOURCES:                                   # XNAT: 404 for a resource that does not exist
+                self.send_response(404); self.end_headers(); return
+            names = SESSION_RESOURCES.get(label, [])
             return self._json({"ResultSet": {"Result": [{"Name": n.rsplit("/", 1)[-1], "URI": f"/data/experiments/XNAT_E1/resources/{label}/files/{n}", "Size": 3} for n in names]}})
         if "/files/" in p:
             self.send_response(200); self.send_header("Content-Type", "application/octet-stream"); self.end_headers(); self.wfile.write(b"data:" + p.rsplit("/", 1)[-1].encode()); return
@@ -111,6 +114,9 @@ def test_parse_specs_and_reject_empty():
     assert Prerequisite.parse("BIDS", "resource=BIDS").is_resource
     with pytest.raises(ValueError):
         Prerequisite.parse("X", "role=DERIVED")
+    with pytest.raises(ValueError, match="accepted= must be true or false, not 'ture'"):   # Codex P1: a typo must not disable the gate
+        Prerequisite.parse("X", "pipeline=qsiprep;accepted=ture")
+    assert Prerequisite.parse("X", "pipeline=qsiprep;accepted=0").accepted is False
     assert [p.name for p in prerequisites_from_env({"XNW_PREREQ_B": "resource=BIDS", "XNW_PREREQ_A": "pipeline=x", "OTHER": "1"})] == ["a", "b"]
 
 
@@ -131,7 +137,13 @@ def test_choose_record_newest_succeeded_then_accepted_then_version_then_explicit
     by_type, _ = choose_record(Prerequisite.parse("q", "type=qc"), records)
     assert by_type["ID"] == "XNAT_E20"
     nothing, why = choose_record(Prerequisite.parse("q", "pipeline=fmriprep"), records)
-    assert nothing is None and "no any-type/fmriprep record" in why
+    assert nothing is None and why.startswith("needs a record from pipeline fmriprep (any version, review not required, run SUCCEEDED), files from its DERIVED resource; this session has no such record (its records: XNAT_E13 (qsiprep 1.1.1, FAILED, PENDING_REVIEW); XNAT_E12")
+    assert why.endswith("; and 1 more)")                                     # five shown, the rest counted
+    unreviewed = [r for r in records if r["ID"] not in ("XNAT_E11", "XNAT_E14")]
+    gated, why = choose_record(Prerequisite.parse("q", "type=diffusion-preprocessing;pipeline=qsiprep;accepted=true;min=1.1"), unreviewed)
+    assert gated is None and why == ("needs a diffusion-preprocessing record from pipeline qsiprep (version >= 1.1, ACCEPTED in review, run SUCCEEDED), "
+                                     "files from its DERIVED resource; none of the 2 SUCCEEDED record(s) is ACCEPTED, review one first: "
+                                     "XNAT_E12 (qsiprep 1.1.1, SUCCEEDED, PENDING_REVIEW); XNAT_E10 (qsiprep 1.1.1, SUCCEEDED, PENDING_REVIEW)")
 
 
 # ── end to end ────────────────────────────────────────────────────────────────
@@ -163,10 +175,10 @@ def test_record_fetch_fails_fast_when_a_prerequisite_is_unmet(xnat, tmp_path, mo
     monkeypatch.setenv("XNW_PREREQ_QSIPREP", "pipeline=qsiprep;accepted=true;min=2.0")
     with caplog.at_level(logging.ERROR):
         assert prereq.main(["--input", str(inp), "--output", str(out)]) == 3
-    assert "prerequisite qsiprep: no SUCCEEDED record at version >= 2.0" in caplog.text
+    assert "prerequisite qsiprep: needs a record from pipeline qsiprep (version >= 2.0, ACCEPTED in review, run SUCCEEDED), files from its DERIVED resource; no SUCCEEDED record at version >= 2.0: XNAT_E13 (qsiprep 1.1.1, FAILED, PENDING_REVIEW); XNAT_E12" in caplog.text
     assert "Failed (Setup)" in caplog.text
     m = json.loads((out / "prereq.json").read_text())
-    assert m["prerequisites"][0]["error"].startswith("no SUCCEEDED record")
+    assert "no SUCCEEDED record at version >= 2.0" in m["prerequisites"][0]["error"]
     assert not (out / "prereq" / "qsiprep").exists() or not any((out / "prereq" / "qsiprep").iterdir())
     assert not [c for c in handler.calls if "/files/" in c[1] and not c[1].endswith("format=json")]      # nothing downloaded
 
@@ -205,11 +217,14 @@ def test_unmet_prerequisite_is_recorded_as_a_failed_record_with_the_reason(xnat,
     assert create[1].startswith("/data/experiments/XNAT_E1/assessors/fake-recon_S1_") and create[1].endswith("_record?inbody=true")
     assert "<analysis:run_status>FAILED</analysis:run_status>" in xml and "<analysis:auto_qc_status>FAIL</analysis:auto_qc_status>" in xml
     assert "<analysis:pipeline_name>fake-recon</analysis:pipeline_name>" in xml and "<analysis:analysis_type>fake-reconstruction</analysis:analysis_type>" in xml
-    assert "Not run: prerequisite(s) unmet at setup: preproc: no SUCCEEDED record at version &gt;= 2.0" in xml
+    assert ("fake-recon 0.1.0 did not run on session S1: prerequisite &#x27;preproc&#x27; needs a diffusion-preprocessing record from pipeline qsiprep "
+            "(version &gt;= 2.0, ACCEPTED in review, run SUCCEEDED), files from its DERIVED resource; no SUCCEEDED record at version &gt;= 2.0: XNAT_E12" in xml.replace("'", "&#x27;")
+            or "fake-recon 0.1.0 did not run on session S1: prerequisite 'preproc' needs a diffusion-preprocessing record from pipeline qsiprep" in xml)
+    assert "Nothing was computed; recorded at setup by record-fetch" in xml
     assert "<analysis:wrapup_version>record-fetch " in xml
     inputs = json.loads(html_unescape(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
     assert inputs["stage"] == "setup" and [q["name"] for q in inputs["prerequisites"]] == ["bids", "preproc"]
-    assert inputs["prerequisites"][1]["error"].startswith("no SUCCEEDED record")
+    assert "no SUCCEEDED record at version >= 2.0" in inputs["prerequisites"][1]["error"]
     assert "failure recorded as analysis record XNAT_E77" in caplog.text
     assert handler.calls[-1][:2] == ("DELETE", "/data/JSESSION")
 
@@ -262,14 +277,28 @@ def test_scan_scope_on_a_session_level_run_selects_scans_by_type(xnat, tmp_path,
     monkeypatch.setenv("XNW_PREREQ_BOLD", "resource=DICOM;scope=scan;scan_type=T1*")
     with caplog.at_level(logging.ERROR):
         assert prereq.main(["--input", str(inp), "--output", str(tmp_path / "out2")]) == 3
-    assert "prerequisite bold: scan 4: no files in resource DICOM" in caplog.text
+    assert "prerequisite bold: needs the DICOM resource of scans of type 'T1*'; scan 4 has no files in its DICOM resource" in caplog.text
     # no scan of that type at all: named, with what the session does have
     monkeypatch.setenv("XNW_PREREQ_BOLD", "resource=DICOM;scope=scan;scan_type=DWI")
     with caplog.at_level(logging.ERROR):
         assert prereq.main(["--input", str(inp), "--output", str(tmp_path / "out3")]) == 3
-    assert "no scan of type 'DWI' on this session (scan types: ['BOLD', 'T1w'])" in caplog.text
+    assert "needs the DICOM resource of scans of type 'DWI'; no scan of type 'DWI' on this session (scan types present: ['BOLD', 'T1w'])" in caplog.text
     # scope=scan with neither a scan-level run nor a type filter is refused before any request
     monkeypatch.setenv("XNW_PREREQ_BOLD", "resource=DICOM;scope=scan")
     with caplog.at_level(logging.ERROR):
         assert prereq.main(["--input", str(inp), "--output", str(tmp_path / "out4")]) == 3
-    assert "scope=scan needs a scan-level run (PROC_SCAN_ID) or scan_type=<glob>" in caplog.text
+    assert "needs the DICOM resource of the run's scan; scope=scan needs a scan-level run (PROC_SCAN_ID) or scan_type=<glob> in the card" in caplog.text
+
+
+def test_a_missing_resource_is_an_unmet_prerequisite_with_a_record_not_a_transport_error(xnat, tmp_path, monkeypatch, caplog):
+    """Codex P2 on PR #10: XNAT answers 404 for a resource that does not exist; that is a reason, not exit 2."""
+    host, handler = xnat
+    inp = tmp_path / "in"; inp.mkdir(); out = tmp_path / "out"
+    for k, v in CONTRACT_ENV.items(): monkeypatch.setenv(k, v)
+    monkeypatch.setenv("XNW_PREREQ_FMAP", "resource=FIELDMAPS")
+    with caplog.at_level(logging.ERROR):
+        assert prereq.main(["--input", str(inp), "--output", str(out)]) == 3
+    m = json.loads((out / "prereq.json").read_text())
+    assert m["prerequisites"][0]["error"] == "needs the session resource FIELDMAPS; the FIELDMAPS resource does not exist on this session (XNAT answered 404)"
+    assert m["analysis_record"]["id"] == "XNAT_E77"
+    assert "prerequisite fmap: needs the session resource FIELDMAPS; the FIELDMAPS resource does not exist" in caplog.text

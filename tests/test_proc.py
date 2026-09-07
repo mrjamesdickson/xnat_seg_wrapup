@@ -357,3 +357,18 @@ def test_proc_wrapup_records_node_envelope_and_phase_timings_for_billing(cs, tmp
     assert manifest["execution"]["facts"]["node_id"] == "laz2ephdgvajpbg96rhc6lfmn"
     report = (out / "report.html").read_text()
     assert "laz2ephdgvajpbg96rhc6lfmn" in report and "swarm" in report
+
+
+def test_pointer_only_keeps_files_an_explicit_derived_contract_left_off_the_record(cs, tmp_path, monkeypatch, caplog):
+    """Codex P1 on PR #10: with XNW_RESOURCE_DERIVED naming only some outputs, the rest must not vanish."""
+    host, handler = cs
+    inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
+    out = tmp_path / "out"
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "pyradiomics", "XNW_RESOURCE_DERIVED": "raw/features.csv"})
+    with caplog.at_level(logging.WARNING):
+        assert proc.main(["--input", str(inp), "--output", str(out), "--pointer-only"]) == 0
+    uploads = [c["path"] for c in handler.calls if "/out/resources/" in c["path"]]
+    assert not any("sub/log.txt" in u for u in uploads)                      # off the record by contract
+    assert (out / "raw" / "sub" / "log.txt").exists()                          # so it stays in the output
+    assert not (out / "raw" / "features.csv").exists()                        # what the record holds is removed
+    assert "2 file(s) are not on record XNAT_E77777 (outside the contract) and stay in the output: raw/status.json, raw/sub/log.txt" in caplog.text
