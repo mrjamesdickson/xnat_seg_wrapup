@@ -124,6 +124,24 @@ def test_parse_specs_and_reject_empty():
     assert [p.name for p in prerequisites_from_env({"XNW_PREREQ_B": "resource=BIDS", "XNW_PREREQ_A": "pipeline=x", "OTHER": "1"})] == ["a", "b"]
 
 
+def test_repeated_clause_is_refused():
+    """Codex P1 (PR #10): the last value won, so accepted=true;accepted=false disabled the gate."""
+    with pytest.raises(ValueError, match="clause 'pipeline' given twice"):
+        Prerequisite.parse("X", "pipeline=trusted;pipeline=other")
+    with pytest.raises(ValueError, match="clause 'accepted' given twice"):
+        Prerequisite.parse("X", "pipeline=qsiprep;accepted=true;accepted=false")
+
+
+def test_scan_type_needs_scan_scope():
+    """Codex P1 (PR #10): resource=DICOM;scan_type=T1* took the session-resource branch and dropped
+    the filter, handing the run the session resource instead of the matching scans."""
+    with pytest.raises(ValueError, match="scan_type= needs scope=scan"):
+        Prerequisite.parse("X", "resource=DICOM;scan_type=T1*")
+    with pytest.raises(ValueError, match="scan_type= needs scope=scan"):
+        Prerequisite.parse("X", "resource=DICOM;scope=session;scan_type=T1*")
+    assert Prerequisite.parse("X", "resource=DICOM;scope=scan;scan_type=T1*").scan_type == "T1*"
+
+
 def test_prerequisite_is_a_resource_or_a_record_never_both():
     """Codex P2 (PR #10): resource=BIDS;pipeline=qsiprep;accepted=true took the resource branch and
     dropped the pipeline and review requirements without a word."""

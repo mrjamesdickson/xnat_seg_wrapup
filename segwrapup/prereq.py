@@ -85,6 +85,10 @@ class Prerequisite:
                 raise ValueError(f"{PREFIX}{name}: clause {part.strip()!r} is not key=value ({spec!r})")
             k, v = part.split("=", 1)
             k = k.strip().lower()
+            if k in fields:
+                # pipeline=trusted;pipeline=other kept only the last value; accepted=true;accepted=false
+                # silently disabled the review gate (Codex P1, PR #10).
+                raise ValueError(f"{PREFIX}{name}: clause {k!r} given twice ({fields[k]!r} then {v.strip()!r}) ({spec!r})")
             if k not in cls.KEYS:
                 # A misspelling (pipline=) must not silently widen the selection (Codex P1, PR #10).
                 raise ValueError(f"{PREFIX}{name}: unknown clause {k!r}; known: {', '.join(cls.KEYS)} ({spec!r})")
@@ -108,6 +112,10 @@ class Prerequisite:
             raise ValueError(f"{PREFIX}{name}: scope=scan needs resource=<label on the scan> ({spec!r})")
         if not p.resource and (p.scan_type or "scope" in fields):
             raise ValueError(f"{PREFIX}{name}: scope= and scan_type= apply only to resource= prerequisites ({spec!r})")
+        if p.scan_type and p.scope != "scan":
+            # resolve() takes the session-resource branch and never reads scan_type, so the filter
+            # would be dropped and the whole session resource used instead (Codex P1, PR #10).
+            raise ValueError(f"{PREFIX}{name}: scan_type= needs scope=scan ({spec!r})")
         return p
 
     @property

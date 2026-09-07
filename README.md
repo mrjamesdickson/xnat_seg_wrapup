@@ -230,7 +230,8 @@ refused at parse time so a misspelling can never widen the match). `<NAME>` is a
 by letters, digits or underscores (at most 64 characters), lowercased into `prereq/<name>/`; two
 names that differ only in case are refused. A prerequisite is either a resource (`resource=`, with
 `scope=`/`scan_type=`) or a record (`type=`, `pipeline=`, `min=`, `role=`, `accepted=`, `id=`);
-mixing the two is refused rather than silently taking the resource and dropping the record rules:
+mixing the two is refused rather than silently taking the resource and dropping the record rules.
+A key given twice is refused (the later value used to win), and `scan_type=` requires `scope=scan`:
 
 | Key | Meaning | Default |
 |---|---|---|
