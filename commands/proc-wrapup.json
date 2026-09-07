@@ -8,5 +8,8 @@
   "mounts": [],
   "inputs": [],
   "outputs": [],
-  "xnat": []
+  "xnat": [],
+  "reserve-memory": 1024,
+  "limit-memory": 8192,
+  "limit-cpu": 2
 }
