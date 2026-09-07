@@ -26,7 +26,7 @@ from . import __version__
 from .execution import (RAW_DIRNAME, STATUS_FILENAME, copy_raw_output, fetch_parent_logs, own_workflow_id,
                         read_status, run_status_from)
 from .publish import RecordContract, publish_if_possible
-from .register import XnatContext, close_session, collection_label
+from .register import XnatContext, close_session, collection_label, fetch_session_label
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,8 @@ def run(args: argparse.Namespace) -> int:
                         "notes": f"Published by proc-wrapup {__version__}; tool output kept verbatim under {RAW_DIRNAME}/; nothing interpreted",
                         "inputs": {"scan": args.scan, "status_json": status is not None, "raw_files": len(copied)}}
         if not (args.record_label or "").strip():
-            args.record_label = collection_label(args.pipeline, args.scan) + "_record"
+            args.record_label = collection_label(args.pipeline, args.scan,
+                                                 session_label=fetch_session_label(context) if context else "") + "_record"
         manifest["analysis_record"] = publish_if_possible(args, output_dir, report, [], False, context=context,
                                                           facts=record_facts, default_resources=PROC_DEFAULT_RESOURCES)
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))

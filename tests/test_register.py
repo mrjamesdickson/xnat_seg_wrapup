@@ -112,8 +112,9 @@ def test_cli_registers_when_parent_context_present(xnat_server, tmp_path, monkey
 
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["roi_collection"]["status"] == 200
-    assert manifest["roi_collection"]["label"].startswith("spleen_ct_segmentation_scan2_")
-    assert handler.calls[0]["path"].startswith("/xapi/roi/projects/P1/sessions/XNAT_E1/collections/spleen_ct_segmentation_scan2_")
+    # the fake answers no session lookup, so the label carries the session id (still unique per project)
+    assert manifest["roi_collection"]["label"].startswith("spleen_ct_segmentation_XNAT_E1_scan2_")
+    assert handler.calls[-1]["path"].startswith("/xapi/roi/projects/P1/sessions/XNAT_E1/collections/spleen_ct_segmentation_XNAT_E1_scan2_")
     # --keep-seg-file, so the uploaded bytes can still be compared against the file on disk.
     assert handler.calls[0]["length"] == (out / "segmentation.seg.dcm").stat().st_size
     assert manifest["dicom_seg"]["retained_in_resource"] is True
@@ -201,3 +202,26 @@ def test_cli_keeps_seg_when_there_is_no_xnat_context(tmp_path, monkeypatch):
     assert manifest["roi_collection"] is None
     assert manifest["dicom_seg"]["retained_in_resource"] is True
     assert (out / "segmentation.seg.dcm").exists()
+
+
+def test_collection_label_carries_the_session_and_trims_only_the_model():
+    """Labels are unique per project: two sessions' runs of one pipeline finishing in the same
+    second (Merlin on RSNA0001/RSNA0002, 2026-09-06) must not build the same label."""
+    from datetime import datetime, timezone
+    from segwrapup.register import LABEL_MAX, collection_label
+    when = datetime(2026, 9, 6, 20, 11, 35, tzinfo=timezone.utc)
+    a = collection_label("merlin", "2", when, session_label="RSNA0001")
+    b = collection_label("merlin", "2", when, session_label="RSNA0002")
+    assert a == "merlin_RSNA0001_scan2_20260906T201135Z" and a != b
+    assert collection_label("merlin", "2", when) == "merlin_scan2_20260906T201135Z"          # no session: old shape
+    long = collection_label("A" * 80, "2", when, session_label="RSNA260904145051_0002")
+    assert len(long) <= LABEL_MAX and long.endswith("_RSNA260904145051_0002_scan2_20260906T201135Z")
+    assert collection_label("!!!", "2", when, session_label="S/1") == "SEG_S_1_scan2_20260906T201135Z"
+
+
+def test_fetch_session_label_falls_back_to_the_id(caplog):
+    from segwrapup.register import XnatContext, fetch_session_label
+    context = XnatContext(host="http://127.0.0.1:9", user="u", password="p", project="P", session="XNAT_E1", session_tried=True)
+    with caplog.at_level("WARNING"):
+        assert fetch_session_label(context, timeout_seconds=1) == "XNAT_E1"
+    assert "could not read the label of session XNAT_E1" in caplog.text

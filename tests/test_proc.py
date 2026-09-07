@@ -65,6 +65,8 @@ class _CS(BaseHTTPRequestHandler):
         self._record()
         if self.path == "/xapi/containers":
             self._send(200, json.dumps(_CS.containers).encode(), "application/json")
+        elif self.path == "/data/experiments/XNAT_E00018?format=json":
+            self._send(200, json.dumps({"items": [{"data_fields": {"label": "SESS01"}}]}).encode(), "application/json")
         elif self.path.startswith("/xapi/containers/900/logs/") and _CS.truncate_logs:
             # a Content-Length the body never reaches: urllib raises http.client.IncompleteRead
             self.send_response(200); self.send_header("Content-Length", "4096"); self.end_headers()
@@ -161,7 +163,8 @@ def test_proc_wrapup_keeps_everything_captures_logs_reports_and_publishes(cs, tm
     assert "PyRadiomics 3.1" in report and "SUCCEEDED" in report and "raw/features.csv" in report and "line one" in report
     # the record: generic fields, roles from the card + defaults, DERIVED takes the rest, one session
     creates = [c for c in handler.calls if c["method"] == "PUT" and "/assessors/" in c["path"] and "/out/" not in c["path"]]
-    assert len(creates) == 1 and creates[0]["path"].startswith("/data/experiments/XNAT_E00018/assessors/PyRadiomics_scan3_")
+    # the label carries the session label: labels are unique per project, not per session
+    assert len(creates) == 1 and creates[0]["path"].startswith("/data/experiments/XNAT_E00018/assessors/PyRadiomics_SESS01_scan3_")
     xml = creates[0]["body"].decode()
     for fragment in ("<analysis:pipeline_name>PyRadiomics<", "<analysis:pipeline_version>3.1<", "<analysis:analysis_type>radiomics<",
                      "<analysis:run_status>SUCCEEDED<", "<analysis:auto_qc_status>NOT_EVALUATED<", "<analysis:container_id>900<",

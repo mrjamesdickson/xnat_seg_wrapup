@@ -19,6 +19,7 @@ import os
 import re
 import urllib.error
 import urllib.parse
+import json
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -117,14 +118,44 @@ def close_session(context: XnatContext, timeout_seconds: float = 60.0) -> None:
         object.__setattr__(context, "jsession", "")
 
 
-def collection_label(model_name: str, scan: str, when: datetime | None = None) -> str:
-    """A label OHIF will accept and a human can read: ``<model>_scan<id>_<UTC stamp>``."""
+LABEL_MAX = 64
+
+
+def collection_label(model_name: str, scan: str, when: datetime | None = None, session_label: str = "") -> str:
+    """A label OHIF will accept and a human can read:
+    ``<model>_<session label>_scan<id>_<UTC stamp>``.
+
+    XNAT experiment labels are unique per *project*, not per session, so the session label is
+    part of it: a batch that finishes two runs of one pipeline in the same second (Merlin on
+    RSNA0001/RSNA0002, 2026-09-06) otherwise builds the same label twice and the second create
+    is refused with 409. When the whole thing exceeds ``LABEL_MAX`` the model name is trimmed,
+    never the session, scan or stamp that make it unique."""
     stamp = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
-    parts = [_LABEL_SAFE.sub("_", model_name).strip("_") or "SEG"]
+    tail = []
+    if session_label:
+        tail.append(_LABEL_SAFE.sub("_", session_label).strip("_"))
     if scan:
-        parts.append(f"scan{_LABEL_SAFE.sub('_', scan)}")
-    parts.append(stamp)
-    return "_".join(parts)[:64]
+        tail.append(f"scan{_LABEL_SAFE.sub('_', scan)}")
+    tail.append(stamp)
+    suffix = "_".join(part for part in tail if part)
+    model = _LABEL_SAFE.sub("_", model_name).strip("_") or "SEG"
+    model = model[:max(LABEL_MAX - len(suffix) - 1, 1)].rstrip("_") or "SEG"
+    return f"{model}_{suffix}"[:LABEL_MAX]
+
+
+def fetch_session_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:
+    """The session's label (``RSNA0002``) for ``context.session`` (``XNAT_E25251``); empty when
+    XNAT does not answer, so callers fall back to the id and still get a unique label."""
+    url = f"{context.host}/data/experiments/{urllib.parse.quote(context.session, safe='')}?format=json"
+    request = urllib.request.Request(url, headers=auth_headers(context))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode())
+        label = str(payload["items"][0]["data_fields"].get("label") or "").strip()
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError) as error:
+        logger.warning("could not read the label of session %s (%s); the record label carries the id instead", context.session, error)
+        return context.session
+    return label or context.session
 
 
 def register_roi_collection(

@@ -42,8 +42,14 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self.send_response(500); self.end_headers()
 
+    conflict_labels: set = set()      # PUT create of these labels answers 409 (taken elsewhere in the project)
+
     def do_GET(self):
         _Handler.calls.append({"path": self.path, "method": "GET", "auth": self.headers.get("Authorization"), "cookie": self.headers.get("Cookie")})
+        if "/assessors/" not in self.path and self.path.endswith("?format=json"):
+            body = json.dumps({"items": [{"data_fields": {"label": "SESS01"}}]}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+            return
         label = self.path.split("/assessors/")[-1].split("?")[0]
         self.send_response(_Handler.get_status or (200 if label in _Handler.existing_labels else 404))
         self.end_headers()
@@ -63,6 +69,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"boom")
             return
+        if "/assessors/" in self.path and "/out/" not in self.path and (_Handler.conflict_labels is None or self.path.split("/assessors/")[1].split("?")[0] in _Handler.conflict_labels):
+            self.send_response(409); self.end_headers(); self.wfile.write(b"<h3>Conflict: Duplicate experiment label</h3>"); return
         self.send_response(201 if "/assessors/" in self.path and "/out/" not in self.path else 200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
@@ -391,7 +399,7 @@ def test_cli_publishes_record_when_contract_and_context_present(xnat, tmp_path, 
     code, manifest, out = _run_with_masks(tmp_path, monkeypatch, env)
     assert code == 0
     record = manifest["analysis_record"]
-    assert record["id"] == "XNAT_E99999" and record["label"].startswith("DeepWMH_scan2_")
+    assert record["id"] == "XNAT_E99999" and record["label"].startswith("DeepWMH_SESS01_scan2_")   # label carries the session label
     assert "volumes.json" in record["uploaded"]["METRICS"] and "report.html" in record["uploaded"]["REPORT"]
     assert "wrapup.json" in record["uploaded"]["PROVENANCE"]
     create = next(c for c in handler.calls if c["method"] == "PUT" and "/assessors/" in c["path"] and "/out/" not in c["path"])
@@ -514,3 +522,34 @@ def test_cli_without_xnat_context_never_touches_the_session_endpoint(xnat, tmp_p
     host, handler = xnat
     code, manifest, out = _run_with_masks(tmp_path, monkeypatch, {})
     assert code == 0 and not [c for c in handler.calls if c["path"] == "/data/JSESSION"]
+
+
+def test_create_409_retries_once_with_a_suffix_and_relabels_the_document(xnat, tmp_path, caplog):
+    from segwrapup import publish
+    """Merlin batch 2026-09-06: labels are unique per project, the per-session probe cannot see a
+    label taken on another session, and two wrapups finishing in the same second collided."""
+    host, handler = xnat
+    handler.conflict_labels = {"merlin_scan2_X_record"}
+    out = tmp_path / "out"; out.mkdir(); (out / "report.html").write_text("<p>r</p>")
+    context = XnatContext(host=host, user="u", password="p", project="P", session="XNAT_E00018", scan="2")
+    xml = '<analysis:SessionAnalysis xmlns:analysis="x" project="P" label="merlin_scan2_X_record">\n</analysis:SessionAnalysis>'
+    with caplog.at_level(logging.WARNING):
+        result = publish.publish_record(context, "merlin_scan2_X_record", xml, {"REPORT": [out / "report.html"]}, output_dir=out)
+    creates = [c for c in handler.calls if c["method"] == "PUT" and "/assessors/" in c["path"] and "/out/" not in c["path"]]
+    assert len(creates) == 2 and creates[0]["path"].startswith("/data/experiments/XNAT_E00018/assessors/merlin_scan2_X_record?")
+    retry_label = creates[1]["path"].split("/assessors/")[1].split("?")[0]
+    assert retry_label.startswith("merlin_scan2_X_record_") and len(retry_label) == len("merlin_scan2_X_record_") + 4
+    assert f'label="{retry_label}"' in creates[1]["body"].decode() and 'label="merlin_scan2_X_record"' not in creates[1]["body"].decode()
+    assert result["label"] == retry_label and "retrying once as " + retry_label in caplog.text
+
+
+def test_create_409_twice_is_reported_not_looped(xnat, tmp_path):
+    from segwrapup import publish
+    host, handler = xnat
+    handler.conflict_labels = None   # sentinel: every create conflicts
+    out = tmp_path / "out"; out.mkdir(); (out / "report.html").write_text("<p>r</p>")
+    context = XnatContext(host=host, user="u", password="p", project="P", session="XNAT_E00018", scan="2")
+    xml = '<analysis:SessionAnalysis xmlns:analysis="x" project="P" label="L">\n</analysis:SessionAnalysis>'
+    with pytest.raises(RuntimeError, match="HTTP 409"):
+        publish.publish_record(context, "L", xml, {"REPORT": [out / "report.html"]}, output_dir=out)
+    assert len([c for c in handler.calls if c["method"] == "PUT"]) == 2

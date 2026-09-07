@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1 (2026-09-06)
+
+Batch fix from the first multi-session run (Merlin on RSNA_DEMO): two wrapups of one pipeline that finish in the same second built the same record label, and XNAT experiment labels are unique per **project**, so the second create was refused with 409 "Duplicate experiment label" and that session got no record.
+
+- Record and ROI-collection labels now carry the session label: `<pipeline>_<session>_scan<id>_<UTC stamp>` (the id when the label cannot be read); the model name is trimmed when the whole exceeds 64 characters, never the parts that make it unique.
+- A 409 on create is retried once with a short random suffix (document relabelled to match); a second 409 is reported as before.
+
 ## 0.4.0 (2026-09-06)
 
 The generic-assessor strategy for every card (James, 2026-09-06):
