@@ -220,7 +220,8 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
     under DERIVED, so the record must not claim PASS while carrying an unusable output.
     ``facts`` lets a generic wrapup override what seg-wrapup derives from masks:
     ``run_status``, ``auto_qc``, ``container_id``, ``duration_seconds``, ``notes``, ``inputs``,
-    and ``wrapup`` (the publishing wrapup's name, ``seg-wrapup`` by default).
+    ``config`` (execution facts: node, envelope, phases; stored as ``config_json``) and
+    ``wrapup`` (the publishing wrapup's name, ``seg-wrapup`` by default).
     """
     facts = facts or {}
     wrapup_name = facts.get("wrapup") or "seg-wrapup"
@@ -257,6 +258,7 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
         (f"  <analysis:scans><analysis:scan>{escape(context.scan)}</analysis:scan></analysis:scans>\n"
          if context.scan else ""),
         _element("inputs_json", json.dumps(inputs)),
+        _element("config_json", json.dumps(facts["config"]) if facts.get("config") else None),
         _element("notes", facts.get("notes") or f"Published by {wrapup_name} {__version__} from the {report.get('model')} run"),
         _element("results_json", json.dumps(summary)),
     ])

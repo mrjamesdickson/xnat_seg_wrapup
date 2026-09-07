@@ -115,7 +115,9 @@ def run(args: argparse.Namespace) -> int:
     try:
         if context is not None:
             execution = fetch_parent_logs(context, output_dir, status, own_workflow_id())
-            chain = chain_from_workflow(context, own_workflow_id())
+            # The orchestration fields sit on the parent's (main) workflow; the wrapup's own
+            # workflow carries none (demo02 wrk_workflowdata, 2026-09-07).
+            chain = chain_from_workflow(context, (execution or {}).get("workflow_id")) or chain_from_workflow(context, own_workflow_id())
         log_tails = {}
         for name in ("stdout", "stderr"):
             path = output_dir / "logs" / f"{name}.log"
@@ -131,6 +133,9 @@ def run(args: argparse.Namespace) -> int:
             "cs_container_id": (execution or {}).get("container_id", ""), "duration_seconds": (execution or {}).get("duration_seconds", ""),
             "files_kept": len(copied),
             "chain": (f"orchestration {chain['orchestration_id']} step {chain['step']} job {chain['job_id']}" if chain else ""),
+            "node": (execution or {}).get("facts", {}).get("node_id", ""), "backend": (execution or {}).get("facts", {}).get("backend", ""),
+            "envelope": json.dumps((execution or {}).get("facts", {}).get("envelope", {})),
+            "total_seconds": (execution or {}).get("facts", {}).get("total_seconds", ""),
             "prerequisites": ", ".join(f"{q['name']}={q.get('record', {}).get('ID') or q.get('resource', '')}" for q in prerequisites),
         }
         facts = {"summary": summary, "files": files, "log_tails": log_tails, "generated": started.strftime("%Y-%m-%d %H:%M:%S UTC")}
@@ -143,6 +148,7 @@ def run(args: argparse.Namespace) -> int:
         report = {"model": args.pipeline, "model_version": args.pipeline_version, "scan": args.scan}
         record_facts = {"wrapup": "proc-wrapup", "run_status": run_status, "auto_qc": "FAIL" if run_status == "FAILED" else "NOT_EVALUATED",
                         "container_id": (execution or {}).get("container_id"), "duration_seconds": (execution or {}).get("duration_seconds"),
+                        "config": (execution or {}).get("facts"),
                         "notes": f"Published by proc-wrapup {__version__}; tool output kept verbatim under {RAW_DIRNAME}/; nothing interpreted",
                         "inputs": {"scan": args.scan, "status_json": status is not None, "raw_files": len(copied),
                                    "chain": chain,

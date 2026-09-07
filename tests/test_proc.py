@@ -25,19 +25,32 @@ CONTEXT_ENV = {"XNAT_HOST": "http://x", "XNAT_USER": "alias", "XNAT_PASS": "secr
 # The real link is the mount: CS resolves the wrapup's /input from the parent's output mount
 # (same xnat-host-path on both), as seen on demo02 for containers 35531/35532.
 BUILD = "/data/xnat/build/1727a620-4b73-4aad-872d-681a14a98d77"
+SETUP_OUT = "/data/xnat/build/0c0c-setup-output"
 CONTAINERS = [
     {"id": 900, "workflow-id": "4990", "subtype": "docker", "status": "Complete", "docker-image": "radiomics/pyradiomics:CLI",
-     "mounts": [{"name": "input-mount", "writable": False, "xnat-host-path": "/data/xnat/archive/P/arc001/S/SCANS/3/NIFTI"},
+     "backend": "swarm", "node-id": "laz2ephdgvajpbg96rhc6lfmn", "service-id": "svc1", "task-id": "task1", "container-id": "5687d46dcb7c", "user-id": "admin",
+     "reserve-memory": 256, "limit-memory": 1024, "limit-cpu": 1.0, "generic-resources": {"GPU": "1"},
+     "mounts": [{"name": "input-mount", "writable": False, "xnat-host-path": SETUP_OUT},
                 {"name": "output-mount", "writable": True, "xnat-host-path": BUILD}],
      "history": [{"status": "Created", "time-recorded": "2026-09-06T10:00:00.000+0000"},
+                 {"status": "running", "time-recorded": "2026-09-06T10:00:20.000+0000"},
+                 {"status": "complete", "time-recorded": "2026-09-06T10:02:20.000+0000"},
                  {"status": "Complete", "time-recorded": "2026-09-06T10:02:30.000+0000"}]},
+    {"id": 899, "workflow-id": "4991", "subtype": "docker-setup", "status": "Complete", "docker-image": "xnatworks/record-fetch:0.5.0",
+     "mounts": [{"name": "input", "writable": False, "xnat-host-path": "/data/xnat/archive/P/arc001/S/SCANS/3/NIFTI"},
+                {"name": "output", "writable": True, "xnat-host-path": SETUP_OUT}],
+     "history": [{"status": "Created", "time-recorded": "2026-09-06T09:59:50.000+0000"},
+                 {"status": "running", "time-recorded": "2026-09-06T09:59:52.000+0000"},
+                 {"status": "complete", "time-recorded": "2026-09-06T09:59:58.000+0000"}]},
     {"id": 902, "workflow-id": "5000", "subtype": "docker", "status": "Complete", "docker-image": "someone/else:1",
      "mounts": [{"name": "output-mount", "writable": True, "xnat-host-path": "/data/xnat/build/other-run"}],
      "history": [{"status": "Created", "time-recorded": "2026-09-06T10:01:00.000+0000"},
                  {"status": "Complete", "time-recorded": "2026-09-06T10:01:05.000+0000"}]},
     {"id": 901, "workflow-id": "5001", "subtype": "docker-wrapup", "status": "Running", "docker-image": "xnatworks/proc-wrapup:0.4.0",
      "mounts": [{"name": "input", "writable": False, "xnat-host-path": BUILD},
-                {"name": "output", "writable": True, "xnat-host-path": "/data/xnat/build/f4f49ad1"}]},
+                {"name": "output", "writable": True, "xnat-host-path": "/data/xnat/build/f4f49ad1"}],
+     "history": [{"status": "Created", "time-recorded": "2026-09-06T10:02:31.000+0000"},
+                 {"status": "running", "time-recorded": "2026-09-06T10:02:33.000+0000"}]},
 ]
 
 
@@ -67,9 +80,11 @@ class _CS(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_CS.containers).encode(), "application/json")
         elif self.path == "/data/experiments/XNAT_E00018?format=json":
             self._send(200, json.dumps({"items": [{"data_fields": {"label": "SESS01"}}]}).encode(), "application/json")
-        elif self.path == "/data/workflows/5001?format=json":
-            self._send(200, json.dumps({"items": [{"data_fields": {"wrk_workflowData_id": 5001, "status": "Running", "next_step_id": "42",
+        elif self.path == "/data/workflows/4990?format=json":       # the parent's workflow carries the orchestration fields
+            self._send(200, json.dumps({"items": [{"data_fields": {"wrk_workflowData_id": 4990, "status": "Complete", "next_step_id": "42",
                                                                     "current_step_id": "2", "jobid": "job-abc"}}]}).encode(), "application/json")
+        elif self.path == "/data/workflows/5001?format=json":       # the wrapup's own does not (demo02 wrk_workflowdata, 2026-09-07)
+            self._send(200, json.dumps({"items": [{"data_fields": {"wrk_workflowData_id": 5001, "status": "Running"}}]}).encode(), "application/json")
         elif self.path.startswith("/xapi/containers/900/logs/") and _CS.truncate_logs:
             # a Content-Length the body never reaches: urllib raises http.client.IncompleteRead
             self.send_response(200); self.send_header("Content-Length", "4096"); self.end_headers()
@@ -160,7 +175,7 @@ def test_proc_wrapup_keeps_everything_captures_logs_reports_and_publishes(cs, tm
     assert (out / "logs" / "stdout.log").read_text().startswith("line one") and (out / "logs" / "stderr.log").exists()
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["wrapup"] == "proc-wrapup" and manifest["run_status"] == "SUCCEEDED"
-    assert manifest["execution"]["container_id"] == 900 and manifest["execution"]["duration_seconds"] == 150
+    assert manifest["execution"]["container_id"] == 900 and manifest["execution"]["duration_seconds"] == 120
     # a report a reviewer can read, interpreting nothing
     report = (out / "report.html").read_text()
     assert "PyRadiomics 3.1" in report and "SUCCEEDED" in report and "raw/features.csv" in report and "line one" in report
@@ -172,7 +187,7 @@ def test_proc_wrapup_keeps_everything_captures_logs_reports_and_publishes(cs, tm
     for fragment in ("<analysis:pipeline_name>PyRadiomics<", "<analysis:pipeline_version>3.1<", "<analysis:analysis_type>radiomics<",
                      "<analysis:run_status>SUCCEEDED<", "<analysis:auto_qc_status>NOT_EVALUATED<", "<analysis:container_id>900<",
                      f"<analysis:wrapup_version>proc-wrapup {__version__}<",
-                     "<analysis:duration_seconds>150<", "<analysis:card_id>pyradiomics<", "<analysis:scans><analysis:scan>3<"):
+                     "<analysis:duration_seconds>120<", "<analysis:card_id>pyradiomics<", "<analysis:scans><analysis:scan>3<"):
         assert fragment in xml, fragment
     uploads = [c["path"].split("/out/resources/")[1].split("?")[0] for c in handler.calls if "/out/resources/" in c["path"]]
     assert "METRICS/files/raw/features.csv" in uploads and "REPORT/files/report.html" in uploads
@@ -217,7 +232,7 @@ def test_find_parent_container_never_guesses(cs, caplog):
     context = XnatContext(host=host, user="u", password="p", project="P", session="S", scan="3")
     assert find_parent_container(context, None, "9999") is None          # own container unknown
     assert find_parent_container(context, None, None) is None
-    twin = dict(CONTAINERS[1], id=903, mounts=[{"name": "output-mount", "writable": True, "xnat-host-path": BUILD}])
+    twin = dict(CONTAINERS[2], id=903, mounts=[{"name": "output-mount", "writable": True, "xnat-host-path": BUILD}])
     handler.containers = CONTAINERS + [twin]
     with caplog.at_level(logging.WARNING):
         assert find_parent_container(context, None, "5001") is None       # two writers: ambiguous
@@ -252,7 +267,7 @@ def test_no_publish_keeps_execution_capture(cs, tmp_path, monkeypatch):
     assert proc.main(["--input", str(inp), "--output", str(out), "--no-publish"]) == 0
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["analysis_record"] is None
-    assert manifest["execution"]["container_id"] == 900 and manifest["execution"]["duration_seconds"] == 150
+    assert manifest["execution"]["container_id"] == 900 and manifest["execution"]["duration_seconds"] == 120
     assert (out / "logs" / "stdout.log").exists() and "line one" in (out / "report.html").read_text()
     assert not [c for c in handler.calls if c["method"] == "PUT"]
     assert [c["method"] for c in handler.calls if c["path"] == "/data/JSESSION"] == ["POST", "DELETE"]
@@ -298,7 +313,7 @@ def test_proc_wrapup_records_chain_and_prerequisites_and_can_leave_only_a_pointe
     assert proc.main(["--input", str(inp), "--output", str(out), "--pointer-only"]) == 0
     xml = [c for c in handler.calls if c["method"] == "PUT" and "/assessors/" in c["path"] and "/out/" not in c["path"]][0]["body"].decode()
     inputs = json.loads(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0].replace("&quot;", '"'))
-    assert inputs["chain"] == {"orchestration_id": "42", "step": 2, "job_id": "job-abc", "workflow_id": "5001"}
+    assert inputs["chain"] == {"orchestration_id": "42", "step": 2, "job_id": "job-abc", "workflow_id": "4990"}
     assert inputs["upstream_record"] == "XNAT_E12"
     assert [(q["name"], q["record"], q["resource"]) for q in inputs["prerequisites"]] == [("qsiprep", "XNAT_E12", None), ("bids", None, "BIDS")]
     # the files went to the record, then the output was reduced to the pointer
@@ -318,3 +333,27 @@ def test_proc_wrapup_without_orchestration_records_no_chain(cs, tmp_path, monkey
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["chain"] is None and manifest["prerequisites"] == []
     assert (out / "raw" / "features.csv").exists()                     # no --pointer-only: output kept
+
+
+def test_proc_wrapup_records_node_envelope_and_phase_timings_for_billing(cs, tmp_path, monkeypatch):
+    """James, 2026-09-07: "accurate compute time … plus machine that ran it … for auditing and cost analysis"."""
+    host, handler = cs
+    inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
+    out = tmp_path / "out"
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "pyradiomics"})
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    xml = [c for c in handler.calls if c["method"] == "PUT" and "/assessors/" in c["path"] and "/out/" not in c["path"]][0]["body"].decode()
+    assert "<analysis:duration_seconds>120</analysis:duration_seconds>" in xml            # running -> complete of the main
+    config = json.loads(xml.split("<analysis:config_json>")[1].split("</analysis:config_json>")[0].replace("&quot;", '"'))
+    assert (config["backend"], config["node_id"], config["image"], config["user"]) == ("swarm", "laz2ephdgvajpbg96rhc6lfmn", "radiomics/pyradiomics:CLI", "admin")
+    assert config["envelope"] == {"reserve_memory_mib": 256, "limit_memory_mib": 1024, "limit_cpu": 1.0, "generic_resources": {"GPU": "1"}, "swarm_constraints": []}
+    main = config["phases"]["main"]
+    assert (main["container_id"], main["seconds"], main["queue_wait_seconds"]) == (900, 120, 20)
+    assert [ (p["container_id"], p["seconds"]) for p in config["phases"]["setup"] ] == [(899, 6)]      # found by the shared mount
+    assert config["phases"]["wrapup"]["container_id"] == 901 and config["phases"]["wrapup"]["seconds"] is not None   # still running: to now
+    assert config["total_seconds"] == 120 + 6 + config["phases"]["wrapup"]["seconds"]
+    assert "measured usage" in config["billing_note"]
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["execution"]["facts"]["node_id"] == "laz2ephdgvajpbg96rhc6lfmn"
+    report = (out / "report.html").read_text()
+    assert "laz2ephdgvajpbg96rhc6lfmn" in report and "swarm" in report

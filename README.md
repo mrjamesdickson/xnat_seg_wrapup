@@ -255,7 +255,7 @@ image lineage, entrypoint `proc-wrapup`, image `xnatworks/proc-wrapup:<version>`
   share: the Container Service resolves the wrapup's `/input` from the parent's output mount,
   and never by workflow-id order, which a concurrent run can break); `--no-publish` leaves this
   capture on and suppresses only the record;
-- writes `report.html` (what ran, how it ended, the files kept, log tails) and `wrapup.json`; records the orchestration (`next_step_id`, step, job id) and the prerequisites record-fetch resolved in the record's `inputs_json`; `--pointer-only` leaves only `wrapup.json` for the output handler so the record is the single owner of the data;
+- records where and how it ran for audit and billing (`config_json`: backend, node, reserved envelope, per-phase wall clock, total); writes `report.html` (what ran, where, how it ended, the files kept, log tails) and `wrapup.json`; records the orchestration (`next_step_id`, step, job id) and the prerequisites record-fetch resolved in the record's `inputs_json`; `--pointer-only` leaves only `wrapup.json` for the output handler so the record is the single owner of the data;
 - publishes the record with the `XNW_*` contract exactly as seg-wrapup does. Default roles:
   `REPORT` report.html, `PROVENANCE` wrapup.json + status.json, `LOGS` logs/*.log, `DERIVED`
   everything else; a card names `METRICS` globs itself (e.g. `XNW_RESOURCE_METRICS=raw/features.csv`).
