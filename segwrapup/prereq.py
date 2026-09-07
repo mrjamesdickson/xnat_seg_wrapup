@@ -96,10 +96,18 @@ class Prerequisite:
                 scope=(fields.get("scope") or "session").lower(), scan_type=fields.get("scan_type", ""), raw=spec)
         if not (p.resource or p.record_id or p.analysis_type or p.pipeline):
             raise ValueError(f"{PREFIX}{name}: a prerequisite needs resource=, id=, type= or pipeline= ({spec!r})")
+        record_keys = [k for k in ("type", "pipeline", "min", "role", "accepted", "id") if k in fields]
+        if p.resource and record_keys:
+            # A resource prerequisite ignores record clauses, so mixing them would silently drop a
+            # pipeline or review requirement (Codex P2, PR #10).
+            raise ValueError(f"{PREFIX}{name}: resource= cannot be combined with {', '.join(k + '=' for k in record_keys)} "
+                             f"(a prerequisite is either a resource or a record) ({spec!r})")
         if p.scope not in ("session", "scan"):
             raise ValueError(f"{PREFIX}{name}: scope must be session or scan ({spec!r})")
         if p.scope == "scan" and not p.resource:
             raise ValueError(f"{PREFIX}{name}: scope=scan needs resource=<label on the scan> ({spec!r})")
+        if not p.resource and (p.scan_type or "scope" in fields):
+            raise ValueError(f"{PREFIX}{name}: scope= and scan_type= apply only to resource= prerequisites ({spec!r})")
         return p
 
     @property

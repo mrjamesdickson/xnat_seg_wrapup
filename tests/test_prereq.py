@@ -124,6 +124,22 @@ def test_parse_specs_and_reject_empty():
     assert [p.name for p in prerequisites_from_env({"XNW_PREREQ_B": "resource=BIDS", "XNW_PREREQ_A": "pipeline=x", "OTHER": "1"})] == ["a", "b"]
 
 
+def test_prerequisite_is_a_resource_or_a_record_never_both():
+    """Codex P2 (PR #10): resource=BIDS;pipeline=qsiprep;accepted=true took the resource branch and
+    dropped the pipeline and review requirements without a word."""
+    with pytest.raises(ValueError, match="resource= cannot be combined with pipeline=, accepted="):
+        Prerequisite.parse("X", "resource=BIDS;pipeline=qsiprep;accepted=true")
+    with pytest.raises(ValueError, match="resource= cannot be combined with type=, min=, role=, id="):
+        Prerequisite.parse("X", "resource=BIDS;type=qc;min=1;role=DERIVED;id=XNAT_E1")
+    with pytest.raises(ValueError, match="scope= and scan_type= apply only to resource="):
+        Prerequisite.parse("X", "pipeline=qsiprep;scope=session")
+    with pytest.raises(ValueError, match="scope= and scan_type= apply only to resource="):
+        Prerequisite.parse("X", "pipeline=qsiprep;scan_type=T1*")
+    assert Prerequisite.parse("X", "resource=DICOM;scope=scan;scan_type=T1*").scan_type == "T1*"
+    with pytest.raises(ValueError, match="resource= cannot be combined with accepted="):   # even accepted=false is a record clause
+        Prerequisite.parse("X", "resource=BIDS;accepted=false")
+
+
 def test_prerequisite_name_is_one_safe_path_component():
     """Codex P2 (PR #10): the name becomes prereq/<name>/, so '..' or a slash would escape the output."""
     for bad in ("..", "a/b", "a\\b", "", "1abc", "a b", "a-b", "x" * 65):

@@ -228,7 +228,9 @@ orchestration or from an event rule and always finds its own inputs.
 Clause reference (`XNW_PREREQ_<NAME>` = `key=value;…`; unknown keys and malformed clauses are
 refused at parse time so a misspelling can never widen the match). `<NAME>` is a letter followed
 by letters, digits or underscores (at most 64 characters), lowercased into `prereq/<name>/`; two
-names that differ only in case are refused:
+names that differ only in case are refused. A prerequisite is either a resource (`resource=`, with
+`scope=`/`scan_type=`) or a record (`type=`, `pipeline=`, `min=`, `role=`, `accepted=`, `id=`);
+mixing the two is refused rather than silently taking the resource and dropping the record rules:
 
 | Key | Meaning | Default |
 |---|---|---|
