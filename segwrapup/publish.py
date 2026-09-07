@@ -220,7 +220,8 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
     under DERIVED, so the record must not claim PASS while carrying an unusable output.
     ``facts`` lets a generic wrapup override what seg-wrapup derives from masks:
     ``run_status``, ``auto_qc``, ``container_id``, ``duration_seconds``, ``notes``, ``inputs``,
-    and ``wrapup`` (the publishing wrapup's name, ``seg-wrapup`` by default).
+    ``config`` (execution facts: node, envelope, phases; stored as ``config_json``) and
+    ``wrapup`` (the publishing wrapup's name, ``seg-wrapup`` by default).
     """
     facts = facts or {}
     wrapup_name = facts.get("wrapup") or "seg-wrapup"
@@ -257,6 +258,7 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
         (f"  <analysis:scans><analysis:scan>{escape(context.scan)}</analysis:scan></analysis:scans>\n"
          if context.scan else ""),
         _element("inputs_json", json.dumps(inputs)),
+        _element("config_json", json.dumps(facts["config"]) if facts.get("config") else None),
         _element("notes", facts.get("notes") or f"Published by {wrapup_name} {__version__} from the {report.get('model')} run"),
         _element("results_json", json.dumps(summary)),
     ])
@@ -342,10 +344,17 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     record_id = text.strip() if text.strip().startswith("XNAT_") else label
     record_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(record_id, safe='')}"
     uploaded: dict[str, list[str]] = {}
+    skipped_empty: list[str] = []
     try:
         for role, paths in files.items():
             for path in paths:
                 name = upload_name(path, output_dir)
+                if path.stat().st_size == 0:
+                    # XNAT answers an in-body PUT with an empty body with HTTP 500 ("request entity
+                    # size is 0"); a tool that wrote nothing to stderr must not cost the record.
+                    logger.warning("%s is empty; not uploaded to %s (XNAT refuses zero-byte in-body files)", name, role)
+                    skipped_empty.append(name)
+                    continue
                 content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
                 url = (f"{record_url}/out/resources/{role}/files/{urllib.parse.quote(name, safe='/')}"
                        f"?inbody=true&format={urllib.parse.quote(upload_format(path), safe='')}")
@@ -364,7 +373,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     logger.info("analysis record %s published as %s with %d file(s)", label, record_id,
                 sum(len(v) for v in uploaded.values()))
     return {"xsi_type": XSI_TYPE, "id": record_id, "label": label, "status": status,
-            "uploaded": uploaded, "url": create_url.split("?")[0]}
+            "uploaded": uploaded, "skipped_empty": skipped_empty, "url": create_url.split("?")[0]}
 
 
 def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict],
@@ -394,9 +403,18 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
     # of the masks, report and ROI collection that are already on disk.
     try:
         files = collect_files(output_dir, contract)
+        # Zero-byte files are dropped here, before the document is built, so output_file_count
+        # and results_json never claim a file the upload would skip (Codex P2 on PR #10).
+        empties = [upload_name(p, output_dir) for paths in files.values() for p in paths if p.stat().st_size == 0]
+        files = {role: [p for p in paths if p.stat().st_size > 0] for role, paths in files.items()}
+        files = {role: paths for role, paths in files.items() if paths}
+        for name in empties:
+            logger.warning("%s is empty; left off the record (XNAT refuses zero-byte in-body files)", name)
         xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present,
                                output_dir=output_dir, unmeasured_masks=unmeasured_masks, facts=facts)
-        return publish_record(context, label, xml, files, output_dir=output_dir)
+        outcome = publish_record(context, label, xml, files, output_dir=output_dir)
+        outcome["skipped_empty"] = sorted(set(outcome.get("skipped_empty") or []) | set(empties))
+        return outcome
     except (RuntimeError, ValueError, NotImplementedError, OSError) as error:
         logger.error("analysis record %s not published; files and ROI collection still delivered: %s: %s",
                      label, type(error).__name__, error, exc_info=True)

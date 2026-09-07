@@ -1,0 +1,15 @@
+{
+  "name": "record-fetch",
+  "description": "Setup command: resolves the card's prerequisites (XNW_PREREQ_* : accepted/newest/version/explicit record, or a session resource) by REST and materialises them under prereq/<name>/ next to the pass-through input. A missing prerequisite fails the run before any compute.",
+  "version": "0.5.0",
+  "type": "docker-setup",
+  "image": "xnatworks/record-fetch:0.5.0",
+  "command-line": "record-fetch",
+  "reserve-memory": 1024,
+  "limit-memory": 4096,
+  "limit-cpu": 2,
+  "mounts": [],
+  "inputs": [],
+  "outputs": [],
+  "xnat": []
+}

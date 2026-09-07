@@ -247,6 +247,41 @@ def test_publish_creates_record_then_uploads_files_to_its_out_resources(xnat, tm
     assert all(c["cookie"] == "JSESSIONID=FAKESESSION1234" for c in calls)     # every working request on the one session
     assert outcome["uploaded"] == {"METRICS": ["volumes.json"], "REPORT": ["report.html"],
                                    "DERIVED": ["segmentation.nii.gz", "sub/part.tsv"]}
+    assert outcome["skipped_empty"] == []
+
+
+def test_publish_skips_empty_files_instead_of_losing_the_record(xnat, tmp_path, caplog):
+    """demo02 2026-09-07: a tool that wrote nothing to stderr produced a 0-byte logs/stderr.log; XNAT
+    answered the in-body PUT with HTTP 500 and the whole record was rolled back."""
+    host, handler = xnat
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "stdout.log").write_text("ran")
+    (tmp_path / "logs" / "stderr.log").write_bytes(b"")
+    files = {"LOGS": [tmp_path / "logs" / "stdout.log", tmp_path / "logs" / "stderr.log"]}
+    outcome = publish_record(_context(host), "fake_X", "<xml/>", files, output_dir=tmp_path)
+    assert outcome["id"] == "XNAT_E99999" and outcome["uploaded"] == {"LOGS": ["logs/stdout.log"]}
+    assert outcome["skipped_empty"] == ["logs/stderr.log"]
+    assert not [c for c in handler.calls if c["method"] == "DELETE"], "no rollback"
+    assert not [c for c in handler.calls if "stderr.log" in c["path"]], "the empty file is never sent"
+    assert "logs/stderr.log is empty; not uploaded to LOGS" in caplog.text
+
+
+def test_publish_if_possible_leaves_empty_files_out_of_the_record_document(xnat, tmp_path, monkeypatch, caplog):
+    """Codex P2 on PR #10: output_file_count and results_json must not claim a file the upload skips."""
+    from types import SimpleNamespace
+    from segwrapup.publish import publish_if_possible
+    host, handler = xnat
+    (tmp_path / "volumes.json").write_text('{"a":1}')
+    (tmp_path / "empty.txt").write_bytes(b"")
+    for k, v in {"XNW_CARD_ID": "c", "XNW_ANALYSIS_TYPE": "t", "XNW_CONTAINER_IMAGE": "i:1"}.items():
+        monkeypatch.setenv(k, v)
+    args = SimpleNamespace(no_publish=False, record_label="lbl_X", model="m", scan="3")
+    with caplog.at_level(logging.WARNING):
+        outcome = publish_if_possible(args, tmp_path, {"model": "m", "model_version": "1"}, [], False, context=_context(host))
+    assert outcome["skipped_empty"] == ["empty.txt"] and outcome["uploaded"] == {"METRICS": ["volumes.json"]}
+    xml = [c for c in handler.calls if c["method"] == "PUT" and "/out/" not in c["path"]][0]["body"].decode()
+    assert "<analysis:output_file_count>1</analysis:output_file_count>" in xml and "empty.txt" not in xml
+    assert "empty.txt is empty; left off the record" in caplog.text
 
 
 def test_publish_refuses_a_label_that_already_exists(xnat, tmp_path):
