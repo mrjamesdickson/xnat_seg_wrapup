@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0 (2026-09-07)
+
+Prerequisites and chains (James: "adding a prerequisite to the card … our setup command needs to find the prereq data"):
+
+- **record-fetch**, a third entrypoint and image (`xnatworks/record-fetch`, a Container Service *setup* command): resolves the card's `XNW_PREREQ_*` prerequisites by REST (a record on the session by analysis type/pipeline, newest SUCCEEDED, optionally ACCEPTED, minimum version, or an explicit record id; or a session resource), materialises the files under `prereq/<name>/` next to the pass-through input, writes `prereq.json`, and exits non-zero when a prerequisite is unmet so the run fails as `Failed (Setup)` before any compute.
+- proc-wrapup records **chain provenance** from its own workflow (`next_step_id` = orchestration, `current_step_id`, `jobid`) and the prerequisites the setup resolved (when `prereq.json` is visible in its input) in the record's `inputs_json` (`chain`, `prerequisites`, `upstream_record`).
+- proc-wrapup `--pointer-only` / `PROC_POINTER_ONLY`: after publishing, only `wrapup.json` is left for the output handler, so the session gets a one-file pointer resource and the record is the only owner of the data.
+
 ## 0.4.1 (2026-09-06)
 
 Batch fix from the first multi-session run (Merlin on RSNA_DEMO): two wrapups of one pipeline that finish in the same second built the same record label, and XNAT experiment labels are unique per **project**, so the second create was refused with 409 "Duplicate experiment label" and that session got no record.

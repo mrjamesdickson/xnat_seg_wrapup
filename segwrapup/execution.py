@@ -188,6 +188,28 @@ def fetch_parent_logs(context: XnatContext, output_dir: Path, status: dict | Non
     return info
 
 
+def chain_from_workflow(context: XnatContext, workflow_id: str | None, timeout: float = 60.0) -> dict | None:
+    """The orchestration this run belongs to, from the wrapup's own workflow: the Container
+    Service stores ``nextStepId`` (orchestration id), ``currentStepId`` (step index) and
+    ``jobid`` (shared bulk-launch id) on every orchestrated workflow
+    (ContainerServiceImpl.createContainerWorkflow, ContainerServiceWorkflowStatusEventListener).
+    None when the run is not orchestrated or the workflow cannot be read."""
+    if not workflow_id:
+        return None
+    try:
+        payload = _get_json(context, f"{context.host}/data/workflows/{workflow_id}?format=json", timeout)
+        fields = payload["items"][0]["data_fields"]
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError) as error:
+        logger.warning("could not read workflow %s for chain provenance: %s", workflow_id, error)
+        return None
+    lower = {str(k).lower(): v for k, v in fields.items()}
+    orchestration = lower.get("next_step_id") or lower.get("nextstepid")
+    if not orchestration:
+        return None
+    return {"orchestration_id": str(orchestration), "step": int(str(lower.get("current_step_id") or lower.get("currentstepid") or 0) or 0),
+            "job_id": str(lower.get("jobid") or lower.get("job_id") or ""), "workflow_id": str(workflow_id)}
+
+
 def own_workflow_id(environ: dict | None = None) -> str | None:
     env = os.environ if environ is None else environ
     return (env.get("XNAT_WORKFLOW_ID") or "").strip() or None

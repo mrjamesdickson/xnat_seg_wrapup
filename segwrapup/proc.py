@@ -23,8 +23,9 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .execution import (RAW_DIRNAME, STATUS_FILENAME, copy_raw_output, fetch_parent_logs, own_workflow_id,
-                        read_status, run_status_from)
+from .execution import (RAW_DIRNAME, STATUS_FILENAME, chain_from_workflow, copy_raw_output, fetch_parent_logs,
+                        own_workflow_id, read_status, run_status_from)
+from .prereq import MANIFEST as PREREQ_MANIFEST
 from .publish import RecordContract, publish_if_possible
 from .register import XnatContext, close_session, collection_label, fetch_session_label
 
@@ -49,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-publish", action="store_true", default=env.get("PROC_NO_PUBLISH", env.get("SEG_NO_PUBLISH", "")).lower() in ("1", "true", "yes"))
     parser.add_argument("--record-label", default=env.get("PROC_RECORD_LABEL", env.get("SEG_RECORD_LABEL", "")))
     parser.add_argument("--scan", default=env.get("PROC_SCAN_ID", env.get("SEG_SCAN_ID", "")))
+    parser.add_argument("--pointer-only", action="store_true", default=env.get("PROC_POINTER_ONLY", "").lower() in ("1", "true", "yes"),
+                        help="after publishing, leave only wrapup.json in the output so the session gets a one-file pointer resource and the record owns the data")
     return parser
 
 
@@ -73,6 +76,21 @@ th{{text-align:left;padding:3px 10px 3px 0;color:#555;vertical-align:top}}td{{pa
 </body></html>"""
 
 
+def read_prerequisites(input_dir: Path) -> list[dict]:
+    """What record-fetch resolved for the parent, if the tool's input mount is visible here.
+    The setup writes ``prereq.json`` into the mount the main container reads; a tool that
+    copies its input tree to /output (or a card whose command line does) makes it visible to
+    the wrapup. Otherwise the list is empty and the record names no upstream."""
+    for candidate in (input_dir / PREREQ_MANIFEST, input_dir / "prereq" / PREREQ_MANIFEST):
+        if candidate.exists():
+            try:
+                data = json.loads(candidate.read_text())
+                return [q for q in data.get("prerequisites", []) if isinstance(q, dict) and not q.get("error")]
+            except (OSError, ValueError) as error:
+                logger.warning("%s unreadable (%s); prerequisites not recorded", candidate, error)
+    return []
+
+
 def run(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     input_dir, output_dir = args.input, args.output
@@ -92,9 +110,12 @@ def run(args: argparse.Namespace) -> int:
     # the record (publish_if_possible checks the flag), never the execution state.
     context = XnatContext.from_env()
     execution = None
+    chain = None
+    prerequisites = read_prerequisites(input_dir)
     try:
         if context is not None:
             execution = fetch_parent_logs(context, output_dir, status, own_workflow_id())
+            chain = chain_from_workflow(context, own_workflow_id())
         log_tails = {}
         for name in ("stdout", "stderr"):
             path = output_dir / "logs" / f"{name}.log"
@@ -109,25 +130,39 @@ def run(args: argparse.Namespace) -> int:
             "card": f"{os.environ.get('XNW_CARD_ID', '')} {os.environ.get('XNW_CARD_REVISION', '')}".strip(),
             "cs_container_id": (execution or {}).get("container_id", ""), "duration_seconds": (execution or {}).get("duration_seconds", ""),
             "files_kept": len(copied),
+            "chain": (f"orchestration {chain['orchestration_id']} step {chain['step']} job {chain['job_id']}" if chain else ""),
+            "prerequisites": ", ".join(f"{q['name']}={q.get('record', {}).get('ID') or q.get('resource', '')}" for q in prerequisites),
         }
         facts = {"summary": summary, "files": files, "log_tails": log_tails, "generated": started.strftime("%Y-%m-%d %H:%M:%S UTC")}
         (output_dir / "report.html").write_text(render_report(facts))
         manifest = {"wrapup": "proc-wrapup", "version": __version__, "generated": facts["generated"], "pipeline": args.pipeline,
                     "pipeline_version": args.pipeline_version, "run_status": run_status, "status": status, "execution": execution,
-                    "raw_files": copied}
+                    "chain": chain, "prerequisites": prerequisites, "raw_files": copied}
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
 
         report = {"model": args.pipeline, "model_version": args.pipeline_version, "scan": args.scan}
         record_facts = {"wrapup": "proc-wrapup", "run_status": run_status, "auto_qc": "FAIL" if run_status == "FAILED" else "NOT_EVALUATED",
                         "container_id": (execution or {}).get("container_id"), "duration_seconds": (execution or {}).get("duration_seconds"),
                         "notes": f"Published by proc-wrapup {__version__}; tool output kept verbatim under {RAW_DIRNAME}/; nothing interpreted",
-                        "inputs": {"scan": args.scan, "status_json": status is not None, "raw_files": len(copied)}}
+                        "inputs": {"scan": args.scan, "status_json": status is not None, "raw_files": len(copied),
+                                   "chain": chain,
+                                   "prerequisites": [{"name": q["name"], "record": (q.get("record") or {}).get("ID"),
+                                                      "resource": q.get("resource"), "role": q.get("role")} for q in prerequisites],
+                                   "upstream_record": next(((q.get("record") or {}).get("ID") for q in prerequisites if q.get("record")), None)}}
         if not (args.record_label or "").strip():
             args.record_label = collection_label(args.pipeline, args.scan,
                                                  session_label=fetch_session_label(context) if context else "") + "_record"
         manifest["analysis_record"] = publish_if_possible(args, output_dir, report, [], False, context=context,
                                                           facts=record_facts, default_resources=PROC_DEFAULT_RESOURCES)
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
+        if args.pointer_only and (manifest.get("analysis_record") or {}).get("id"):
+            # The record owns the bytes; the output handler gets a one-file pointer resource.
+            for path in sorted(output_dir.rglob("*"), reverse=True):
+                if path.is_file() and path.name != "wrapup.json":
+                    path.unlink()
+                elif path.is_dir() and not any(path.iterdir()):
+                    path.rmdir()
+            logger.info("pointer-only: output reduced to wrapup.json; record %s holds the files", manifest["analysis_record"]["id"])
     finally:
         if context is not None:
             close_session(context)

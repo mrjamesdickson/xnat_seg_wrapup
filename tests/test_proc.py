@@ -67,6 +67,9 @@ class _CS(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_CS.containers).encode(), "application/json")
         elif self.path == "/data/experiments/XNAT_E00018?format=json":
             self._send(200, json.dumps({"items": [{"data_fields": {"label": "SESS01"}}]}).encode(), "application/json")
+        elif self.path == "/data/workflows/5001?format=json":
+            self._send(200, json.dumps({"items": [{"data_fields": {"wrk_workflowData_id": 5001, "status": "Running", "next_step_id": "42",
+                                                                    "current_step_id": "2", "jobid": "job-abc"}}]}).encode(), "application/json")
         elif self.path.startswith("/xapi/containers/900/logs/") and _CS.truncate_logs:
             # a Content-Length the body never reaches: urllib raises http.client.IncompleteRead
             self.send_response(200); self.send_header("Content-Length", "4096"); self.end_headers()
@@ -278,3 +281,40 @@ def test_proc_wrapup_without_contract_or_context_still_keeps_and_reports(cs, tmp
     assert (out / "raw" / "features.csv").exists() and (out / "report.html").exists()
     assert json.loads((out / "wrapup.json").read_text())["analysis_record"] is None
     assert handler.calls == [], "no XNAT context: nothing is requested"
+
+
+def test_proc_wrapup_records_chain_and_prerequisites_and_can_leave_only_a_pointer(cs, tmp_path, monkeypatch):
+    """0.5.0: the record names its orchestration step and the prerequisites record-fetch resolved;
+    --pointer-only leaves wrapup.json alone for the output handler (the record owns the bytes)."""
+    host, handler = cs
+    inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
+    (inp / "prereq.json").write_text(json.dumps({"prerequisites": [
+        {"name": "qsiprep", "kind": "record", "path": "prereq/qsiprep", "files": 2, "role": "DERIVED",
+         "record": {"ID": "XNAT_E12", "label": "qsiprep_S1_record", "pipeline_name": "qsiprep", "review_state": "ACCEPTED"}},
+        {"name": "bids", "kind": "resource", "path": "prereq/bids", "files": 2, "resource": "BIDS"},
+        {"name": "broken", "kind": "record", "error": "no record"}]}))
+    out = tmp_path / "out"
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "qsirecon"})
+    assert proc.main(["--input", str(inp), "--output", str(out), "--pointer-only"]) == 0
+    xml = [c for c in handler.calls if c["method"] == "PUT" and "/assessors/" in c["path"] and "/out/" not in c["path"]][0]["body"].decode()
+    inputs = json.loads(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0].replace("&quot;", '"'))
+    assert inputs["chain"] == {"orchestration_id": "42", "step": 2, "job_id": "job-abc", "workflow_id": "5001"}
+    assert inputs["upstream_record"] == "XNAT_E12"
+    assert [(q["name"], q["record"], q["resource"]) for q in inputs["prerequisites"]] == [("qsiprep", "XNAT_E12", None), ("bids", None, "BIDS")]
+    # the files went to the record, then the output was reduced to the pointer
+    uploads = [c["path"] for c in handler.calls if "/out/resources/" in c["path"]]
+    assert any("METRICS/files/raw/features.csv" in u for u in uploads) and any("DERIVED/files/raw/sub/log.txt" in u for u in uploads)
+    assert sorted(p.name for p in out.rglob("*") if p.is_file()) == ["wrapup.json"]
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["chain"]["orchestration_id"] == "42" and manifest["analysis_record"]["id"] == "XNAT_E77777"
+
+
+def test_proc_wrapup_without_orchestration_records_no_chain(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp = tool_output(tmp_path)
+    out = tmp_path / "out"
+    set_env(monkeypatch, host, {"XNAT_WORKFLOW_ID": "5002"})          # no workflow answer -> not orchestrated
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["chain"] is None and manifest["prerequisites"] == []
+    assert (out / "raw" / "features.csv").exists()                     # no --pointer-only: output kept

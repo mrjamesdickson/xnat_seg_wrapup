@@ -75,7 +75,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.4.1"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.5.0"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -188,8 +188,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.4.1 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.4.1
+docker build -t xnatworks/seg-wrapup:0.5.0 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.5.0
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
@@ -213,6 +213,18 @@ default label is `<pipeline>_<session label>_scan<id>_<UTC stamp>` (since 0.4.1;
 id when its label cannot be read), so two sessions' runs of one pipeline finishing in the same
 second cannot collide; a 409 on create is retried once with a random suffix.
 
+## record-fetch: prerequisites resolved at launch (since 0.5.0)
+
+A setup command (`xnatworks/record-fetch:<version>`, attached to a card's root resource input
+with `via-setup-command`). It reads one `XNW_PREREQ_<NAME>` variable per prerequisite
+(`key=value;…`): `type=`/`pipeline=` pick a generic record on the session (newest SUCCEEDED;
+`accepted=true` requires review; `min=` a version floor; `id=` names one record), `role=` the
+record resource to copy (default `DERIVED`); `resource=LABEL` copies a session resource
+instead. Files land under `prereq/<name>/` beside the passed-through input, `prereq.json`
+says what was chosen, and an unmet prerequisite exits 3 so the Container Service reports
+`Failed (Setup)` and never starts the tool. The same card therefore runs by hand, in an
+orchestration or from an event rule and always finds its own inputs.
+
 ## proc-wrapup: the generic wrapup (since 0.4.0)
 
 For cards that are not segmentations (QC pipelines, diffusion, radiomics, anything). Same
@@ -230,7 +242,7 @@ image lineage, entrypoint `proc-wrapup`, image `xnatworks/proc-wrapup:<version>`
   share: the Container Service resolves the wrapup's `/input` from the parent's output mount,
   and never by workflow-id order, which a concurrent run can break); `--no-publish` leaves this
   capture on and suppresses only the record;
-- writes `report.html` (what ran, how it ended, the files kept, log tails) and `wrapup.json`;
+- writes `report.html` (what ran, how it ended, the files kept, log tails) and `wrapup.json`; records the orchestration (`next_step_id`, step, job id) and the prerequisites record-fetch resolved in the record's `inputs_json`; `--pointer-only` leaves only `wrapup.json` for the output handler so the record is the single owner of the data;
 - publishes the record with the `XNW_*` contract exactly as seg-wrapup does. Default roles:
   `REPORT` report.html, `PROVENANCE` wrapup.json + status.json, `LOGS` logs/*.log, `DERIVED`
   everything else; a card names `METRICS` globs itself (e.g. `XNW_RESOURCE_METRICS=raw/features.csv`).
