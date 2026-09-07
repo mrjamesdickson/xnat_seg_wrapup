@@ -5,6 +5,7 @@ downloads; every request is recorded.
 """
 import json
 import logging
+from html import unescape as html_unescape
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -33,6 +34,7 @@ RECORDS = [
 FILES = {"XNAT_E12": {"DERIVED": ["raw/sub-1/dwi/preproc.nii.gz", "raw/sub-1/qc.json"]},
          "XNAT_E11": {"DERIVED": ["raw/sub-1/dwi/preproc.nii.gz"]}}
 SESSION_RESOURCES = {"BIDS": ["sub-1/anat/sub-1_T1w.nii.gz", "dataset_description.json"]}
+SCANS = {"2": {"type": "T1w", "DICOM": ["1.dcm", "2.dcm"]}, "3": {"type": "BOLD", "DICOM": ["b1.dcm"]}, "4": {"type": "T1w", "DICOM": []}}
 
 
 class _Xnat(BaseHTTPRequestHandler):
@@ -46,6 +48,12 @@ class _Xnat(BaseHTTPRequestHandler):
     def do_POST(self):
         _Xnat.calls.append(("POST", self.path)); self.send_response(200); self.end_headers(); self.wfile.write(b"FAKESESSION")
 
+    def do_PUT(self):
+        n = int(self.headers.get("Content-Length", "0")); body = self.rfile.read(n)
+        _Xnat.calls.append(("PUT", self.path, self.headers.get("Cookie"), body))
+        create = "/assessors/" in self.path and "/out/" not in self.path
+        self.send_response(201 if create else 200); self.end_headers(); self.wfile.write(b"XNAT_E77" if create else b"")
+
     def do_DELETE(self):
         _Xnat.calls.append(("DELETE", self.path)); self.send_response(200); self.end_headers()
 
@@ -54,10 +62,20 @@ class _Xnat(BaseHTTPRequestHandler):
         p = self.path
         if p.startswith("/data/projects/P/experiments?xsiType=analysis:sessionAnalysisData"):
             return self._json({"ResultSet": {"Result": RECORDS}})
+        if p == "/data/experiments/XNAT_E1?format=json":                      # session label for the record label
+            return self._json({"items": [{"data_fields": {"label": "S1"}}]})
+        if "/assessors/" in p:                                               # label probe: free
+            self.send_response(404); self.end_headers(); return
         if "/out/resources/" in p and p.endswith("/files?format=json"):
             rid = p.split("/experiments/")[1].split("/")[0]; role = p.split("/out/resources/")[1].split("/")[0]
             names = FILES.get(rid, {}).get(role, [])
             return self._json({"ResultSet": {"Result": [{"Name": n.rsplit("/", 1)[-1], "URI": f"/data/experiments/{rid}/out/resources/{role}/files/{n}", "Size": 3} for n in names]}})
+        if p == "/data/experiments/XNAT_E1/scans?format=json":
+            return self._json({"ResultSet": {"Result": [{"ID": k, "type": v["type"], "series_description": v["type"]} for k, v in SCANS.items()]}})
+        if "/data/experiments/XNAT_E1/scans/" in p and p.endswith("/files?format=json"):
+            scan = p.split("/scans/")[1].split("/")[0]; label = p.split("/resources/")[1].split("/")[0]
+            names = SCANS.get(scan, {}).get(label, [])
+            return self._json({"ResultSet": {"Result": [{"Name": n, "URI": f"/data/experiments/XNAT_E1/scans/{scan}/resources/{label}/files/{n}", "Size": 3} for n in names]}})
         if "/data/experiments/XNAT_E1/resources/" in p and p.endswith("/files?format=json"):
             label = p.split("/resources/")[1].split("/")[0]; names = SESSION_RESOURCES.get(label, [])
             return self._json({"ResultSet": {"Result": [{"Name": n.rsplit("/", 1)[-1], "URI": f"/data/experiments/XNAT_E1/resources/{label}/files/{n}", "Size": 3} for n in names]}})
@@ -162,3 +180,95 @@ def test_record_fetch_without_specs_or_context(xnat, tmp_path, monkeypatch, capl
     with caplog.at_level(logging.ERROR):
         assert prereq.main(["--input", str(inp), "--output", str(tmp_path / "out2")]) == 2
     assert "XNAT context is incomplete" in caplog.text
+
+
+CONTRACT_ENV = {"XNW_CARD_ID": "fake-recon", "XNW_CARD_REVISION": "0.1.0", "XNW_ANALYSIS_TYPE": "fake-reconstruction",
+                "XNW_CONTAINER_IMAGE": "xnatworks/fake-tool:0.1", "XNW_CONTAINER_DIGEST": "sha256:" + "c" * 64,
+                "XNW_OUTPUT_RESOURCE_LABEL": "XNW_FAKE_RECON", "PROC_PIPELINE_NAME": "fake-recon", "PROC_PIPELINE_VERSION": "0.1.0"}
+
+
+def test_unmet_prerequisite_is_recorded_as_a_failed_record_with_the_reason(xnat, tmp_path, monkeypatch, caplog):
+    """James, 2026-09-07: 'if criteria are missing, it's very ambiguous why' — the CS only says Failed (Setup)."""
+    host, handler = xnat
+    inp = tmp_path / "in"; inp.mkdir(); out = tmp_path / "out"
+    for k, v in CONTRACT_ENV.items(): monkeypatch.setenv(k, v)
+    monkeypatch.setenv("XNW_PREREQ_PREPROC", "type=diffusion-preprocessing;pipeline=qsiprep;accepted=true;min=2.0")
+    monkeypatch.setenv("XNW_PREREQ_BIDS", "resource=BIDS")
+    with caplog.at_level(logging.INFO):
+        assert prereq.main(["--input", str(inp), "--output", str(out)]) == 3
+    m = json.loads((out / "prereq.json").read_text())
+    assert m["analysis_record"]["id"] == "XNAT_E77" and m["analysis_record"]["label"].startswith("fake-recon_S1_")
+    assert m["analysis_record"]["uploaded"] == {"PROVENANCE": ["prereq.json"]}
+    create = next(c for c in handler.calls if c[0] == "PUT" and "/out/" not in c[1])
+    xml = create[3].decode()
+    assert create[1].startswith("/data/experiments/XNAT_E1/assessors/fake-recon_S1_") and create[1].endswith("_record?inbody=true")
+    assert "<analysis:run_status>FAILED</analysis:run_status>" in xml and "<analysis:auto_qc_status>FAIL</analysis:auto_qc_status>" in xml
+    assert "<analysis:pipeline_name>fake-recon</analysis:pipeline_name>" in xml and "<analysis:analysis_type>fake-reconstruction</analysis:analysis_type>" in xml
+    assert "Not run: prerequisite(s) unmet at setup: preproc: no SUCCEEDED record at version &gt;= 2.0" in xml
+    assert "<analysis:wrapup_version>record-fetch " in xml
+    inputs = json.loads(html_unescape(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
+    assert inputs["stage"] == "setup" and [q["name"] for q in inputs["prerequisites"]] == ["bids", "preproc"]
+    assert inputs["prerequisites"][1]["error"].startswith("no SUCCEEDED record")
+    assert "failure recorded as analysis record XNAT_E77" in caplog.text
+    assert handler.calls[-1][:2] == ("DELETE", "/data/JSESSION")
+
+
+def test_unmet_prerequisite_without_a_contract_records_nothing(xnat, tmp_path, monkeypatch, caplog):
+    host, handler = xnat
+    inp = tmp_path / "in"; inp.mkdir(); out = tmp_path / "out"
+    for k in CONTRACT_ENV: monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("XNW_PREREQ_PREPROC", "pipeline=qsiprep;min=2.0")
+    with caplog.at_level(logging.INFO):
+        assert prereq.main(["--input", str(inp), "--output", str(out)]) == 3
+    assert json.loads((out / "prereq.json").read_text())["analysis_record"] is None
+    assert not [c for c in handler.calls if c[0] == "PUT"]
+    assert "not recorded as an analysis record" in caplog.text
+
+
+# ── scan-level prerequisites (dcm2niix needs the scan's DICOM) ────────────────
+
+def test_parse_scan_scope():
+    p = Prerequisite.parse("DICOM", "resource=DICOM;scope=scan")
+    assert (p.is_resource, p.scope, p.scan_type) == (True, "scan", "")
+    assert Prerequisite.parse("T1", "resource=DICOM;scope=scan;scan_type=T1*").scan_type == "T1*"
+    with pytest.raises(ValueError, match="scope=scan needs resource="):
+        Prerequisite.parse("X", "pipeline=qsiprep;scope=scan")
+    with pytest.raises(ValueError, match="scope must be"):
+        Prerequisite.parse("X", "resource=DICOM;scope=subject")
+
+
+def test_scan_scope_on_a_scan_level_run_takes_the_runs_scan(xnat, tmp_path, monkeypatch):
+    host, handler = xnat
+    inp = tmp_path / "in"; inp.mkdir(); out = tmp_path / "out"
+    monkeypatch.setenv("PROC_SCAN_ID", "2")
+    monkeypatch.setenv("XNW_PREREQ_DICOM", "resource=DICOM;scope=scan")
+    assert prereq.main(["--input", str(inp), "--output", str(out)]) == 0
+    assert sorted(f.name for f in (out / "prereq" / "dicom" / "2").iterdir()) == ["1.dcm", "2.dcm"]
+    m = json.loads((out / "prereq.json").read_text())["prerequisites"][0]
+    assert m["kind"] == "scan-resource" and m["scans"] == ["2"] and m["files"] == 2 and m["resource"] == "DICOM"
+    assert not [c for c in handler.calls if c[1].endswith("/scans?format=json")], "no scan listing needed on a scan-level run"
+
+
+def test_scan_scope_on_a_session_level_run_selects_scans_by_type(xnat, tmp_path, monkeypatch, caplog):
+    host, handler = xnat
+    inp = tmp_path / "in"; inp.mkdir(); out = tmp_path / "out"
+    monkeypatch.delenv("PROC_SCAN_ID", raising=False)
+    monkeypatch.setenv("XNW_PREREQ_BOLD", "resource=DICOM;scope=scan;scan_type=BOLD")
+    assert prereq.main(["--input", str(inp), "--output", str(out)]) == 0
+    assert (out / "prereq" / "bold" / "3" / "b1.dcm").read_bytes() == b"data:b1.dcm"
+    assert json.loads((out / "prereq.json").read_text())["prerequisites"][0]["scans"] == ["3"]
+    # T1* matches scans 2 and 4; scan 4 has an empty DICOM resource, which is a reason, not a silent gap
+    monkeypatch.setenv("XNW_PREREQ_BOLD", "resource=DICOM;scope=scan;scan_type=T1*")
+    with caplog.at_level(logging.ERROR):
+        assert prereq.main(["--input", str(inp), "--output", str(tmp_path / "out2")]) == 3
+    assert "prerequisite bold: scan 4: no files in resource DICOM" in caplog.text
+    # no scan of that type at all: named, with what the session does have
+    monkeypatch.setenv("XNW_PREREQ_BOLD", "resource=DICOM;scope=scan;scan_type=DWI")
+    with caplog.at_level(logging.ERROR):
+        assert prereq.main(["--input", str(inp), "--output", str(tmp_path / "out3")]) == 3
+    assert "no scan of type 'DWI' on this session (scan types: ['BOLD', 'T1w'])" in caplog.text
+    # scope=scan with neither a scan-level run nor a type filter is refused before any request
+    monkeypatch.setenv("XNW_PREREQ_BOLD", "resource=DICOM;scope=scan")
+    with caplog.at_level(logging.ERROR):
+        assert prereq.main(["--input", str(inp), "--output", str(tmp_path / "out4")]) == 3
+    assert "scope=scan needs a scan-level run (PROC_SCAN_ID) or scan_type=<glob>" in caplog.text

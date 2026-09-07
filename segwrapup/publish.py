@@ -342,10 +342,17 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     record_id = text.strip() if text.strip().startswith("XNAT_") else label
     record_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(record_id, safe='')}"
     uploaded: dict[str, list[str]] = {}
+    skipped_empty: list[str] = []
     try:
         for role, paths in files.items():
             for path in paths:
                 name = upload_name(path, output_dir)
+                if path.stat().st_size == 0:
+                    # XNAT answers an in-body PUT with an empty body with HTTP 500 ("request entity
+                    # size is 0"); a tool that wrote nothing to stderr must not cost the record.
+                    logger.warning("%s is empty; not uploaded to %s (XNAT refuses zero-byte in-body files)", name, role)
+                    skipped_empty.append(name)
+                    continue
                 content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
                 url = (f"{record_url}/out/resources/{role}/files/{urllib.parse.quote(name, safe='/')}"
                        f"?inbody=true&format={urllib.parse.quote(upload_format(path), safe='')}")
@@ -364,7 +371,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     logger.info("analysis record %s published as %s with %d file(s)", label, record_id,
                 sum(len(v) for v in uploaded.values()))
     return {"xsi_type": XSI_TYPE, "id": record_id, "label": label, "status": status,
-            "uploaded": uploaded, "url": create_url.split("?")[0]}
+            "uploaded": uploaded, "skipped_empty": skipped_empty, "url": create_url.split("?")[0]}
 
 
 def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict],

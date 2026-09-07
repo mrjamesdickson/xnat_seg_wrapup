@@ -225,6 +225,19 @@ says what was chosen, and an unmet prerequisite exits 3 so the Container Service
 `Failed (Setup)` and never starts the tool. The same card therefore runs by hand, in an
 orchestration or from an event rule and always finds its own inputs.
 
+`resource=LABEL;scope=scan` takes the resource from a **scan** instead (dcm2niix needs the
+scan's `DICOM`): on a scan-level run the run's scan (`PROC_SCAN_ID`); on a session-level run
+`scan_type=<glob>` selects the scans (`T1*`, `BOLD`), each landing under `prereq/<name>/<scan>/`.
+A scan with an empty resource, or no scan of the type, is an unmet prerequisite with that reason.
+
+An unmet prerequisite is also **recorded**: when the card's `XNW_*` contract is in the
+environment (it is, the setup command inherits the card's variables), record-fetch publishes a
+`analysis:sessionAnalysisData` record with `run_status FAILED`, auto QC `FAIL`, the reason in
+`notes` (`Not run: prerequisite(s) unmet at setup: preproc: no fake-preprocessing/fake-preproc
+record on this session`), the full resolution in `inputs_json` and `prereq.json` under
+`PROVENANCE`. The Container Service alone only says `Failed (Setup)`; the record says why, on the
+session, where the reviewer looks. A FAILED record never satisfies a prerequisite.
+
 ## proc-wrapup: the generic wrapup (since 0.4.0)
 
 For cards that are not segmentations (QC pipelines, diffusion, radiomics, anything). Same

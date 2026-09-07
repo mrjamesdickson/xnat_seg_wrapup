@@ -247,6 +247,23 @@ def test_publish_creates_record_then_uploads_files_to_its_out_resources(xnat, tm
     assert all(c["cookie"] == "JSESSIONID=FAKESESSION1234" for c in calls)     # every working request on the one session
     assert outcome["uploaded"] == {"METRICS": ["volumes.json"], "REPORT": ["report.html"],
                                    "DERIVED": ["segmentation.nii.gz", "sub/part.tsv"]}
+    assert outcome["skipped_empty"] == []
+
+
+def test_publish_skips_empty_files_instead_of_losing_the_record(xnat, tmp_path, caplog):
+    """demo02 2026-09-07: a tool that wrote nothing to stderr produced a 0-byte logs/stderr.log; XNAT
+    answered the in-body PUT with HTTP 500 and the whole record was rolled back."""
+    host, handler = xnat
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "stdout.log").write_text("ran")
+    (tmp_path / "logs" / "stderr.log").write_bytes(b"")
+    files = {"LOGS": [tmp_path / "logs" / "stdout.log", tmp_path / "logs" / "stderr.log"]}
+    outcome = publish_record(_context(host), "fake_X", "<xml/>", files, output_dir=tmp_path)
+    assert outcome["id"] == "XNAT_E99999" and outcome["uploaded"] == {"LOGS": ["logs/stdout.log"]}
+    assert outcome["skipped_empty"] == ["logs/stderr.log"]
+    assert not [c for c in handler.calls if c["method"] == "DELETE"], "no rollback"
+    assert not [c for c in handler.calls if "stderr.log" in c["path"]], "the empty file is never sent"
+    assert "logs/stderr.log is empty; not uploaded to LOGS" in caplog.text
 
 
 def test_publish_refuses_a_label_that_already_exists(xnat, tmp_path):
