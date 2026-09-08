@@ -150,6 +150,22 @@ def test_copy_raw_output_keeps_the_tree_and_skips_hidden_and_skipped(tmp_path):
     assert not (out / "raw" / ".source_dicom").exists() and not (out / "raw" / "sub").exists()
 
 
+def test_copy_raw_output_keeps_the_tools_dotfiles_and_skips_only_the_dicom_copy(tmp_path):
+    """qsirecon, qsiprep and fmriprep write .bidsignore; heudiconv leaves .heudiconv/ in a raw
+    dataset. 0.6.0 skipped every dot-prefixed entry, so none of them reached raw/ or the record.
+    The only entry that is not the tool's is the DICOM copy the card put at .source_dicom."""
+    inp = tool_output(tmp_path)
+    (inp / ".bidsignore").write_text("*.html\n")
+    (inp / ".heudiconv" / "sub-1").mkdir(parents=True)
+    (inp / ".heudiconv" / "sub-1" / "info.json").write_text("{}")
+    (inp / "sub" / ".state").write_text("done")
+    out = tmp_path / "out"; out.mkdir()
+    copied = copy_raw_output(inp, out)
+    assert copied == ["raw/.bidsignore", "raw/.heudiconv/sub-1/info.json", "raw/features.csv", "raw/sub/.state", "raw/sub/log.txt"]
+    assert (out / "raw" / ".bidsignore").read_text() == "*.html\n"
+    assert not (out / "raw" / ".source_dicom").exists()
+
+
 def test_status_and_run_status(tmp_path):
     assert read_status(tmp_path) is None and run_status_from(None) == "SUCCEEDED"
     (tmp_path / "status.json").write_text('{"exit_code": 1, "workflow_id": "5000"}')
@@ -406,6 +422,26 @@ def test_a_status_json_and_prereq_json_in_the_tool_output_are_provenance_not_par
     assert sorted(u for u in uploads if u.startswith("DERIVED/")) == ["DERIVED/files/features.csv", "DERIVED/files/sub/log.txt"]
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["prerequisites"][0]["record"]["ID"] == "XNAT_E5"                          # still read for the record's inputs
+
+
+def test_proc_wrapup_publishes_the_datasets_dotfiles_in_derived_and_never_the_dicom_copy(cs, tmp_path, monkeypatch):
+    """The QSIRECON shape (demo02 XNAT_E09349 carries a .bidsignore): a dotfile at the dataset root and
+    one in a subdirectory land in DERIVED at their paths; the card's .source_dicom is uploaded nowhere."""
+    host, handler = cs
+    inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
+    (inp / ".bidsignore").write_text("*.html\n")
+    (inp / "sub" / ".state").write_text("done")
+    out = tmp_path / "out"
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "qsirecon"})
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    uploads = sorted(c["path"].split("/out/resources/")[1].split("?")[0] for c in handler.calls if "/out/resources/" in c["path"])
+    assert [u for u in uploads if u.startswith("DERIVED/")] == [
+        "DERIVED/files/.bidsignore", "DERIVED/files/features.csv", "DERIVED/files/sub/.state", "DERIVED/files/sub/log.txt"]
+    assert not [c["path"] for c in handler.calls if ".source_dicom" in c["path"]]
+    assert not (out / "raw" / ".source_dicom").exists()
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert "raw/.bidsignore" in manifest["raw_files"] and "raw/sub/.state" in manifest["raw_files"]
+    assert "PROVENANCE/files/status.json" in uploads and "DERIVED/files/status.json" not in uploads
 
 
 def test_proc_wrapup_publishes_a_bids_derivatives_dataset_at_the_derived_root_with_views_and_links_the_tool_report(cs, tmp_path, monkeypatch, caplog):

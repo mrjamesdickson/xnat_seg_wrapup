@@ -99,7 +99,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.6.0"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.6.1"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -212,8 +212,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.6.0 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.6.0
+docker build -t xnatworks/seg-wrapup:0.6.1 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.6.1
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
@@ -293,8 +293,9 @@ For cards that are not segmentations (QC pipelines, diffusion, radiomics, anythi
 image lineage, entrypoint `proc-wrapup`, image `xnatworks/proc-wrapup:<version>`
 (`Dockerfile.proc`). It interprets nothing:
 
-- copies everything the tool wrote to `/output/raw/` (hidden entries such as `.source_dicom`
-  excluded) and publishes that tree as the record's `DERIVED` **at the resource root**, no
+- copies everything the tool wrote to `/output/raw/`, dotfiles included (`.bidsignore`,
+  `.heudiconv/` are part of a dataset; only the DICOM copy at `.source_dicom`, which XNAT
+  already holds, is left out) and publishes that tree as the record's `DERIVED` **at the resource root**, no
   `raw/` segment: the scientists' derivatives dataset, byte-for-byte and path-for-path. The
   local `raw/` only keeps the tool's files apart from the wrapup's own in `/output` (a tool that
   writes its own `report.html` or `logs/` must not collide with the wrapup's);

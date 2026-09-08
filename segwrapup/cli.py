@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
+from .execution import SOURCE_DICOM_DIRNAME, copy_raw_output
 from .labels import (bids_dseg_tsv, collect_labels, discover_labels, itksnap_label_file, load_labels,
                      sidecar_labels, slicer_color_table)
 from .report import render_html
@@ -27,7 +28,7 @@ from .volumes import (find_masks, looks_like_binary_set, measure_mask, merge_bin
 
 logger = logging.getLogger("seg-wrapup")
 
-DEFAULT_SOURCE_DIRNAME = ".source_dicom"
+DEFAULT_SOURCE_DIRNAME = SOURCE_DICOM_DIRNAME
 MERGED_MASK_NAME = "segmentation.nii.gz"
 
 
@@ -158,7 +159,6 @@ def run(args: argparse.Namespace) -> int:
 
     # Everything else the tool wrote (statistics, labels, logs) is kept verbatim under raw/
     # (plan D10): the masks are already at the top level, the DICOM copy is already in XNAT.
-    from .execution import copy_raw_output
     manifest_raw = copy_raw_output(input_dir, output_dir, skip=tuple(masks) + (source_dicom,))
 
     results = []

@@ -41,6 +41,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from . import __version__
+from .execution import is_reserved
 from .register import LABEL_MAX, XnatContext, auth_headers, collection_label, fetch_session_label
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,9 @@ DEFAULT_RESOURCES: dict[str, list[str]] = {
 #: The role for the data output itself (design §6; plan D16: the derivatives dataset). It holds
 #: every file of the tool's output tree, unchanged, at the resource root; a wrapup that keeps the
 #: tree in a subdirectory of its output (proc-wrapup: ``raw/``) names it as ``derived_root`` and
-#: the prefix is dropped on the record. Dotfiles and dot-directories are never uploaded.
+#: the prefix is dropped on the record. The tree goes whole, dotfiles included (``.bidsignore``,
+#: ``.heudiconv/``); the one entry left out is the DICOM copy the card reserved at the root
+#: (``.source_dicom``, :data:`segwrapup.execution.RESERVED_ROOT_NAMES`), which XNAT already holds.
 DERIVED_ROLE = "DERIVED"
 
 #: The only roles that are XNAT resources on the record. ``DERIVED`` is the tool's tree; the
@@ -167,8 +170,9 @@ class RecordContract:
         )
 
 
-def _is_hidden(path: Path, root: Path) -> bool:
-    return any(part.startswith(".") for part in path.relative_to(root).parts)
+def _reserved(path: Path, root: Path) -> bool:
+    """A reserved root entry of ``root`` (the DICOM copy), or inside one: never on the record."""
+    return is_reserved(path.relative_to(root))
 
 
 def _valid_role(role: str) -> str:
@@ -190,10 +194,11 @@ def _declare(resources: dict[str, list[str]], ignored: list[str], role: str, pat
 
 
 def _tree(root: Path) -> list[Path]:
-    """Every non-hidden file under ``root``, sorted, or nothing when the directory is absent."""
+    """Every file under ``root`` (dotfiles included, reserved root entries excluded), sorted, or
+    nothing when the directory is absent."""
     if not root.is_dir():
         return []
-    return [p for p in sorted(root.rglob("*")) if p.is_file() and not _is_hidden(p, root)]
+    return [p for p in sorted(root.rglob("*")) if p.is_file() and not _reserved(p, root)]
 
 
 def collect_files(output_dir: Path, contract: RecordContract, derived_root: str | None = None) -> dict[str, list[RecordFile]]:
@@ -204,9 +209,11 @@ def collect_files(output_dir: Path, contract: RecordContract, derived_root: str 
     with ``derived_root`` (proc-wrapup keeps it under ``raw/``) every file under that directory,
     named relative to it, so the dataset sits at the resource root exactly as the tool wrote it;
     without one, every file the artefact roles did not claim (seg-wrapup's masks, sidecars and
-    measurements at the top level plus the tool's ``raw/`` tree). Hidden entries are never
-    uploaded. A file that is neither an artefact nor part of the tree (only possible with
-    ``derived_root``) is left off the record with a warning: the dataset is not a place for it.
+    measurements at the top level plus the tool's ``raw/`` tree). Dotfiles are files like any
+    other; only the reserved root entry ``.source_dicom`` (the DICOM copy XNAT already holds) is
+    never uploaded, at the output root or at the tree root. A file that is neither an artefact
+    nor part of the tree (only possible with ``derived_root``) is left off the record with a
+    warning: the dataset is not a place for it.
     """
     found: dict[str, list[RecordFile]] = {}
     claimed: set[Path] = set()
@@ -217,7 +224,7 @@ def collect_files(output_dir: Path, contract: RecordContract, derived_root: str 
         files: list[RecordFile] = []
         for pattern in patterns:
             for path in sorted(output_dir.glob(pattern)):
-                if not path.is_file() or path in claimed or _is_hidden(path, output_dir):
+                if not path.is_file() or path in claimed or _reserved(path, output_dir):
                     continue
                 if tree_root is not None and tree_root in path.parents:
                     continue        # a wrapup artefact glob never reaches into the tool's tree
@@ -262,10 +269,10 @@ def collect_views(output_dir: Path, contract: RecordContract, derived: list[Reco
                                role, pattern, derived_root)
                 pattern = pattern[len(derived_root) + 1:]
             for path in sorted(root.glob(pattern)):
-                if not path.is_file() or _is_hidden(path, root):
+                if not path.is_file():
                     continue
                 name = path.relative_to(root).as_posix()
-                if name in on_record and name not in names:
+                if name in on_record and name not in names:      # on_record already leaves out the reserved entries
                     names.append(name)
         if not names:
             logger.warning("view %s matched no file on DERIVED (globs: %s)", role, ", ".join(patterns))
