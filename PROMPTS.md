@@ -18,3 +18,13 @@
   tool's whole tree at the resource root, four fixed resources, METRICS a view (role → DERIVED
   paths in wrapup.json/results_json), record-fetch resolves views, pointer-only drops the
   empty files it skipped. Design: `docs/ROLES-AS-VIEWS.md`.
+
+## 2026-09-08 — xnat_seg_wrapup (0.6.1)
+
+- Fix a fidelity gap in 0.6.0 against D20 ("DERIVED is the scientists' derivatives dataset
+  byte-for-byte, path-for-path"): `_tree()`/`_is_hidden()` and `copy_raw_output` skipped every
+  dot-prefixed entry, so a dataset's `.bidsignore` (the reference QSIRECON on demo02
+  XNAT_E09349 has one) and `.heudiconv/` never reached DERIVED. Keep the `.source_dicom`
+  exclusion by name, enumerate the wrapup's own names, no dot-prefix rule inside the tool tree.
+  TDD, bump to 0.6.1, one PR, Codex loop. Result: `fix/derived-keeps-dotfiles`,
+  `RESERVED_ROOT_NAMES` in `segwrapup/execution.py`.

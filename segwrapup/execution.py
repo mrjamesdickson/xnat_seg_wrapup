@@ -5,8 +5,10 @@ wrote (not just what a wrapup recognises), *how the run ended*, and *what it sai
 way. This module gathers them for any card:
 
 - ``copy_raw_output``: the parent's whole ``/input`` tree into ``/output/raw/``, so the scan
-  resource and the record's ``DERIVED`` carry it. Hidden entries are skipped: ``.source_dicom``
-  is the DICOM XNAT already holds.
+  resource and the record's ``DERIVED`` carry it. The one entry left out is the DICOM copy the
+  card put at ``.source_dicom`` (XNAT already holds it); the tool's own dotfiles (``.bidsignore``,
+  ``.heudiconv/``) are part of the dataset and are kept (0.6.1; until 0.6.0 every dot-prefixed
+  entry was dropped).
 - ``read_status``: the parent's ``status.json`` when its command line trapped a failure
   (the Container Service never runs a wrapup after a non-zero exit, so a card that wants a
   record on failure writes this file and exits 0).
@@ -36,11 +38,30 @@ RAW_DIRNAME = "raw"
 LOGS_DIRNAME = "logs"
 STATUS_FILENAME = "status.json"
 
+#: Where a parent command leaves the source DICOM for the wrapup (``/output/.source_dicom`` in
+#: the parent, so ``/input/.source_dicom`` here). The wrapup consumes it for the DICOM SEG; it
+#: is never copied on or uploaded, because XNAT already holds that series.
+SOURCE_DICOM_DIRNAME = ".source_dicom"
+
+#: Root entries of a tool's output tree that are the wrapup contract's, not the tool's, and never
+#: join the dataset. Matched by exact name as the first path component under the tree root and
+#: nowhere else: plan D20 makes DERIVED the scientists' dataset byte-for-byte and path-for-path,
+#: so the wrapup enumerates what it reserves instead of judging the tree (a dot-prefix rule
+#: dropped ``.bidsignore`` and ``.heudiconv/`` until 0.6.0). ``status.json`` and ``prereq.json``
+#: are the card's too but are lifted into PROVENANCE by proc-wrapup, not skipped here.
+RESERVED_ROOT_NAMES = frozenset({SOURCE_DICOM_DIRNAME})
+
+
+def is_reserved(relative: Path) -> bool:
+    """True when ``relative`` (a path under a tree root) is, or is inside, a reserved root entry."""
+    return bool(relative.parts) and relative.parts[0] in RESERVED_ROOT_NAMES
+
 
 def copy_raw_output(input_dir: Path, output_dir: Path, skip: tuple[Path, ...] = ()) -> list[str]:
-    """Copy every non-hidden file under ``input_dir`` to ``output_dir/raw/`` keeping the tree.
+    """Copy every file under ``input_dir`` to ``output_dir/raw/`` keeping the tree, dotfiles included.
 
-    ``skip`` names files or directories not to copy (a wrapup that already placed the masks at
+    Left out: the reserved root entries (:data:`RESERVED_ROOT_NAMES`, the DICOM copy) and
+    ``skip``, files or directories the caller names (a wrapup that already placed the masks at
     the top level passes them here so nothing is uploaded twice). Returns the relative paths.
     """
     skipped = tuple(p.resolve() for p in skip)
@@ -48,7 +69,7 @@ def copy_raw_output(input_dir: Path, output_dir: Path, skip: tuple[Path, ...] = 
     raw_root = output_dir / RAW_DIRNAME
     for path in sorted(input_dir.rglob("*")):
         rel = path.relative_to(input_dir)
-        if any(part.startswith(".") for part in rel.parts) or not path.is_file():
+        if is_reserved(rel) or not path.is_file():
             continue
         resolved = path.resolve()
         if any(resolved == s or s in resolved.parents for s in skipped):

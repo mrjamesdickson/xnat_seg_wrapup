@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.1 (2026-09-08)
+
+Fidelity fix for D20 ("DERIVED is the scientists' dataset byte-for-byte, path-for-path"): the dataset's own dotfiles were being dropped.
+
+- **The tool's dotfiles stay in the dataset.** 0.6.0 skipped every dot-prefixed entry at any depth, in `copy_raw_output` and in the publisher's tree walk, so `.bidsignore` (written by qsirecon, qsiprep and fmriprep; the reference QSIRECON on demo02, XNAT_E09349, has one), a raw dataset's `.heudiconv/` and any dot-prefixed state file inside a subject directory never reached `raw/` or `DERIVED`. Now only the entries the wrapup contract reserves by name are left out: `.source_dicom` (the DICOM copy the card places for the wrapup, which XNAT already holds), matched as a root entry of the tree being copied or published, plus whatever a wrapup passes explicitly as `skip` (seg-wrapup: the delivered masks and `--source-dicom`). `segwrapup.execution.RESERVED_ROOT_NAMES` is the list. A view glob (`**/*.tsv`) can name a dotfile like any other DERIVED file. Applies to seg-wrapup (under its `raw/` prefix) and proc-wrapup alike; `status.json`/`prereq.json` handling is unchanged.
+- 179 tests (5 new, 1 rewritten: a dot entry at the output root is now on DERIVED, none removed).
+
+Cards re-pin to 0.6.1; nothing else changes for them.
+
 ## 0.6.0 (2026-09-08)
 
 Roles are views onto the output tree, not a partition of it (plan D20; James, on the mriqc/fmriprep records: "raw/sub-H025.html should be in with everything else", "DERIVED should contain the entire output of the container", "we have a predefined dataset that's created by the scientists. Don't fuck it up."). Behaviour change; cards re-pin. Design and rejected alternatives in `docs/ROLES-AS-VIEWS.md`.

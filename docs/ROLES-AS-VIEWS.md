@@ -36,8 +36,11 @@ dataset. A dataset with pieces moved out and a `raw/` wrapper is not that.
 ## The rule
 
 1. **`DERIVED` is the tool's complete output tree at the resource root**: byte-for-byte,
-   path-for-path, nothing renamed, moved, filtered or reformatted. Hidden entries are the one
-   exclusion (`.source_dicom` is the DICOM XNAT already holds; documented since 0.1).
+   path-for-path, nothing renamed, moved, filtered or reformatted, dotfiles included. The one
+   exclusion is a root entry the wrapup contract reserves by name: `.source_dicom`, the DICOM
+   copy the card put there for the wrapup, which XNAT already holds (documented since 0.1).
+   The reserved names are enumerated in `segwrapup.execution.RESERVED_ROOT_NAMES` and matched
+   as the first path component only; nothing is filtered by shape (0.6.1, see below).
 2. **The record has four resources and only four.** `REPORT`, `PROVENANCE` and `LOGS` hold what
    the wrapup itself generated; a tool file is never copied into them and a wrapup file never
    lands in `DERIVED`. A card's `XNW_RESOURCE_<fixed role>` is ignored, logged and listed in
@@ -54,6 +57,28 @@ dataset. A dataset with pieces moved out and a `raw/` wrapper is not that.
    record's `PROVENANCE/wrapup.json`, copying exactly the DERIVED files the view names at their
    DERIVED paths. A record with no `views` (published before 0.6.0) serves its resource of that
    name as before.
+
+## 0.6.1: the dataset's dotfiles are the dataset's
+
+0.6.0 implemented the `.source_dicom` exclusion as "skip every dot-prefixed entry, at any
+depth", in `copy_raw_output` and in the publisher's tree walk. That rule also dropped files
+the tool wrote: `.bidsignore` (qsirecon, qsiprep and fmriprep write one; the reference
+QSIRECON on demo02, XNAT_E09349, carries it), heudiconv's `.heudiconv/` in a raw dataset, any
+`.something` state file inside a subject directory. A DERIVED without its `.bidsignore` is not
+the dataset byte-for-byte, and a BIDS validator run on a fetched prerequisite would behave
+differently from one run on the tool's own output.
+
+The rule is now the enumerated one above: `RESERVED_ROOT_NAMES` (`.source_dicom`), matched
+as the first path component under the tree root (the wrapup's `/input` when copying, the
+DERIVED root and the output root when publishing), and `skip`, the explicit paths a wrapup
+passes (seg-wrapup: the masks it delivered at the top level and `--source-dicom` wherever it
+points). A dot-prefixed entry anywhere else is copied and uploaded at its path, and a view
+glob can name it. `.DS_Store` from a local run on a Mac is uploaded too: the wrapup does not
+judge what is in the tree, that is the principle, and a Container Service run never has one.
+
+Rejected: keeping the dot rule for the wrapup's own output root (seg-wrapup's `/output`,
+where the tool tree sits under `raw/`) and lifting it only inside the tree. Two rules for one
+question, and nothing dot-prefixed at that root is the wrapup's anyway.
 
 ## Where the tree lives locally, and why the record differs
 

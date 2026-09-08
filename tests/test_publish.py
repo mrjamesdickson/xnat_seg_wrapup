@@ -164,17 +164,17 @@ def test_collect_files_wrapup_artefacts_by_role_then_everything_else_is_derived_
     (tmp_path / "meshes").mkdir()
     (tmp_path / "meshes" / "liver.stl").write_text("x")
     (tmp_path / ".source_dicom").mkdir()
-    (tmp_path / ".source_dicom" / "1.dcm").write_text("x")     # hidden: never uploaded
-    (tmp_path / ".DS_Store").write_text("x")
+    (tmp_path / ".source_dicom" / "1.dcm").write_text("x")     # the DICOM copy XNAT already holds: never uploaded
+    (tmp_path / ".DS_Store").write_text("x")                    # any other dot entry is output, not the wrapup's to judge (0.6.1)
     files = collect_files(tmp_path, RecordContract())
     assert _names(files) == {
         "REPORT": ["report.html"], "PROVENANCE": ["wrapup.json"],
-        DERIVED_ROLE: ["meshes/liver.stl", "segmentation.nii.gz", "segmentation_uint8.nii.gz", "volumes.json"]}
+        DERIVED_ROLE: [".DS_Store", "meshes/liver.stl", "segmentation.nii.gz", "segmentation_uint8.nii.gz", "volumes.json"]}
     assert "METRICS" not in files                                     # not a resource any more
     assert collect_views(tmp_path, RecordContract(), files[DERIVED_ROLE]) == {"METRICS": ["volumes.json"]}
     # the whole output is on the record, each file in exactly one resource
     every = [f.path for items in files.values() for f in items]
-    assert len(every) == len(set(every)) == 6
+    assert len(every) == len(set(every)) == 7
 
 
 def test_collect_files_a_derived_override_is_ignored_the_tree_is_always_whole(tmp_path, caplog):
@@ -257,6 +257,46 @@ def test_a_tool_html_report_with_sibling_figures_stays_in_derived_and_is_not_cop
     assert {"sub-H025.html", "sub-H025/figures/a.svg"} <= set(_names(files)[DERIVED_ROLE])
     uploads = [(role, f.name) for role, items in files.items() for f in items]
     assert uploads.count(("REPORT", "sub-H025.html")) == 0 and len([u for u in uploads if u[1] == "sub-H025.html"]) == 1
+
+
+def test_collect_files_keeps_the_datasets_dotfiles_and_skips_only_the_dicom_copy(tmp_path):
+    """0.6.0 dropped every dot-prefixed entry from DERIVED, so a dataset's own dotfiles never reached
+    the record: qsirecon's .bidsignore (the reference QSIRECON on demo02, XNAT_E09349, carries one;
+    qsiprep and fmriprep write it too), heudiconv's .heudiconv/ directory. D20: DERIVED is the
+    scientists' dataset byte-for-byte and path-for-path; the wrapup leaves out the one entry it
+    reserves by name (the DICOM copy XNAT already holds) and nothing else."""
+    tree = _tool_tree(tmp_path)
+    (tree / ".bidsignore").write_text("*.html\n")
+    (tree / ".heudiconv" / "sub-H025" / "info").mkdir(parents=True)
+    (tree / ".heudiconv" / "sub-H025" / "info" / "dicominfo.tsv").write_text("series\n")
+    (tree / "sub-H025" / ".qsirecon_state").write_text("done")
+    (tree / ".source_dicom").mkdir()
+    (tree / ".source_dicom" / "1.dcm").write_text("x")          # the card's DICOM copy at the tree root
+    (tmp_path / ".source_dicom").mkdir()
+    (tmp_path / ".source_dicom" / "1.dcm").write_text("x")      # ... or at the wrapup's output root
+    contract = RecordContract.from_env({"XNW_CARD_ID": "qsirecon", "XNW_RESOURCE_METRICS": "**/*.tsv"}, defaults=PROC_DEFAULTS)
+    files = collect_files(tmp_path, contract, derived_root="raw")
+    derived = _names(files)[DERIVED_ROLE]
+    assert derived[:2] == [".bidsignore", ".heudiconv/sub-H025/info/dicominfo.tsv"] and "sub-H025/.qsirecon_state" in derived
+    assert not [name for items in _names(files).values() for name in items if ".source_dicom" in name]
+    assert (tmp_path / ".source_dicom" / "1.dcm").exists() and (tree / ".source_dicom" / "1.dcm").exists()   # left alone, just not uploaded
+    # a view glob reaches a dotfile like any other DERIVED file
+    assert collect_views(tmp_path, contract, files[DERIVED_ROLE], derived_root="raw") == {
+        "METRICS": [".heudiconv/sub-H025/info/dicominfo.tsv", "sub-H025/anat/sub-H025_desc-conf_timeseries.tsv"]}
+
+
+def test_collect_files_without_a_derived_root_keeps_the_tools_dotfiles_under_raw(tmp_path):
+    """seg-wrapup's shape: the tool's tree sits under raw/ in the wrapup's own output and keeps that
+    prefix on the record (docs/ROLES-AS-VIEWS.md); its dotfiles come along, the DICOM copy does not."""
+    (tmp_path / "segmentation.nii.gz").write_text("x")
+    (tmp_path / "raw" / "stats").mkdir(parents=True)
+    (tmp_path / "raw" / ".bidsignore").write_text("*.html\n")
+    (tmp_path / "raw" / "stats" / ".cache").write_text("k")
+    (tmp_path / "raw" / "stats" / "statistics.json").write_text("{}")
+    (tmp_path / ".source_dicom").mkdir()
+    (tmp_path / ".source_dicom" / "1.dcm").write_text("x")
+    files = collect_files(tmp_path, RecordContract())
+    assert _names(files) == {DERIVED_ROLE: ["raw/.bidsignore", "raw/stats/.cache", "raw/stats/statistics.json", "segmentation.nii.gz"]}
 
 
 def test_a_legacy_raw_prefixed_view_glob_is_rebased_onto_the_derived_root_with_a_warning(tmp_path, caplog):
@@ -541,11 +581,14 @@ def test_publish_raises_with_http_detail(xnat, tmp_path):
 
 # ── CLI end to end ─────────────────────────────────────────────────────────────
 
-def _run_with_masks(tmp_path, monkeypatch, env, *extra):
+def _run_with_masks(tmp_path, monkeypatch, env, *extra, tool_files=None):
     inp, out = tmp_path / "in", tmp_path / "out"
     inp.mkdir()
     write_ct_series(inp / ".source_dicom")
     write_mask(inp / "segmentation.nii.gz", blob_mask(), affine=series_ras_affine())
+    for name, text in (tool_files or {}).items():           # anything else the tool wrote beside the masks
+        (inp / name).parent.mkdir(parents=True, exist_ok=True)
+        (inp / name).write_text(text)
     for key in list(CONTEXT_ENV) + ["XNW_CONTRACT", "SEG_NO_REGISTER", "SEG_NO_PUBLISH"] + list(RecordContract.DISCRETE_KEYS):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
@@ -574,6 +617,23 @@ def test_cli_publishes_record_when_contract_and_context_present(xnat, tmp_path, 
     assert create["path"].endswith(f"/assessors/{record['label']}?inbody=true")
     assert b"<analysis:pipeline_name>DeepWMH</analysis:pipeline_name>" in create["body"]
     assert b"<analysis:card_id>deepwmh</analysis:card_id>" in create["body"]
+
+
+def test_cli_keeps_the_tools_dotfiles_under_raw_and_never_uploads_the_dicom_copy(xnat, tmp_path, monkeypatch):
+    """seg-wrapup path: the tool's tree keeps its raw/ prefix on a segmentation record and since 0.6.1
+    its dotfiles travel with it; the parent's .source_dicom is consumed by the DICOM SEG step and
+    never copied to the output or uploaded (README, D10: "minus the DICOM copy")."""
+    host, handler = xnat
+    env = {**CONTEXT_ENV, "XNAT_HOST": host, "XNW_CONTRACT": json.dumps(CONTRACT)}
+    code, manifest, out = _run_with_masks(tmp_path, monkeypatch, env,
+                                          tool_files={".bidsignore": "*.html\n", "stats/.cache": "k", "stats/statistics.json": "{}"})
+    assert code == 0
+    uploaded = manifest["analysis_record"]["uploaded"]
+    assert {"raw/.bidsignore", "raw/stats/.cache", "raw/stats/statistics.json", "segmentation.nii.gz"} <= set(uploaded["DERIVED"])
+    assert not [name for names in uploaded.values() for name in names if ".source_dicom" in name]
+    assert not [c["path"] for c in handler.calls if ".source_dicom" in c["path"]]
+    assert not (out / ".source_dicom").exists() and not (out / "raw" / ".source_dicom").exists()
+    assert (out / "raw" / ".bidsignore").read_text() == "*.html\n"
 
 
 def test_cli_record_shares_the_roi_collection_label(xnat, tmp_path, monkeypatch):
