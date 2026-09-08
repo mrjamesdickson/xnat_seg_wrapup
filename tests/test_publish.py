@@ -13,9 +13,11 @@ import numpy as np
 import pytest
 
 from segwrapup import __version__, cli
+from html import unescape as html_unescape
+
 from segwrapup.publish import (
-    DEFAULT_RESOURCES, DERIVED_ROLE, XSI_TYPE, RecordContract, build_record_xml, collect_files, publish_record,
-    upload_format,
+    DEFAULT_RESOURCES, DERIVED_ROLE, XSI_TYPE, RecordContract, build_record_xml, collect_files, collect_views,
+    publish_record, upload_format,
 )
 from segwrapup.register import XnatContext
 from tests.conftest import blob_mask, series_ras_affine, write_ct_series, write_mask
@@ -111,24 +113,28 @@ def test_contract_absent_means_no_record(caplog):
     assert "no XNW_CONTRACT" in caplog.text
 
 
-def test_contract_parses_fields_and_resource_overrides():
+def test_contract_parses_fields_and_resource_overrides(caplog):
     env = {"XNW_CONTRACT": json.dumps({**CONTRACT, "resources": {"metrics": ["*.json"], "LOGS": ["*.log"]}})}
-    contract = RecordContract.from_env(env)
+    with caplog.at_level(logging.WARNING):
+        contract = RecordContract.from_env(env)
     assert contract.card_id == "deepwmh" and contract.container_digest.startswith("sha256:")
-    assert contract.resources["METRICS"] == ["*.json"]          # override, upper-cased role
-    assert contract.resources["LOGS"] == ["*.log"]              # new role
+    assert contract.resources["METRICS"] == ["*.json"]          # a view role: override taken, upper-cased
+    assert "LOGS" not in contract.resources                     # a fixed resource: the wrapup decides, the card's globs are ignored
+    assert contract.ignored_overrides == ("LOGS=*.log",) and "LOGS is a fixed resource" in caplog.text
     assert contract.resources["REPORT"] == ["report.html"]      # default kept
 
 
-def test_contract_from_discrete_variables_the_container_service_can_store():
+def test_contract_from_discrete_variables_the_container_service_can_store(caplog):
     # CS caps each environment value at 255 chars, so the installer sets XNW_* variables.
     env = {"XNW_CARD_ID": "deepwmh", "XNW_CARD_REVISION": "1.1.0", "XNW_CONTAINER_DIGEST": "sha256:" + "b" * 64,
-           "XNW_OUTPUT_RESOURCE_LABEL": "DEEPWMH", "XNW_RESOURCE_LOGS": "run.log, stderr.txt"}
-    contract = RecordContract.from_env(env)
+           "XNW_OUTPUT_RESOURCE_LABEL": "DEEPWMH", "XNW_RESOURCE_LOGS": "run.log, stderr.txt", "XNW_RESOURCE_QC": "raw/*_qc.tsv"}
+    with caplog.at_level(logging.WARNING):
+        contract = RecordContract.from_env(env)
     assert contract.card_id == "deepwmh" and contract.card_revision == "1.1.0"
     assert contract.container_digest.endswith("b" * 64) and contract.output_resource_label == "DEEPWMH"
     assert contract.analysis_type == "segmentation"                  # default kept
-    assert contract.resources["LOGS"] == ["run.log", "stderr.txt"]   # extra role from XNW_RESOURCE_LOGS
+    assert contract.resources["QC"] == ["raw/*_qc.tsv"]              # a new view role from XNW_RESOURCE_QC
+    assert "LOGS" not in contract.resources and contract.ignored_overrides == ("LOGS=run.log,stderr.txt",)   # fixed: ignored
     assert contract.resources["METRICS"] == DEFAULT_RESOURCES["METRICS"]
     assert all(len(v) <= 255 for v in env.values())
 
@@ -146,7 +152,13 @@ def test_contract_rejects_malformed_input(raw):
 
 # ── files and XML ──────────────────────────────────────────────────────────────
 
-def test_collect_files_named_roles_then_everything_else_is_derived(tmp_path):
+def _names(files):
+    return {role: [f.name for f in items] for role, items in files.items()}
+
+
+def test_collect_files_wrapup_artefacts_by_role_then_everything_else_is_derived_and_metrics_is_a_view(tmp_path):
+    """seg-wrapup's record since 0.6.0: REPORT and PROVENANCE hold the wrapup's own files, DERIVED
+    everything else (masks, sidecars, the measurements), and METRICS is a view onto DERIVED."""
     for name in ("volumes.json", "report.html", "wrapup.json", "segmentation.nii.gz", "segmentation_uint8.nii.gz"):
         (tmp_path / name).write_text("x")
     (tmp_path / "meshes").mkdir()
@@ -155,34 +167,129 @@ def test_collect_files_named_roles_then_everything_else_is_derived(tmp_path):
     (tmp_path / ".source_dicom" / "1.dcm").write_text("x")     # hidden: never uploaded
     (tmp_path / ".DS_Store").write_text("x")
     files = collect_files(tmp_path, RecordContract())
-    assert {role: [p.relative_to(tmp_path).as_posix() for p in paths] for role, paths in files.items()} == {
-        "METRICS": ["volumes.json"], "REPORT": ["report.html"], "PROVENANCE": ["wrapup.json"],
-        DERIVED_ROLE: ["meshes/liver.stl", "segmentation.nii.gz", "segmentation_uint8.nii.gz"]}
-    # the whole output is on the record, each file in exactly one role
-    every = [p for paths in files.values() for p in paths]
+    assert _names(files) == {
+        "REPORT": ["report.html"], "PROVENANCE": ["wrapup.json"],
+        DERIVED_ROLE: ["meshes/liver.stl", "segmentation.nii.gz", "segmentation_uint8.nii.gz", "volumes.json"]}
+    assert "METRICS" not in files                                     # not a resource any more
+    assert collect_views(tmp_path, RecordContract(), files[DERIVED_ROLE]) == {"METRICS": ["volumes.json"]}
+    # the whole output is on the record, each file in exactly one resource
+    every = [f.path for items in files.values() for f in items]
     assert len(every) == len(set(every)) == 6
 
 
-def test_collect_files_explicit_derived_globs_replace_the_everything_else_default(tmp_path):
+def test_collect_files_a_derived_override_is_ignored_the_tree_is_always_whole(tmp_path, caplog):
+    """Until 0.5.0 XNW_RESOURCE_DERIVED replaced the everything-else default and left files off the
+    record. Plan D20: DERIVED is always the complete tool output; the card's globs are ignored and said so."""
     for name in ("volumes.json", "segmentation.nii.gz", "scratch.bin"):
         (tmp_path / name).write_text("x")
-    contract = RecordContract.from_env({"XNW_CARD_ID": "c", "XNW_RESOURCE_DERIVED": "*.nii.gz"})
+    with caplog.at_level(logging.WARNING):
+        contract = RecordContract.from_env({"XNW_CARD_ID": "c", "XNW_RESOURCE_DERIVED": "*.nii.gz"})
     files = collect_files(tmp_path, contract)
-    assert [p.name for p in files[DERIVED_ROLE]] == ["segmentation.nii.gz"]
-    assert "scratch.bin" not in str(files)
+    assert _names(files)[DERIVED_ROLE] == ["scratch.bin", "segmentation.nii.gz", "volumes.json"]
+    assert contract.ignored_overrides == ("DERIVED=*.nii.gz",) and "DERIVED is a fixed resource" in caplog.text
 
 
 def test_collect_files_overlapping_role_globs_assign_each_file_once(tmp_path):
     """Codex P2 on PR #3: METRICS overridden to *.json also matches wrapup.json, which the default
-    PROVENANCE pattern names too. First role wins; nothing is uploaded twice."""
+    PROVENANCE pattern names too. Since 0.6.0 METRICS is a view onto DERIVED, so it can name
+    volumes.json (on DERIVED) but never wrapup.json (on PROVENANCE); nothing is uploaded twice."""
     for name in ("volumes.json", "wrapup.json", "report.html"):
         (tmp_path / name).write_text("x")
     contract = RecordContract.from_env({"XNW_CARD_ID": "c", "XNW_RESOURCE_METRICS": "*.json"})
     files = collect_files(tmp_path, contract)
-    assert [p.name for p in files["METRICS"]] == ["volumes.json", "wrapup.json"]
-    assert "PROVENANCE" not in files
-    every = [p for paths in files.values() for p in paths]
+    assert _names(files) == {"REPORT": ["report.html"], "PROVENANCE": ["wrapup.json"], DERIVED_ROLE: ["volumes.json"]}
+    assert collect_views(tmp_path, contract, files[DERIVED_ROLE]) == {"METRICS": ["volumes.json"]}
+    every = [f.path for items in files.values() for f in items]
     assert len(every) == len(set(every)) == 3
+
+
+def _tool_tree(root, derived="raw"):
+    """A proc-wrapup output: the tool's derivatives dataset under raw/ (an HTML report whose
+    figures are siblings, a JSON metric, a TSV), the wrapup's artefacts at the root."""
+    tree = root / derived
+    (tree / "sub-H025" / "figures").mkdir(parents=True)
+    (tree / "sub-H025" / "anat").mkdir()
+    (tree / "dataset_description.json").write_text('{"Name": "x"}')
+    (tree / "sub-H025.html").write_text('<img src="sub-H025/figures/a.svg">')
+    (tree / "sub-H025" / "figures" / "a.svg").write_text("<svg/>")
+    (tree / "sub-H025" / "anat" / "sub-H025_T1w.json").write_text('{"cjv": 0.4}')
+    (tree / "sub-H025" / "anat" / "sub-H025_desc-conf_timeseries.tsv").write_text("a\tb")
+    (root / "report.html").write_text("<html/>")
+    (root / "wrapup.json").write_text("{}")
+    (root / "status.json").write_text('{"exit_code": 0}')
+    (root / "logs").mkdir()
+    (root / "logs" / "stdout.log").write_text("ran")
+    return tree
+
+
+PROC_DEFAULTS = {"REPORT": ["report.html"], "PROVENANCE": ["wrapup.json", "status.json", "prereq.json"], "LOGS": ["logs/*.log"]}
+
+
+def test_derived_is_the_whole_tool_tree_at_the_resource_root_and_named_roles_are_views(tmp_path, caplog):
+    """Plan D20 (James: "raw/sub-H025.html should be in with everything else"; "DERIVED should
+    contain the entire output of the container"). On 0.5.0 mriqc E25614 had its reports in
+    REPORT, its IQM JSONs in METRICS and 49 other files in DERIVED: three resources, no dataset."""
+    _tool_tree(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        contract = RecordContract.from_env({"XNW_CARD_ID": "mriqc", "XNW_RESOURCE_METRICS": "sub-*/**/*.json",
+                                            "XNW_RESOURCE_REPORT": "report.html,sub-*.html"}, defaults=PROC_DEFAULTS)
+    files = collect_files(tmp_path, contract, derived_root="raw")
+    assert _names(files) == {
+        "REPORT": ["report.html"], "PROVENANCE": ["wrapup.json", "status.json"], "LOGS": ["logs/stdout.log"],
+        # the dataset, complete, at the root of the resource: no raw/ prefix, layout untouched
+        DERIVED_ROLE: ["dataset_description.json", "sub-H025/anat/sub-H025_T1w.json", "sub-H025/anat/sub-H025_desc-conf_timeseries.tsv",
+                       "sub-H025/figures/a.svg", "sub-H025.html"]}
+    assert all(f.path == tmp_path / "raw" / f.name for f in files[DERIVED_ROLE])
+    # METRICS is not a resource: it is a mapping onto DERIVED paths
+    assert "METRICS" not in files
+    assert collect_views(tmp_path, contract, files[DERIVED_ROLE], derived_root="raw") == {"METRICS": ["sub-H025/anat/sub-H025_T1w.json"]}
+    # the card's REPORT override is not honoured: nothing the tool wrote is copied out of DERIVED
+    assert contract.ignored_overrides == ("REPORT=report.html,sub-*.html",)
+
+
+def test_a_tool_html_report_with_sibling_figures_stays_in_derived_and_is_not_copied_into_report(tmp_path):
+    """fmriprep E25617 on 0.5.0: raw/sub-H025.html alone in REPORT rendered without its figures,
+    which are relative links into sub-H025/figures/ (in DERIVED). The report lives with its figures."""
+    _tool_tree(tmp_path)
+    contract = RecordContract.from_env({"XNW_CARD_ID": "fmriprep", "XNW_RESOURCE_REPORT": "report.html,sub-*.html"}, defaults=PROC_DEFAULTS)
+    files = collect_files(tmp_path, contract, derived_root="raw")
+    assert _names(files)["REPORT"] == ["report.html"]
+    assert {"sub-H025.html", "sub-H025/figures/a.svg"} <= set(_names(files)[DERIVED_ROLE])
+    uploads = [(role, f.name) for role, items in files.items() for f in items]
+    assert uploads.count(("REPORT", "sub-H025.html")) == 0 and len([u for u in uploads if u[1] == "sub-H025.html"]) == 1
+
+
+def test_a_legacy_raw_prefixed_view_glob_is_rebased_onto_the_derived_root_with_a_warning(tmp_path, caplog):
+    """Cards pinned to 0.5.0 wrote METRICS globs as raw/sub-*/**/*.json; the same files match after the re-pin."""
+    _tool_tree(tmp_path)
+    contract = RecordContract.from_env({"XNW_CARD_ID": "mriqc", "XNW_RESOURCE_METRICS": "raw/sub-*/**/*.json"}, defaults=PROC_DEFAULTS)
+    files = collect_files(tmp_path, contract, derived_root="raw")
+    with caplog.at_level(logging.WARNING):
+        views = collect_views(tmp_path, contract, files[DERIVED_ROLE], derived_root="raw")
+    assert views == {"METRICS": ["sub-H025/anat/sub-H025_T1w.json"]}
+    assert "drop the raw/ prefix" in caplog.text
+
+
+def test_a_view_that_matches_nothing_is_recorded_empty_and_a_view_never_reaches_a_wrapup_artefact(tmp_path, caplog):
+    _tool_tree(tmp_path)
+    contract = RecordContract.from_env({"XNW_CARD_ID": "c", "XNW_RESOURCE_METRICS": "**/*.csv", "XNW_RESOURCE_QC": "status.json"},
+                                       defaults=PROC_DEFAULTS)
+    files = collect_files(tmp_path, contract, derived_root="raw")
+    with caplog.at_level(logging.WARNING):
+        views = collect_views(tmp_path, contract, files[DERIVED_ROLE], derived_root="raw")
+    assert views == {"METRICS": [], "QC": []}                           # status.json is PROVENANCE, not on DERIVED
+    assert "view METRICS matched no file on DERIVED" in caplog.text
+
+
+def test_a_file_that_is_neither_the_tools_nor_the_wrapups_is_left_off_the_record_with_a_warning(tmp_path, caplog):
+    """The dataset is not a place for stray files, and the fixed resources hold only the wrapup's own."""
+    _tool_tree(tmp_path)
+    (tmp_path / "scratch.bin").write_text("x")
+    contract = RecordContract.from_env({"XNW_CARD_ID": "c"}, defaults=PROC_DEFAULTS)
+    with caplog.at_level(logging.WARNING):
+        files = collect_files(tmp_path, contract, derived_root="raw")
+    assert "scratch.bin" not in str(_names(files))
+    assert "1 file(s) in the output are neither the tool's output (raw/) nor a wrapup artefact and are not on the record: scratch.bin" in caplog.text
 
 
 @pytest.mark.parametrize("name,fmt", [("a.nii.gz", "NIFTI"), ("a.nii", "NIFTI"), ("a.seg.dcm", "DICOM"),
@@ -239,15 +346,29 @@ def test_publish_creates_record_then_uploads_files_to_its_out_resources(xnat, tm
     assert paths[0] == "/data/experiments/XNAT_E00018/assessors/DeepWMH_scan2_X?format=json" and calls[0]["method"] == "GET"
     assert paths[1] == "/data/experiments/XNAT_E00018/assessors/DeepWMH_scan2_X?inbody=true"
     assert calls[1]["content_type"] == "application/xml" and calls[1]["body"] == b"<xml/>"
-    assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/METRICS/files/volumes.json?inbody=true&format=JSON" in paths
+    assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/DERIVED/files/volumes.json?inbody=true&format=JSON" in paths
     assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/REPORT/files/report.html?inbody=true&format=HTML" in paths
+    assert not [p for p in paths if "/resources/METRICS/" in p]                 # METRICS is a view, not a resource (0.6.0)
     # the data output rides along under DERIVED, nested paths kept, NIfTI declared as NIFTI
     assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/DERIVED/files/segmentation.nii.gz?inbody=true&format=NIFTI" in paths
     assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/DERIVED/files/sub/part.tsv?inbody=true&format=TSV" in paths
     assert all(c["cookie"] == "JSESSIONID=FAKESESSION1234" for c in calls)     # every working request on the one session
-    assert outcome["uploaded"] == {"METRICS": ["volumes.json"], "REPORT": ["report.html"],
-                                   "DERIVED": ["segmentation.nii.gz", "sub/part.tsv"]}
+    assert outcome["uploaded"] == {"REPORT": ["report.html"],
+                                   "DERIVED": ["segmentation.nii.gz", "sub/part.tsv", "volumes.json"]}
     assert outcome["skipped_empty"] == []
+    assert outcome["output_paths"] == {"uploaded": ["report.html", "segmentation.nii.gz", "sub/part.tsv", "volumes.json"], "skipped_empty": []}
+
+
+def test_publish_names_derived_files_relative_to_the_tree_root_not_the_output_dir(xnat, tmp_path):
+    """The dataset sits at the DERIVED root: raw/sub-H025.html on disk is sub-H025.html on the record."""
+    host, handler = xnat
+    _tool_tree(tmp_path)
+    files = collect_files(tmp_path, RecordContract.from_env({"XNW_CARD_ID": "c"}, defaults=PROC_DEFAULTS), derived_root="raw")
+    outcome = publish_record(_context(host), "fmriprep_X", "<xml/>", files, output_dir=tmp_path)
+    paths = [c["path"].split("/out/resources/")[1].split("?")[0] for c in handler.calls if "/out/resources/" in c["path"]]
+    assert "DERIVED/files/sub-H025.html" in paths and "DERIVED/files/sub-H025/figures/a.svg" in paths
+    assert not [p for p in paths if "raw/" in p]
+    assert "raw/sub-H025.html" in outcome["output_paths"]["uploaded"]       # the local path, for the pointer reduction
 
 
 def test_publish_skips_empty_files_instead_of_losing_the_record(xnat, tmp_path, caplog):
@@ -278,9 +399,14 @@ def test_publish_if_possible_leaves_empty_files_out_of_the_record_document(xnat,
     args = SimpleNamespace(no_publish=False, record_label="lbl_X", model="m", scan="3")
     with caplog.at_level(logging.WARNING):
         outcome = publish_if_possible(args, tmp_path, {"model": "m", "model_version": "1"}, [], False, context=_context(host))
-    assert outcome["skipped_empty"] == ["empty.txt"] and outcome["uploaded"] == {"METRICS": ["volumes.json"]}
+    assert outcome["skipped_empty"] == ["empty.txt"] and outcome["uploaded"] == {"DERIVED": ["volumes.json"]}
+    assert outcome["output_paths"] == {"uploaded": ["volumes.json"], "skipped_empty": ["empty.txt"]}
     xml = [c for c in handler.calls if c["method"] == "PUT" and "/out/" not in c["path"]][0]["body"].decode()
     assert "<analysis:output_file_count>1</analysis:output_file_count>" in xml and "empty.txt" not in xml
+    # the record's own field carries the views, so a consumer resolves METRICS without wrapup.json
+    results = json.loads(html_unescape(xml.split("<analysis:results_json>")[1].split("</analysis:results_json>")[0]))
+    assert results["views"] == {"METRICS": ["volumes.json"]} and results["files"] == {"DERIVED": ["volumes.json"]}
+    assert outcome["views"] == {"METRICS": ["volumes.json"]}
     assert "empty.txt is empty; left off the record" in caplog.text
 
 
@@ -371,8 +497,9 @@ def test_contract_rejects_unsafe_resource_roles(role):
 
 
 def test_contract_accepts_lowercase_roles_by_uppercasing():
-    contract = RecordContract.from_env({"XNW_CARD_ID": "c", "XNW_RESOURCE_logs": "*.log"})
-    assert contract.resources["LOGS"] == ["*.log"]
+    contract = RecordContract.from_env({"XNW_CARD_ID": "c", "XNW_RESOURCE_metrics": "*.json", "XNW_RESOURCE_logs": "*.log"})
+    assert contract.resources["METRICS"] == ["*.json"]
+    assert contract.ignored_overrides == ("LOGS=*.log",)         # upper-cased before the fixed-role check
 
 
 def test_publish_rolls_back_on_an_invalid_upload_url(xnat, tmp_path, monkeypatch):
@@ -435,8 +562,14 @@ def test_cli_publishes_record_when_contract_and_context_present(xnat, tmp_path, 
     assert code == 0
     record = manifest["analysis_record"]
     assert record["id"] == "XNAT_E99999" and record["label"].startswith("DeepWMH_SESS01_scan2_")   # label carries the session label
-    assert "volumes.json" in record["uploaded"]["METRICS"] and "report.html" in record["uploaded"]["REPORT"]
-    assert "wrapup.json" in record["uploaded"]["PROVENANCE"]
+    assert "volumes.json" in record["uploaded"]["DERIVED"] and "report.html" in record["uploaded"]["REPORT"]
+    assert "wrapup.json" in record["uploaded"]["PROVENANCE"] and "METRICS" not in record["uploaded"]
+    assert "segmentation.nii.gz" in record["uploaded"]["DERIVED"] and "segmentation.tsv" in record["uploaded"]["DERIVED"]
+    # the METRICS view names the measurement files inside DERIVED, in wrapup.json (the copy on
+    # PROVENANCE included, since it is uploaded after the views are known) and on the record
+    assert record["views"] == manifest["views"] == {"METRICS": ["volumes.json", "volumes.csv", "segmentation.tsv"]}
+    uploaded_manifest = next(c for c in handler.calls if c["method"] == "PUT" and c["path"].split("?")[0].endswith("/PROVENANCE/files/wrapup.json"))
+    assert json.loads(uploaded_manifest["body"])["views"] == {"METRICS": ["volumes.json", "volumes.csv", "segmentation.tsv"]}
     create = next(c for c in handler.calls if c["method"] == "PUT" and "/assessors/" in c["path"] and "/out/" not in c["path"])
     assert create["path"].endswith(f"/assessors/{record['label']}?inbody=true")
     assert b"<analysis:pipeline_name>DeepWMH</analysis:pipeline_name>" in create["body"]

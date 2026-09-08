@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.0 (2026-09-08)
+
+Roles are views onto the output tree, not a partition of it (plan D20; James, on the mriqc/fmriprep records: "raw/sub-H025.html should be in with everything else", "DERIVED should contain the entire output of the container", "we have a predefined dataset that's created by the scientists. Don't fuck it up."). Behaviour change; cards re-pin. Design and rejected alternatives in `docs/ROLES-AS-VIEWS.md`.
+
+- **`DERIVED` is the tool's complete output tree, at the resource root, byte-for-byte and path-for-path.** proc-wrapup no longer publishes it under `raw/` (locally the tree still sits at `/output/raw/`, apart from the wrapup's own files): fmriprep's record now reads `DERIVED/dataset_description.json`, `DERIVED/sub-H025/...`, and record-fetch materialises a `role=DERIVED` prerequisite at `prereq/<name>/` with no `raw/` segment. Nothing is ever carved out of it: on 0.5.0 mriqc E25614 had its reports in `REPORT`, its IQM JSONs in `METRICS` and the other 49 files in `DERIVED`; fmriprep E25617 had its confounds carved into `METRICS` (worked around in workshop #15 by dropping fmriprep's `METRICS`) and `raw/sub-H025.html` alone in `REPORT`, where it rendered without its figures.
+- **The record has four resources and only four.** `REPORT` (the wrapup's `report.html`), `PROVENANCE` (`wrapup.json`, `status.json`, `prereq.json`; seg-wrapup's label files), `LOGS` (the captured stdout/stderr) hold what the wrapup itself generated, never a tool file; `DERIVED` holds the tool's files, never a wrapup file. A card's `XNW_RESOURCE_REPORT/PROVENANCE/LOGS/DERIVED` is ignored with a warning and listed in `wrapup.json` as `ignored_overrides`.
+- **Every other role a card names is a view.** `XNW_RESOURCE_METRICS=sub-*/**/*.json` (globs relative to the DERIVED root; a 0.5.0-style `raw/...` glob is rebased with a warning) no longer uploads a `METRICS` resource: the matched DERIVED paths are recorded as `views` in `wrapup.json` and in the record's `results_json`, one copy of every file. seg-wrapup's default `METRICS` (`volumes.json`, `volumes.csv`, `segmentation.tsv`) is such a view too, so those files now live in `DERIVED` beside the masks. Masks were already in `DERIVED`; segmentation records change only in that.
+- **record-fetch resolves a view role through the mapping.** `role=METRICS` (or any non-fixed role) reads the record's `PROVENANCE/wrapup.json` and copies exactly the DERIVED files the view names, at their DERIVED paths; a record published before 0.6.0 has no views and its resource of that name is used as before; a role the record does not map is an unmet prerequisite naming the views it has.
+- **`status.json` and `prereq.json` at the root of the tool's `/output` are not the tool's.** The card's exit trap and command line put them there; they were landing in the dataset (E25614: `METRICS raw/status.json`). proc-wrapup lifts them out, verbatim, into `PROVENANCE`.
+- **proc-wrapup's `report.html` links the tool's own HTML reports** where they live in `DERIVED` (`../../DERIVED/files/<path>`, resolved against the record page's `<base>` at `REPORT/files/`), so fmriprep's and mriqc's reports open with their figures.
+- **`--pointer-only` removes the empty files the record could not take** (XNAT refuses zero-byte in-body uploads), instead of leaving them for the output handler: on demo02 the `XNW_BIDS` pointer resource carried an empty `stderr.log` and `XNW_FMRIPREP` an empty `stderr.log` and `patchdir.txt`. A file the publisher skips is uploaded nowhere.
+- 174 tests (12 new, 12 rewritten for the new shape, none removed).
+
+Cards pinned to 0.5.0 keep publishing (their fixed-role overrides are ignored, their `raw/` view globs rebased, both logged); they must re-pin to 0.6.0 and drop `REPORT`/`PROVENANCE`/`LOGS` blocks and `raw/` prefixes, and any card that reads a prerequisite at `.../prereq/<name>/raw/` must read `.../prereq/<name>/`.
+
 ## 0.5.0 (2026-09-07)
 
 Prerequisites and chains (James: "adding a prerequisite to the card … our setup command needs to find the prereq data"):

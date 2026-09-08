@@ -17,7 +17,7 @@ from segwrapup.execution import copy_raw_output, read_status, run_status_from
 CONTRACT_ENV = {"XNW_CARD_ID": "pyradiomics", "XNW_CARD_REVISION": "1.1.0", "XNW_CONTRACT_VERSION": "0.1",
                 "XNW_ANALYSIS_TYPE": "radiomics", "XNW_CONTAINER_IMAGE": "radiomics/pyradiomics:CLI",
                 "XNW_CONTAINER_DIGEST": "sha256:" + "b" * 64, "XNW_OUTPUT_RESOURCE_LABEL": "PyRadiomics",
-                "XNW_RESOURCE_METRICS": "raw/features.csv"}
+                "XNW_RESOURCE_METRICS": "features.csv"}     # a view glob, relative to the DERIVED root (0.6.0)
 CONTEXT_ENV = {"XNAT_HOST": "http://x", "XNAT_USER": "alias", "XNAT_PASS": "secret",
                "PROC_PROJECT": "PROJ_1", "PROC_SESSION_ID": "XNAT_E00018", "PROC_SCAN_ID": "3", "XNAT_WORKFLOW_ID": "5001"}
 # The parent (900) ran under workflow 4990; a stranger's run (902) took workflow 5000, the id
@@ -177,10 +177,11 @@ def test_proc_wrapup_keeps_everything_captures_logs_reports_and_publishes(cs, tm
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["wrapup"] == "proc-wrapup" and manifest["run_status"] == "SUCCEEDED"
     assert manifest["execution"]["container_id"] == 900 and manifest["execution"]["duration_seconds"] == 120
-    # a report a reviewer can read, interpreting nothing
+    # a report a reviewer can read, interpreting nothing; files named as they are on DERIVED
     report = (out / "report.html").read_text()
-    assert "PyRadiomics 3.1" in report and "SUCCEEDED" in report and "raw/features.csv" in report and "line one" in report
-    # the record: generic fields, roles from the card + defaults, DERIVED takes the rest, one session
+    assert "PyRadiomics 3.1" in report and "SUCCEEDED" in report and "features.csv" in report and "line one" in report
+    assert "raw/features.csv" not in report
+    # the record: generic fields, the wrapup's artefacts by fixed role, the tool's tree as DERIVED, one session
     creates = [c for c in handler.calls if c["method"] == "PUT" and "/assessors/" in c["path"] and "/out/" not in c["path"]]
     # the label carries the session label: labels are unique per project, not per session
     assert len(creates) == 1 and creates[0]["path"].startswith("/data/experiments/XNAT_E00018/assessors/PyRadiomics_SESS01_scan3_")
@@ -191,10 +192,13 @@ def test_proc_wrapup_keeps_everything_captures_logs_reports_and_publishes(cs, tm
                      "<analysis:duration_seconds>120<", "<analysis:card_id>pyradiomics<", "<analysis:scans><analysis:scan>3<"):
         assert fragment in xml, fragment
     uploads = [c["path"].split("/out/resources/")[1].split("?")[0] for c in handler.calls if "/out/resources/" in c["path"]]
-    assert "METRICS/files/raw/features.csv" in uploads and "REPORT/files/report.html" in uploads
+    assert "DERIVED/files/features.csv" in uploads and "REPORT/files/report.html" in uploads
     assert "PROVENANCE/files/wrapup.json" in uploads and "PROVENANCE/files/status.json" in uploads
-    assert "LOGS/files/logs/stdout.log" in uploads and "DERIVED/files/raw/sub/log.txt" in uploads
+    assert "LOGS/files/logs/stdout.log" in uploads and "DERIVED/files/sub/log.txt" in uploads
+    assert not [u for u in uploads if u.startswith("METRICS/") or "/raw/" in u]     # METRICS is a view; DERIVED is the tree at its root
     assert manifest["analysis_record"]["id"] == "XNAT_E77777"
+    assert manifest["views"] == manifest["analysis_record"]["views"] == {"METRICS": ["features.csv"]}
+    assert "output_paths" not in manifest["analysis_record"]                     # local bookkeeping, not provenance
     logins = [c for c in handler.calls if c["path"] == "/data/JSESSION"]
     assert [c["method"] for c in logins] == ["POST", "DELETE"] and handler.calls[-1]["path"] == "/data/JSESSION"
 
@@ -319,7 +323,7 @@ def test_proc_wrapup_records_chain_and_prerequisites_and_can_leave_only_a_pointe
     assert [(q["name"], q["record"], q["resource"]) for q in inputs["prerequisites"]] == [("qsiprep", "XNAT_E12", None), ("bids", None, "BIDS")]
     # the files went to the record, then the output was reduced to the pointer
     uploads = [c["path"] for c in handler.calls if "/out/resources/" in c["path"]]
-    assert any("METRICS/files/raw/features.csv" in u for u in uploads) and any("DERIVED/files/raw/sub/log.txt" in u for u in uploads)
+    assert any("DERIVED/files/features.csv" in u for u in uploads) and any("DERIVED/files/sub/log.txt" in u for u in uploads)
     assert sorted(p.name for p in out.rglob("*") if p.is_file()) == ["wrapup.json"]
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["chain"]["orchestration_id"] == "42" and manifest["analysis_record"]["id"] == "XNAT_E77777"
@@ -364,8 +368,11 @@ def test_proc_wrapup_records_node_envelope_and_phase_timings_for_billing(cs, tmp
     assert "laz2ephdgvajpbg96rhc6lfmn" in report and "swarm" in report
 
 
-def test_pointer_only_keeps_files_an_explicit_derived_contract_left_off_the_record(cs, tmp_path, monkeypatch, caplog):
-    """Codex P1 on PR #10: with XNW_RESOURCE_DERIVED naming only some outputs, the rest must not vanish."""
+def test_pointer_only_a_derived_override_is_ignored_so_nothing_is_left_off_the_record(cs, tmp_path, monkeypatch, caplog):
+    """Codex P1 on PR #10 made --pointer-only keep files an XNW_RESOURCE_DERIVED contract left off the
+    record. Since 0.6.0 (plan D20) DERIVED is always the whole tool tree, the override is ignored and
+    said so, everything is on the record, and the output reduces to the pointer. (A file that is
+    still not on the record keeps staying in the output: the safety net is unchanged.)"""
     host, handler = cs
     inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
     out = tmp_path / "out"
@@ -373,10 +380,80 @@ def test_pointer_only_keeps_files_an_explicit_derived_contract_left_off_the_reco
     with caplog.at_level(logging.WARNING):
         assert proc.main(["--input", str(inp), "--output", str(out), "--pointer-only"]) == 0
     uploads = [c["path"] for c in handler.calls if "/out/resources/" in c["path"]]
-    assert not any("sub/log.txt" in u for u in uploads)                      # off the record by contract
-    assert (out / "raw" / "sub" / "log.txt").exists()                          # so it stays in the output
-    assert not (out / "raw" / "features.csv").exists()                        # what the record holds is removed
-    assert "2 file(s) are not on record XNAT_E77777 (outside the contract) and stay in the output: raw/status.json, raw/sub/log.txt" in caplog.text
+    assert any("DERIVED/files/sub/log.txt" in u for u in uploads) and any("DERIVED/files/features.csv" in u for u in uploads)
+    assert [p.relative_to(out).as_posix() for p in out.rglob("*") if p.is_file()] == ["wrapup.json"]
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["ignored_overrides"] == ["DERIVED=raw/features.csv"]
+    assert "DERIVED is a fixed resource" in caplog.text and "stay in the output" not in caplog.text
+
+
+def test_a_status_json_and_prereq_json_in_the_tool_output_are_provenance_not_part_of_the_dataset(cs, tmp_path, monkeypatch):
+    """The card's exit trap writes status.json into the tool's /output and the command line copies
+    prereq.json there; on 0.5.0 both landed in the dataset (mriqc E25614: METRICS raw/status.json).
+    James: "we have a predefined dataset that's created by the scientists. Don't fuck it up."."""
+    host, handler = cs
+    inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
+    (inp / "prereq.json").write_text(json.dumps({"prerequisites": [{"name": "conv", "kind": "record", "path": "prereq/conv",
+                                                                     "files": 1, "role": "PROVENANCE", "record": {"ID": "XNAT_E5"}}]}))
+    out = tmp_path / "out"
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "mriqc"})
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    uploads = [c["path"].split("/out/resources/")[1].split("?")[0] for c in handler.calls if "/out/resources/" in c["path"]]
+    assert "PROVENANCE/files/status.json" in uploads and "PROVENANCE/files/prereq.json" in uploads
+    assert "DERIVED/files/status.json" not in uploads and "DERIVED/files/prereq.json" not in uploads
+    assert not (out / "raw" / "status.json").exists() and not (out / "raw" / "prereq.json").exists()
+    assert (out / "status.json").read_bytes() == (inp / "status.json").read_bytes()          # verbatim, not re-serialised
+    assert sorted(u for u in uploads if u.startswith("DERIVED/")) == ["DERIVED/files/features.csv", "DERIVED/files/sub/log.txt"]
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["prerequisites"][0]["record"]["ID"] == "XNAT_E5"                          # still read for the record's inputs
+
+
+def test_proc_wrapup_publishes_a_bids_derivatives_dataset_at_the_derived_root_with_views_and_links_the_tool_report(cs, tmp_path, monkeypatch, caplog):
+    """The fmriprep/mriqc shape of XNAT_E25617/E25614 on a card still carrying 0.5.0 globs: the whole
+    dataset is DERIVED with no raw/ segment, the tool's HTML report stays beside its figures and is
+    linked from report.html, METRICS is a view, and the card's REPORT/PROVENANCE globs are ignored."""
+    host, handler = cs
+    inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
+    (inp / "sub-H025" / "figures").mkdir(parents=True); (inp / "sub-H025" / "anat").mkdir()
+    (inp / "dataset_description.json").write_text('{"Name": "fMRIPrep"}')
+    (inp / "sub-H025.html").write_text('<img src="sub-H025/figures/a.svg">')
+    (inp / "sub-H025" / "figures" / "a.svg").write_text("<svg/>")
+    (inp / "sub-H025" / "anat" / "sub-H025_T1w.json").write_text('{"cjv": 0.4}')
+    out = tmp_path / "out"
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "fmriprep", "XNW_RESOURCE_METRICS": "raw/sub-*/**/*.json",
+                                "XNW_RESOURCE_REPORT": "report.html,raw/sub-*.html",
+                                "XNW_RESOURCE_PROVENANCE": "wrapup.json,status.json,raw/prereq.json"})
+    with caplog.at_level(logging.WARNING):
+        assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    uploads = sorted(c["path"].split("/out/resources/")[1].split("?")[0] for c in handler.calls if "/out/resources/" in c["path"])
+    assert [u for u in uploads if u.startswith("DERIVED/")] == [
+        "DERIVED/files/dataset_description.json", "DERIVED/files/features.csv", "DERIVED/files/sub-H025.html",
+        "DERIVED/files/sub-H025/anat/sub-H025_T1w.json", "DERIVED/files/sub-H025/figures/a.svg", "DERIVED/files/sub/log.txt"]
+    assert [u for u in uploads if u.startswith("REPORT/")] == ["REPORT/files/report.html"]
+    assert not [u for u in uploads if u.startswith("METRICS/") or "raw/" in u]
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["views"] == {"METRICS": ["sub-H025/anat/sub-H025_T1w.json"]}
+    assert manifest["ignored_overrides"] == ["REPORT=report.html,raw/sub-*.html", "PROVENANCE=wrapup.json,status.json,raw/prereq.json"]
+    assert manifest["derived_root"] == "raw"
+    report = (out / "report.html").read_text()
+    assert '<a href="../../DERIVED/files/sub-H025.html"' in report          # resolved against the record page's <base> at REPORT/files/
+    assert "drop the raw/ prefix" in caplog.text and "REPORT is a fixed resource" in caplog.text
+
+
+def test_pointer_only_removes_the_empty_files_the_record_could_not_take(cs, tmp_path, monkeypatch):
+    """demo02 2026-09-08: proc-wrapup 0.5.0 skipped the zero-byte files at publish but left them in the
+    output, so the session's XNW_BIDS pointer resource carried an empty stderr.log and XNW_FMRIPREP an
+    empty stderr.log and patchdir.txt. A skipped file is uploaded nowhere."""
+    host, handler = cs
+    inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
+    (inp / "patchdir.txt").write_bytes(b"")
+    out = tmp_path / "out"
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "fmriprep"})
+    assert proc.main(["--input", str(inp), "--output", str(out), "--pointer-only"]) == 0
+    assert not [c for c in handler.calls if "patchdir.txt" in c["path"]]
+    assert [p.relative_to(out).as_posix() for p in out.rglob("*") if p.is_file()] == ["wrapup.json"]
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["skipped_empty"] == ["patchdir.txt"]
 
 
 def test_phase_without_a_running_event_is_timed_from_created():
@@ -398,4 +475,4 @@ def test_pointer_only_exempts_only_the_root_manifest(cs, tmp_path, monkeypatch):
     set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "pyradiomics"})
     assert proc.main(["--input", str(inp), "--output", str(out), "--pointer-only"]) == 0
     assert [p.relative_to(out).as_posix() for p in out.rglob("*") if p.is_file()] == ["wrapup.json"]
-    assert any("DERIVED/files/raw/previous/wrapup.json" in c["path"] for c in handler.calls)   # it went to the record
+    assert any("DERIVED/files/previous/wrapup.json" in c["path"] for c in handler.calls)   # it went to the record, as the tool laid it out

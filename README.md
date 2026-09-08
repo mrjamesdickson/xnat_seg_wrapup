@@ -23,21 +23,44 @@ and this wrapup, so every card produces the same resource layout.
 
 When the card opts in, the wrapup publishes an `analysis:sessionAnalysisData` record on the
 session after the ROI collection. The record's **fields** are type, status, QC and provenance
-only; no measurement is ever a field (the numbers are in `METRICS`). The record's
-**resources carry the entire output of the run**: `METRICS` (volumes.json/csv,
-segmentation.tsv), `REPORT` (report.html), `PROVENANCE` (wrapup.json, label files) and
-`DERIVED`, which takes every other file the wrapup wrote, recursively, masks included. The
-same files are also on the parent's resource (`output_resource_label`) for OHIF and the
-viewer sidecars, so today the data output exists twice; the DICOM SEG registered as a ROI
-collection is not copied again.
+only; no measurement is ever a field. The record's **resources carry the entire output of the
+run**, and since 0.6.0 there are exactly four of them (`docs/ROLES-AS-VIEWS.md`):
+
+| Resource | Holds | seg-wrapup | proc-wrapup |
+|---|---|---|---|
+| `DERIVED` | the tool's output, complete, unchanged, at the resource root; never a wrapup file | the delivered mask(s), their `.tsv` sidecars and 8-bit companions, `volumes.json`/`volumes.csv`, the DICOM SEG when kept, and the tool's other output under `raw/` | the tool's whole `/output` tree as the tool laid it out (`dataset_description.json`, `sub-<label>/...`) |
+| `REPORT` | the wrapup's `report.html` and nothing else | volumetrics report | did-it-run report, linking the tool's own HTML reports inside `DERIVED` |
+| `PROVENANCE` | what the wrapup knows about the run | `wrapup.json`, `labels.txt`, `labels.ctbl` | `wrapup.json`, `status.json`, `prereq.json` |
+| `LOGS` | the parent container's captured stdout/stderr | – | `logs/stdout.log`, `logs/stderr.log` |
+
+`METRICS` is **not a resource**: it is a *view*, a list of paths inside `DERIVED` (seg-wrapup:
+`volumes.json`, `volumes.csv`, `segmentation.tsv`; a proc-wrapup card names its own globs). Views
+are written to `wrapup.json` (`"views": {"METRICS": [...]}`) and to the record's `results_json`,
+so the record page, record-fetch and any script resolve a role to files without a second copy
+of anything. The same files are also on the parent's resource (`output_resource_label`) for
+OHIF and the viewer sidecars unless the card runs proc-wrapup with `--pointer-only`; the DICOM
+SEG registered as a ROI collection is not copied again.
 
 The card opts in through environment variables on its command, which the registry installer
 writes from the card's `results` block. The Container Service stores each value in a 255-char
 column, so the contract is **discrete variables**: `XNW_CARD_ID`, `XNW_CARD_REVISION`,
 `XNW_CONTRACT_VERSION`, `XNW_ANALYSIS_TYPE`, `XNW_CONTAINER_IMAGE`, `XNW_CONTAINER_DIGEST`,
 `XNW_OUTPUT_RESOURCE_LABEL`, `XNW_SUPERSEDES_ID`, and optional `XNW_RESOURCE_<ROLE>=a,b`
-globs per role (`XNW_RESOURCE_DERIVED` replaces the "everything else" default). A single
-`XNW_CONTRACT` JSON value is still honoured where it fits.
+view globs, relative to the `DERIVED` root (`XNW_RESOURCE_METRICS=sub-*/**/*.json`). A glob for
+one of the four fixed resources is ignored with a warning and listed under `ignored_overrides`
+in `wrapup.json`: the wrapup decides what they hold, and nothing the tool wrote is ever copied
+out of `DERIVED` (a tool's HTML report copied on its own loses the figures it links by relative
+path). A single `XNW_CONTRACT` JSON value is still honoured where it fits.
+
+Worked example, an mriqc card with `XNW_RESOURCE_METRICS=sub-*/**/*.json`: the record's
+`DERIVED` holds `dataset_description.json`, `sub-H025.html`, `sub-H025_ses-H025_T1w.html`,
+`sub-H025/ses-H025/anat/sub-H025_ses-H025_T1w.json`, the `figures/` and everything else mriqc
+wrote, exactly as it wrote it; `REPORT` holds proc-wrapup's `report.html`, which links the
+mriqc reports; `PROVENANCE/wrapup.json` says `"views": {"METRICS": ["sub-H025/ses-H025/anat/sub-H025_ses-H025_T1w.json", ...]}`.
+A downstream card with `XNW_PREREQ_IQM=pipeline=mriqc;role=METRICS` gets exactly those files at
+`prereq/iqm/sub-H025/ses-H025/anat/...`. What this will **not** do: rename, move, filter or
+reformat a tool file; put a wrapup file in `DERIVED`; upload a zero-byte file anywhere (XNAT
+refuses it; it is listed as `skipped_empty`); or honour a card's globs for the four fixed resources.
 
 No `XNW_*` variables, no record; nothing else changes. Publishing is create-only and
 additive: a label that already exists on the session is refused before any write, a file
@@ -51,7 +74,8 @@ measured. The record label is the ROI collection's label plus `_record`
 
 Contract keys: `card_id`, `card_revision`, `contract_version`, `analysis_type`,
 `container_image`, `container_digest`, `output_resource_label`, `supersedes_id`, and
-`resources` (role -> list of file globs, merged over the defaults above).
+`resources` (view role -> list of file globs relative to the `DERIVED` root, merged over the
+wrapup's defaults; entries for `DERIVED`, `REPORT`, `PROVENANCE`, `LOGS` are ignored).
 
 ## How a wrapup command works
 
@@ -75,7 +99,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.5.0"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.6.0"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -188,8 +212,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.5.0 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.5.0
+docker build -t xnatworks/seg-wrapup:0.6.0 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.6.0
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
@@ -240,7 +264,7 @@ A key given twice is refused (the later value used to win), and `scan_type=` req
 | `min=` | minimum `pipeline_version` (numeric-aware compare) | none |
 | `accepted=` | `true`: only records with `review_state ACCEPTED`; `false`: newest SUCCEEDED | `false` |
 | `id=` | one explicit record id; wins over the rules above | none |
-| `role=` | the record's `out` resource to copy (`DERIVED`, `METRICS`, `REPORT`, `LOGS`, `PROVENANCE`) | `DERIVED` |
+| `role=` | what to copy from the record: a resource (`DERIVED`, `REPORT`, `LOGS`, `PROVENANCE`) or a view (`METRICS`, any role the producing card named): the `DERIVED` files its `wrapup.json` view lists, at their `DERIVED` paths. A record published before 0.6.0 has no views and its resource of that name is used instead | `DERIVED` |
 | `resource=` | a session (or scan) resource label instead of a record | none |
 | `scope=` | `session` or `scan` (with `resource=`) | `session` |
 | `scan_type=` | with `scope=scan` on a session-level run: glob over scan `type` (`T1*`) | the run's scan |
@@ -270,20 +294,27 @@ image lineage, entrypoint `proc-wrapup`, image `xnatworks/proc-wrapup:<version>`
 (`Dockerfile.proc`). It interprets nothing:
 
 - copies everything the tool wrote to `/output/raw/` (hidden entries such as `.source_dicom`
-  excluded), so the scan/session resource and the record's `DERIVED` carry the whole run;
+  excluded) and publishes that tree as the record's `DERIVED` **at the resource root**, no
+  `raw/` segment: the scientists' derivatives dataset, byte-for-byte and path-for-path. The
+  local `raw/` only keeps the tool's files apart from the wrapup's own in `/output` (a tool that
+  writes its own `report.html` or `logs/` must not collide with the wrapup's);
 - reads `status.json` if the card's command line trapped a failure (`…; rc=$?; echo
   "{\"exit_code\": $rc, \"workflow_id\": \"$XNAT_WORKFLOW_ID\"}" > /output/status.json; exit 0`,
   because the Container Service never runs a wrapup after a non-zero exit) and publishes
-  `run_status FAILED` / auto QC `FAIL` in that case;
+  `run_status FAILED` / auto QC `FAIL` in that case; `status.json` and `prereq.json` at the root
+  of the tool's `/output` are the card's, not the tool's, and go verbatim to `PROVENANCE`
+  instead of into the dataset;
 - fetches the parent container's stdout/stderr and timing from the Container Service into
   `logs/` (found by the workflow id in `status.json`, else by the mount the two containers
   share: the Container Service resolves the wrapup's `/input` from the parent's output mount,
   and never by workflow-id order, which a concurrent run can break); `--no-publish` leaves this
   capture on and suppresses only the record;
-- records where and how it ran for audit and billing (`config_json`: backend, node, reserved envelope, per-phase wall clock, total); writes `report.html` (what ran, where, how it ended, the files kept, log tails) and `wrapup.json`; records the orchestration (`next_step_id`, step, job id) and the prerequisites record-fetch resolved in the record's `inputs_json`; `--pointer-only` leaves only `wrapup.json` for the output handler so the record is the single owner of the data;
-- publishes the record with the `XNW_*` contract exactly as seg-wrapup does. Default roles:
-  `REPORT` report.html, `PROVENANCE` wrapup.json + status.json, `LOGS` logs/*.log, `DERIVED`
-  everything else; a card names `METRICS` globs itself (e.g. `XNW_RESOURCE_METRICS=raw/features.csv`).
+- records where and how it ran for audit and billing (`config_json`: backend, node, reserved envelope, per-phase wall clock, total); writes `report.html` (what ran, where, how it ended, the files in `DERIVED`, links to the tool's own HTML reports where they live in `DERIVED`, log tails) and `wrapup.json`; records the orchestration (`next_step_id`, step, job id) and the prerequisites record-fetch resolved in the record's `inputs_json`; `--pointer-only` leaves only `wrapup.json` for the output handler so the record is the single owner of the data (files the record could not take because they were empty are removed too, not left for the session);
+- publishes the record with the `XNW_*` contract exactly as seg-wrapup does. Resources:
+  `REPORT` report.html, `PROVENANCE` wrapup.json + status.json + prereq.json, `LOGS` logs/*.log,
+  `DERIVED` the tool's tree; a card names `METRICS` (or any other view) with globs relative to the
+  tree (`XNW_RESOURCE_METRICS=sub-*/**/*.json`), which become a `views` mapping in `wrapup.json`
+  and `results_json`, not a resource. A `raw/`-prefixed glob from a 0.5.0 card is rebased with a warning.
 
 Environment: `PROC_PIPELINE_NAME` / `PROC_PIPELINE_VERSION` (fallback `SEG_MODEL_*`, then
 `XNW_CARD_ID`/`XNW_CARD_REVISION`), `PROC_PROJECT` / `PROC_SESSION_ID` / `PROC_SCAN_ID` (or the

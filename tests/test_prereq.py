@@ -31,8 +31,11 @@ RECORDS = [
     rec("XNAT_E20", "mriqc_S1_record", "mriqc", "24.0.2", "ACCEPTED", "SUCCEEDED", "2026-09-07 09:00:00", atype="qc"),
     rec("XNAT_E99", "qsiprep_other_session", "qsiprep", "1.1.1", "ACCEPTED", "SUCCEEDED", "2026-09-07 14:00:00", session="XNAT_E2"),
 ]
-FILES = {"XNAT_E12": {"DERIVED": ["raw/sub-1/dwi/preproc.nii.gz", "raw/sub-1/qc.json"]},
-         "XNAT_E11": {"DERIVED": ["raw/sub-1/dwi/preproc.nii.gz"]}}
+FILES = {"XNAT_E12": {"DERIVED": ["sub-1/dwi/preproc.nii.gz", "sub-1/qc.json"], "PROVENANCE": ["wrapup.json"]},      # published by 0.6.0
+         "XNAT_E11": {"DERIVED": ["sub-1/dwi/preproc.nii.gz"], "METRICS": ["sub-1/qc.json"], "PROVENANCE": ["wrapup.json"]}}   # by 0.5.0
+# wrapup.json as served from PROVENANCE: a 0.6.0 record maps its view roles onto DERIVED paths; a 0.5.0 one has no views
+WRAPUP_JSON = {"XNAT_E12": {"wrapup": "proc-wrapup", "version": "0.6.0", "views": {"METRICS": ["sub-1/qc.json"]}},
+               "XNAT_E11": {"wrapup": "proc-wrapup", "version": "0.5.0"}}
 SESSION_RESOURCES = {"BIDS": ["sub-1/anat/sub-1_T1w.nii.gz", "dataset_description.json"]}
 SCANS = {"2": {"type": "T1w", "DICOM": ["1.dcm", "2.dcm"]}, "3": {"type": "BOLD", "DICOM": ["b1.dcm"]}, "4": {"type": "T1w", "DICOM": []}}
 
@@ -83,6 +86,11 @@ class _Xnat(BaseHTTPRequestHandler):
                 self.send_response(404); self.end_headers(); return
             names = SESSION_RESOURCES.get(label, [])
             return self._json({"ResultSet": {"Result": [{"Name": n.rsplit("/", 1)[-1], "URI": f"/data/experiments/XNAT_E1/resources/{label}/files/{n}", "Size": 3} for n in names]}})
+        if p.endswith("/PROVENANCE/files/wrapup.json") and "/assessors/" in p:
+            rid = p.split("/assessors/")[1].split("/")[0]
+            if rid in WRAPUP_JSON:
+                return self._json(WRAPUP_JSON[rid])
+            self.send_response(404); self.end_headers(); return
         if "/files/" in p:
             self.send_response(200); self.send_header("Content-Type", "application/octet-stream"); self.end_headers(); self.wfile.write(b"data:" + p.rsplit("/", 1)[-1].encode()); return
         self.send_response(404); self.end_headers()
@@ -205,7 +213,9 @@ def test_record_fetch_passes_input_through_and_materialises_record_and_resource(
     with caplog.at_level(logging.INFO):
         assert prereq.main(["--input", str(inp), "--output", str(out)]) == 0
     assert (out / "sub-1" / "orig.txt").read_text() == "x"                                     # pass-through
-    assert (out / "prereq" / "qsiprep" / "raw" / "sub-1" / "dwi" / "preproc.nii.gz").read_bytes() == b"data:preproc.nii.gz"
+    # the record's DERIVED is the dataset at its root, so it lands at prereq/<name>/ with no raw/ segment (0.6.0)
+    assert (out / "prereq" / "qsiprep" / "sub-1" / "dwi" / "preproc.nii.gz").read_bytes() == b"data:preproc.nii.gz"
+    assert not (out / "prereq" / "qsiprep" / "raw").exists()
     assert (out / "prereq" / "bids" / "dataset_description.json").exists()
     m = json.loads((out / "prereq.json").read_text())
     q = next(p for p in m["prerequisites"] if p["name"] == "qsiprep")
@@ -215,6 +225,46 @@ def test_record_fetch_passes_input_through_and_materialises_record_and_resource(
     assert [c[0] for c in handler.calls if c[1] == "/data/JSESSION"] == ["POST", "DELETE"]
     assert all(c[2] == "JSESSIONID=FAKESESSION" for c in handler.calls if c[0] == "GET")
     assert any(c[1].startswith("/data/projects/P/experiments?xsiType=analysis:sessionAnalysisData") for c in handler.calls)
+
+
+def test_a_view_role_resolves_through_wrapup_json_to_the_derived_paths_it_names(xnat, tmp_path, monkeypatch, caplog):
+    """0.6.0: METRICS is not a resource on the record; role=METRICS reads the record's wrapup.json
+    views and copies exactly those DERIVED files, at their DERIVED paths."""
+    host, handler = xnat
+    inp = tmp_path / "in"; inp.mkdir(); out = tmp_path / "out"
+    monkeypatch.setenv("XNW_PREREQ_QC", "pipeline=qsiprep;role=METRICS")
+    with caplog.at_level(logging.INFO):
+        assert prereq.main(["--input", str(inp), "--output", str(out)]) == 0
+    assert (out / "prereq" / "qc" / "sub-1" / "qc.json").read_bytes() == b"data:qc.json"
+    assert not (out / "prereq" / "qc" / "sub-1" / "dwi").exists()                              # only what the view names
+    q = json.loads((out / "prereq.json").read_text())["prerequisites"][0]
+    assert q["record"]["ID"] == "XNAT_E12" and q["role"] == "METRICS" and q["files"] == 1
+    assert not [c for c in handler.calls if "/out/resources/METRICS/" in c[1]]                 # no such resource is ever asked for
+    assert any(c[1].endswith("/assessors/XNAT_E12/out/resources/PROVENANCE/files/wrapup.json") for c in handler.calls)
+    assert "needs a record from pipeline qsiprep (any version, review not required, run SUCCEEDED), the DERIVED files its METRICS view names" not in caplog.text
+
+
+def test_a_record_published_before_views_existed_still_serves_its_role_resource(xnat, tmp_path, monkeypatch, caplog):
+    """A 0.5.0 record has a real METRICS resource and no views in wrapup.json: used as it was."""
+    host, handler = xnat
+    inp = tmp_path / "in"; inp.mkdir(); out = tmp_path / "out"
+    monkeypatch.setenv("XNW_PREREQ_QC", "id=XNAT_E11;role=METRICS")
+    with caplog.at_level(logging.INFO):
+        assert prereq.main(["--input", str(inp), "--output", str(out)]) == 0
+    assert (out / "prereq" / "qc" / "sub-1" / "qc.json").read_bytes() == b"data:qc.json"
+    assert any("/assessors/XNAT_E11/out/resources/METRICS/files?format=json" in c[1] for c in handler.calls)
+    assert "record XNAT_E11 carries no views (published before 0.6.0); reading its METRICS resource" in caplog.text
+
+
+def test_a_view_the_record_does_not_map_is_an_unmet_prerequisite_with_the_views_it_has(xnat, tmp_path, monkeypatch, caplog):
+    host, handler = xnat
+    inp = tmp_path / "in"; inp.mkdir(); out = tmp_path / "out"
+    monkeypatch.setenv("XNW_PREREQ_CONN", "id=XNAT_E12;role=CONNECTOME")
+    with caplog.at_level(logging.ERROR):
+        assert prereq.main(["--input", str(inp), "--output", str(out)]) == 3
+    assert ("prerequisite conn: needs record XNAT_E12 (the DERIVED files its CONNECTOME view names); "
+            "record XNAT_E12 has no CONNECTOME view; its wrapup.json maps METRICS") in caplog.text
+    assert not [c for c in handler.calls if "/DERIVED/files/" in c[1] and not c[1].endswith("format=json")]   # nothing downloaded
 
 
 def test_record_fetch_fails_fast_when_a_prerequisite_is_unmet(xnat, tmp_path, monkeypatch, caplog):
