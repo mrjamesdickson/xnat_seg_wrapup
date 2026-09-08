@@ -144,6 +144,16 @@ still exist, `segmentation.tsv` now under `DERIVED`; OHIF reads ROI collections,
   `prereq/<name>/raw/…` breaks the moment its producer re-pins, because the producer's DERIVED
   no longer has the segment. Re-pin producers and consumers together (qsirecon, xcp-d,
   fmripost-aroma, giga-connectome, bidsmreye at least).
+- Dot-prefixed names on XNAT (0.6.1): the in-body file PUT (`SecureResource` → `FileList` →
+  `CatalogUtils.storeCatalogEntry`, xnat-web 1.9.2) validates nothing about a leading dot, the
+  file listing applies no filter, and a live listing on demo02 already shows an assessor
+  resource serving `files/.bidsignore` with a catalog id (grouplevel evidence 416, fmriprep
+  E17005). The catalogable-file filter excludes `*_catalog.xml` and `lock-*` only. Trap: XNAT
+  1.8.0–1.8.2 skipped `isHidden()` files on catalog *refresh* (XNAT-6820, fixed in 1.8.3), so
+  on those versions a root-level `.bidsignore` was uploaded and then dropped from the catalog
+  by the next refresh (a dotfile inside a subdirectory survived: `isHidden()` tests the file's
+  own name). Not exercised here: an in-body PUT of a dot-prefixed name through a site's
+  reverse proxy; nothing in xnat-web rejects it.
 - Zero-byte files: XNAT refuses them in-body, they are skipped (`skipped_empty`) and, under
   `--pointer-only`, deleted from the output as well. An empty file's only trace is its name in
   `wrapup.json` (`raw_files`, `skipped_empty`).
