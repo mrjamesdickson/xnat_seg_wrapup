@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import __version__
-from .publish import RecordContract, build_record_xml, publish_record
+from .publish import FIXED_ROLES, RecordContract, build_record_xml, publish_record
 from .register import XnatContext, auth_headers, close_session, collection_label, fetch_session_label
 
 logger = logging.getLogger(__name__)
@@ -129,13 +129,15 @@ class Prerequisite:
             return f"the {self.resource} resource {which}"
         if self.resource:
             return f"the session resource {self.resource}"
+        files = (f"files from its {self.role} resource" if self.role in FIXED_ROLES
+                 else f"the DERIVED files its {self.role} view names")
         if self.record_id:
-            return f"record {self.record_id} (files from its {self.role} resource)"
+            return f"record {self.record_id} ({files})"
         what = " ".join(x for x in [f"a {self.analysis_type}" if self.analysis_type else "a", "record",
                                      f"from pipeline {self.pipeline}" if self.pipeline else "from any pipeline"] if x)
         conds = [f"version >= {self.min_version}" if self.min_version else "any version",
                  "ACCEPTED in review" if self.accepted else "review not required", "run SUCCEEDED"]
-        return f"{what} ({', '.join(conds)}), files from its {self.role} resource"
+        return f"{what} ({', '.join(conds)}), {files}"
 
 
 def _parse_bool(name: str, key: str, value: str) -> bool:
@@ -228,21 +230,26 @@ def choose_record(prereq: Prerequisite, records: list[dict]) -> tuple[dict | Non
     return ok[0], ""
 
 
-def download_role(context: XnatContext, record_id: str, role: str, dest: Path, timeout: float = 300.0) -> list[str]:
-    """Copy every file of the record's ``out`` resource ``role`` into ``dest`` keeping the paths."""
-    rid = urllib.parse.quote(record_id, safe="")
+def _record_resource_url(context: XnatContext, record_id: str, role: str) -> str:
     # Assessor-scoped: ``/data/experiments/<record>/out/resources/<role>/files`` answers with the
     # record document, not a file list (demo02, 2026-09-07), and the listing then looks empty.
-    sid = urllib.parse.quote(context.session, safe="")
-    listing = _get_json(context, f"{context.host}/data/experiments/{sid}/assessors/{rid}/out/resources/"
-                                 f"{urllib.parse.quote(role, safe='')}/files?format=json", timeout)
+    return (f"{context.host}/data/experiments/{urllib.parse.quote(context.session, safe='')}/assessors/"
+            f"{urllib.parse.quote(record_id, safe='')}/out/resources/{urllib.parse.quote(role, safe='')}/files")
+
+
+def download_role(context: XnatContext, record_id: str, role: str, dest: Path, timeout: float = 300.0,
+                  only: set[str] | None = None) -> list[str]:
+    """Copy every file of the record's ``out`` resource ``role`` into ``dest`` keeping the paths.
+
+    ``only`` restricts the copy to those record paths (a view resolved through ``record_views``)."""
+    listing = _get_json(context, f"{_record_resource_url(context, record_id, role)}?format=json", timeout)
     files = listing.get("ResultSet", {}).get("Result", []) if isinstance(listing, dict) else []
     written: list[str] = []
     for f in files:
         uri = f.get("URI") or ""
         rel = uri.split("/files/", 1)[1] if "/files/" in uri else (f.get("Name") or "")
         rel = urllib.parse.unquote(rel)
-        if not rel or ".." in Path(rel).parts:
+        if not rel or ".." in Path(rel).parts or (only is not None and rel not in only):
             continue
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -251,6 +258,50 @@ def download_role(context: XnatContext, record_id: str, role: str, dest: Path, t
             shutil.copyfileobj(response, out)
         written.append(rel)
     return written
+
+
+def record_views(context: XnatContext, record_id: str, timeout: float = 60.0) -> dict[str, list[str]] | None:
+    """The record's role -> DERIVED-path views from its ``PROVENANCE/wrapup.json``.
+
+    ``None`` when the record predates 0.6.0 (no ``views`` in the manifest, or no manifest):
+    such a record carries its views as resources of the same name instead."""
+    url = f"{_record_resource_url(context, record_id, 'PROVENANCE')}/wrapup.json"
+    try:
+        manifest = _get_json(context, url, timeout)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise
+    except ValueError as error:
+        logger.warning("record %s: wrapup.json is not JSON (%s); views unknown", record_id, error)
+        return None
+    views = manifest.get("views") if isinstance(manifest, dict) else None
+    if not isinstance(views, dict):
+        return None
+    return {str(role).upper(): [str(p) for p in paths] for role, paths in views.items() if isinstance(paths, list)}
+
+
+def download_view(context: XnatContext, record_id: str, role: str, dest: Path, timeout: float = 300.0) -> tuple[list[str], str]:
+    """Materialise a view role (``METRICS``, ...): the DERIVED files its mapping names, at their
+    DERIVED paths. Returns ``(files, reason)``; a non-empty reason means the view could not be
+    resolved. A record from before 0.6.0 has no views and a resource of that name instead, which
+    is used as it was (a 404 there propagates as before)."""
+    views = record_views(context, record_id, timeout=min(timeout, 60.0))
+    if views is None:
+        logger.info("record %s carries no views (published before 0.6.0); reading its %s resource", record_id, role)
+        return download_role(context, record_id, role, dest, timeout), ""
+    if role not in views:
+        return [], (f"record {record_id} has no {role} view; its wrapup.json maps "
+                    + (", ".join(sorted(views)) if views else "no view roles"))
+    wanted = set(views[role])
+    if not wanted:
+        return [], f"record {record_id}'s {role} view names no files (its globs matched nothing in DERIVED)"
+    got = download_role(context, record_id, "DERIVED", dest, timeout, only=wanted)
+    missing = sorted(wanted - set(got))
+    if missing:
+        return got, (f"record {record_id}'s {role} view names {len(missing)} file(s) that are not on its DERIVED "
+                     f"resource: {', '.join(missing[:5])}" + (f", and {len(missing) - 5} more" if len(missing) > 5 else ""))
+    return got, ""
 
 
 def download_session_resource(context: XnatContext, label: str, dest: Path, timeout: float = 300.0) -> list[str]:
@@ -369,8 +420,14 @@ def materialise(context: XnatContext, resolutions: list[Resolution], output_dir:
                 continue
             if r.kind == "resource":
                 r.files = download_session_resource(context, r.resource, dest)
-            else:
+            elif r.role in FIXED_ROLES:
                 r.files = download_role(context, r.record["ID"], r.role, dest)
+            else:
+                # A view role (METRICS, ...) is a mapping onto DERIVED since 0.6.0, not a resource.
+                r.files, why = download_view(context, r.record["ID"], r.role, dest)
+                if why:
+                    r.error = f"{needs}{why}"
+                    continue
         except urllib.error.HTTPError as error:
             if error.code != 404:
                 raise

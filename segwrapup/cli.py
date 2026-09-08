@@ -227,8 +227,10 @@ def run(args: argparse.Namespace) -> int:
         roi = manifest.get("roi_collection") or {}
         if roi.get("label") and not roi.get("error") and not (args.record_label or "").strip():
             args.record_label = f"{roi['label']}_record"
-        manifest["analysis_record"] = publish_if_possible(args, output_dir, report, results, source_dicom.is_dir(),
-                                                          unmeasured_masks=len(delivered) - len(results), context=context)
+        outcome = publish_if_possible(args, output_dir, report, results, source_dicom.is_dir(),
+                                      unmeasured_masks=len(delivered) - len(results), context=context, manifest=manifest)
+        (outcome or {}).pop("output_paths", None)      # local bookkeeping for a pointer reduction; seg-wrapup keeps its output
+        manifest["analysis_record"] = outcome
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
         for result in results:
             for item in result["structures"]:

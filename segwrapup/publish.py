@@ -2,11 +2,14 @@
 
 The record is the searchable, reviewable XNAT object a catalog card leaves behind. It holds
 **type, status, QC and provenance** as fields, and it carries **the entire output of the run**
-as resources: ``METRICS``, ``REPORT`` and ``PROVENANCE`` for the files the contract names by
-role, and ``DERIVED`` for everything else the wrapup produced (masks, label maps, viewer
-sidecars). A reviewer QCs the run from the record alone. No field ever holds a measurement:
-what the model measured stays in ``METRICS`` (``volumes.json``). Design and rationale:
-``development/xnat_genericProcessing_plugin/docs/DATATYPE-SPEC.md``.
+as resources. Since 0.6.0 (plan D20, James: "roles are views onto the output tree, not a
+partition of it") the resources are fixed: ``DERIVED`` is the tool's complete output tree,
+byte-for-byte and path-for-path at the resource root; ``REPORT``, ``PROVENANCE`` and ``LOGS``
+hold only what the wrapup itself generated. Every other role a card names (``METRICS``, or
+anything else) is a **view**: the files its globs matched, recorded as paths inside ``DERIVED``
+in ``wrapup.json`` and in the record's ``results_json``, never a second copy. A reviewer QCs
+the run from the record alone. No field ever holds a measurement. Design and rationale:
+``docs/ROLES-AS-VIEWS.md`` here and ``development/xnat_genericProcessing_plugin/docs/``.
 
 The wrapup already has everything the record needs: the Container Service injects
 ``XNAT_HOST``/``XNAT_USER``/``XNAT_PASS`` (an alias token) and the parent command passes
@@ -46,19 +49,35 @@ XSI_TYPE = "analysis:sessionAnalysisData"
 ANALYSIS_NS = "http://xnatworks.io/analysis"
 XNAT_NS = "http://nrg.wustl.edu/xnat"
 
-#: Files the record carries by named role when the contract does not say otherwise. Every
-#: other file in the output directory goes to ``DERIVED`` (see :data:`DERIVED_ROLE`), so the
-#: record's resources together are the complete run output.
+#: seg-wrapup's roles when the card does not say otherwise. ``REPORT`` and ``PROVENANCE`` name
+#: the wrapup's own artefacts (the only files those resources ever hold); ``METRICS`` is a view
+#: onto ``DERIVED``: the measurement files the wrapup wrote beside the masks, listed by path.
 DEFAULT_RESOURCES: dict[str, list[str]] = {
     "METRICS": ["volumes.json", "volumes.csv", "segmentation.tsv"],
     "REPORT": ["report.html"],
     "PROVENANCE": ["wrapup.json", "labels.txt", "labels.ctbl"],
 }
 
-#: The role for the data output itself (design §6: images, labels, transforms, meshes). Unless a
-#: contract names ``DERIVED`` globs explicitly, it receives every file under the output directory,
-#: recursively, that no other role claimed. Dotfiles and dot-directories are never uploaded.
+#: The role for the data output itself (design §6; plan D16: the derivatives dataset). It holds
+#: every file of the tool's output tree, unchanged, at the resource root; a wrapup that keeps the
+#: tree in a subdirectory of its output (proc-wrapup: ``raw/``) names it as ``derived_root`` and
+#: the prefix is dropped on the record. Dotfiles and dot-directories are never uploaded.
 DERIVED_ROLE = "DERIVED"
+
+#: The only roles that are XNAT resources on the record. ``DERIVED`` is the tool's tree; the
+#: other three hold what the wrapup generated (report, manifest/status/labels, captured logs).
+#: A card's ``XNW_RESOURCE_<ROLE>`` for one of these is ignored with a warning: nothing the tool
+#: wrote is ever copied out of ``DERIVED`` (a tool's HTML report links to its figures by relative
+#: path, so a copy on its own is broken), and nothing the wrapup wrote ever lands in it.
+FIXED_ROLES = (DERIVED_ROLE, "REPORT", "PROVENANCE", "LOGS")
+
+
+@dataclass(frozen=True)
+class RecordFile:
+    """One file to upload: where it is on disk and its name (relative path) on the record."""
+
+    path: Path
+    name: str
 
 #: Resource roles become path segments of the upload URL, so they are validated at parse time
 #: rather than escaped: an unsafe role is a contract error the wrapup records, not a request
@@ -83,6 +102,9 @@ class RecordContract:
     output_resource_label: str = ""
     supersedes_id: str = ""
     resources: dict[str, list[str]] = field(default_factory=lambda: dict(DEFAULT_RESOURCES))
+    #: ``XNW_RESOURCE_<ROLE>`` overrides for a fixed role the card sent and the wrapup ignored
+    #: (``"REPORT=report.html,raw/sub-*.html"``), so ``wrapup.json`` says what was dropped.
+    ignored_overrides: tuple[str, ...] = ()
 
     #: Discrete environment variables, the form the Container Service can actually store: its
     #: command table caps each environment value at 255 characters, so a JSON contract does not
@@ -99,7 +121,9 @@ class RecordContract:
         """Parse ``XNW_CONTRACT`` (JSON) or the discrete ``XNW_*`` variables; ``None`` when neither is set.
 
         ``defaults`` are the role globs used when the card declares none (seg-wrapup's by default;
-        proc-wrapup passes its own)."""
+        proc-wrapup passes its own). The fixed roles (``DERIVED``, ``REPORT``, ``PROVENANCE``,
+        ``LOGS``) always keep the wrapup's defaults: a card override for one of them is logged,
+        kept in ``ignored_overrides`` and otherwise ignored (plan D20)."""
         env = os.environ if environ is None else environ
         base = dict(defaults if defaults is not None else DEFAULT_RESOURCES)
         raw = env.get("XNW_CONTRACT", "").strip()
@@ -109,10 +133,12 @@ class RecordContract:
                 logger.info("no XNW_CONTRACT or XNW_* variables in the environment; no analysis record will be published")
                 return None
             resources = dict(base)
+            ignored: list[str] = []
             for key, value in env.items():
                 if key.startswith("XNW_RESOURCE_") and value.strip():   # XNW_RESOURCE_METRICS="a.json,b.csv"
-                    resources[_valid_role(key[len("XNW_RESOURCE_"):])] = [p.strip() for p in value.split(",") if p.strip()]
-            return cls(resources=resources, **{k: v for k, v in discrete.items()})
+                    _declare(resources, ignored, _valid_role(key[len("XNW_RESOURCE_"):]),
+                             [p.strip() for p in value.split(",") if p.strip()])
+            return cls(resources=resources, ignored_overrides=tuple(ignored), **{k: v for k, v in discrete.items()})
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as error:
@@ -120,13 +146,15 @@ class RecordContract:
         if not isinstance(data, dict):
             raise ValueError("XNW_CONTRACT must be a JSON object")
         resources = dict(base)
+        ignored = []
         declared = data.get("resources")
         if isinstance(declared, dict):
             for role, patterns in declared.items():
                 if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
                     raise ValueError(f"XNW_CONTRACT resources.{role} must be a list of file patterns")
-                resources[_valid_role(str(role))] = patterns
+                _declare(resources, ignored, _valid_role(str(role)), list(patterns))
         return cls(
+            ignored_overrides=tuple(ignored),
             card_id=str(data.get("card_id", "")),
             card_revision=str(data.get("card_revision", "")),
             contract_version=str(data.get("contract_version", "0.1")),
@@ -150,37 +178,99 @@ def _valid_role(role: str) -> str:
     return upper
 
 
-def collect_files(output_dir: Path, contract: RecordContract) -> dict[str, list[Path]]:
-    """Every file in ``output_dir`` assigned to exactly one role.
+def _declare(resources: dict[str, list[str]], ignored: list[str], role: str, patterns: list[str]) -> None:
+    """Apply one card-declared role: a view is taken as given; a fixed role keeps the default."""
+    if role in FIXED_ROLES:
+        logger.warning("%s is a fixed resource: the wrapup decides its files (%s); the card's globs %s are ignored "
+                       "(since 0.6.0 nothing is copied out of DERIVED, and DERIVED is always the whole tool output)",
+                       role, ", ".join(resources.get(role, [])) or "the tool's output tree", patterns)
+        ignored.append(f"{role}={','.join(patterns)}")
+        return
+    resources[role] = patterns
 
-    Named roles first, in contract order, no duplicates. Then ``DERIVED`` takes all remaining
-    files (recursive, dotfiles excluded) unless the contract lists ``DERIVED`` globs itself, in
-    which case only those are taken. The union is the whole run output minus hidden files.
+
+def _tree(root: Path) -> list[Path]:
+    """Every non-hidden file under ``root``, sorted, or nothing when the directory is absent."""
+    if not root.is_dir():
+        return []
+    return [p for p in sorted(root.rglob("*")) if p.is_file() and not _is_hidden(p, root)]
+
+
+def collect_files(output_dir: Path, contract: RecordContract, derived_root: str | None = None) -> dict[str, list[RecordFile]]:
+    """The record's resources: the wrapup's artefacts by fixed role, then the tool's tree as ``DERIVED``.
+
+    ``REPORT``, ``PROVENANCE`` and ``LOGS`` take the files their (wrapup-owned) globs match at the
+    output root; the first role to name a file owns it. ``DERIVED`` is the tool's output tree:
+    with ``derived_root`` (proc-wrapup keeps it under ``raw/``) every file under that directory,
+    named relative to it, so the dataset sits at the resource root exactly as the tool wrote it;
+    without one, every file the artefact roles did not claim (seg-wrapup's masks, sidecars and
+    measurements at the top level plus the tool's ``raw/`` tree). Hidden entries are never
+    uploaded. A file that is neither an artefact nor part of the tree (only possible with
+    ``derived_root``) is left off the record with a warning: the dataset is not a place for it.
     """
-    found: dict[str, list[Path]] = {}
+    found: dict[str, list[RecordFile]] = {}
     claimed: set[Path] = set()
-    explicit_derived = DERIVED_ROLE in contract.resources
+    tree_root = output_dir / derived_root if derived_root else None
     for role, patterns in contract.resources.items():
-        if role == DERIVED_ROLE:
+        if role not in FIXED_ROLES or role == DERIVED_ROLE:
             continue
-        paths: list[Path] = []
+        files: list[RecordFile] = []
         for pattern in patterns:
             for path in sorted(output_dir.glob(pattern)):
-                # first role to name a file owns it: overlapping globs (METRICS "*.json" and the
-                # default PROVENANCE "wrapup.json") must not upload one file twice
-                if path.is_file() and path not in paths and path not in claimed and not _is_hidden(path, output_dir):
-                    paths.append(path)
-        if paths:
-            found[role] = paths
-            claimed.update(paths)
-    if explicit_derived:
-        derived = [p for pattern in contract.resources[DERIVED_ROLE] for p in sorted(output_dir.glob(pattern))
-                   if p.is_file() and p not in claimed and not _is_hidden(p, output_dir)]
+                if not path.is_file() or path in claimed or _is_hidden(path, output_dir):
+                    continue
+                if tree_root is not None and tree_root in path.parents:
+                    continue        # a wrapup artefact glob never reaches into the tool's tree
+                files.append(RecordFile(path, path.relative_to(output_dir).as_posix()))
+                claimed.add(path)
+        if files:
+            found[role] = files
+    if tree_root is not None:
+        derived = [RecordFile(p, p.relative_to(tree_root).as_posix()) for p in _tree(tree_root)]
+        stray = [p.relative_to(output_dir).as_posix() for p in _tree(output_dir)
+                 if p not in claimed and tree_root not in p.parents]
+        if stray:
+            logger.warning("%d file(s) in the output are neither the tool's output (%s/) nor a wrapup artefact and "
+                           "are not on the record: %s", len(stray), derived_root, ", ".join(stray))
     else:
-        derived = [p for p in sorted(output_dir.rglob("*")) if p.is_file() and p not in claimed and not _is_hidden(p, output_dir)]
+        derived = [RecordFile(p, p.relative_to(output_dir).as_posix()) for p in _tree(output_dir) if p not in claimed]
     if derived:
-        found[DERIVED_ROLE] = list(dict.fromkeys(derived))
+        found[DERIVED_ROLE] = derived
     return found
+
+
+def collect_views(output_dir: Path, contract: RecordContract, derived: list[RecordFile],
+                  derived_root: str | None = None) -> dict[str, list[str]]:
+    """Role -> paths inside ``DERIVED`` for every non-fixed role the card named (``METRICS``, ...).
+
+    Globs are matched relative to the DERIVED root, so a card writes them as the dataset is laid
+    out (``sub-*/**/*.json``), and only files that are on ``DERIVED`` can be named: a glob that
+    reaches a wrapup artefact names nothing. A pre-0.6.0 glob that starts with the local
+    ``derived_root`` (``raw/...``) is rebased with a warning so a card re-pins without breaking.
+    Every declared view is present, empty when nothing matched, so a reviewer sees the miss.
+    """
+    root = output_dir / derived_root if derived_root else output_dir
+    on_record = {f.name for f in derived}
+    views: dict[str, list[str]] = {}
+    for role, patterns in contract.resources.items():
+        if role in FIXED_ROLES:
+            continue
+        names: list[str] = []
+        for pattern in patterns:
+            if derived_root and pattern.startswith(f"{derived_root}/"):
+                logger.warning("%s glob %r is read relative to the DERIVED root since 0.6.0; drop the %s/ prefix in the card",
+                               role, pattern, derived_root)
+                pattern = pattern[len(derived_root) + 1:]
+            for path in sorted(root.glob(pattern)):
+                if not path.is_file() or _is_hidden(path, root):
+                    continue
+                name = path.relative_to(root).as_posix()
+                if name in on_record and name not in names:
+                    names.append(name)
+        if not names:
+            logger.warning("view %s matched no file on DERIVED (globs: %s)", role, ", ".join(patterns))
+        views[role] = names
+    return views
 
 
 def upload_name(path: Path, output_dir: Path | None) -> str:
@@ -191,6 +281,12 @@ def upload_name(path: Path, output_dir: Path | None) -> str:
         except ValueError:
             pass
     return path.name
+
+
+def _record_files(files: dict, output_dir: Path | None) -> dict[str, list[RecordFile]]:
+    """Accept plain ``Path`` lists (named relative to ``output_dir``) as well as ``RecordFile`` lists."""
+    return {role: [f if isinstance(f, RecordFile) else RecordFile(f, upload_name(f, output_dir)) for f in paths]
+            for role, paths in files.items()}
 
 
 def upload_format(path: Path) -> str:
@@ -210,10 +306,10 @@ def _element(name: str, value) -> str:
 
 
 def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
-                     report: dict, results: list[dict], files: dict[str, list[Path]],
+                     report: dict, results: list[dict], files: dict[str, list],
                      source_dicom_present: bool, when: datetime | None = None,
                      output_dir: Path | None = None, unmeasured_masks: int = 0,
-                     facts: dict | None = None) -> str:
+                     facts: dict | None = None, views: dict[str, list[str]] | None = None) -> str:
     """The assessor document XNAT ingests. Fields: type, status, QC, provenance. No measurements.
 
     ``unmeasured_masks`` is how many delivered masks could not be measured: they still ship
@@ -221,9 +317,12 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
     ``facts`` lets a generic wrapup override what seg-wrapup derives from masks:
     ``run_status``, ``auto_qc``, ``container_id``, ``duration_seconds``, ``notes``, ``inputs``,
     ``config`` (execution facts: node, envelope, phases; stored as ``config_json``) and
-    ``wrapup`` (the publishing wrapup's name, ``seg-wrapup`` by default).
+    ``wrapup`` (the publishing wrapup's name, ``seg-wrapup`` by default). ``views`` (role ->
+    paths inside DERIVED) goes into ``results_json`` so a consumer can resolve ``METRICS`` to
+    files without reading ``wrapup.json``.
     """
     facts = facts or {}
+    files = _record_files(files, output_dir)
     wrapup_name = facts.get("wrapup") or "seg-wrapup"
     now = when or datetime.now(timezone.utc)
     structures = sum(len(r.get("structures", [])) for r in results)
@@ -233,7 +332,8 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
     summary = {"model": report.get("model"), "model_version": report.get("model_version"),
                "structures": structures,
                "total_volume_ml": round(sum(r.get("total_volume_ml", 0) for r in results), 2),
-               "files": {role: [upload_name(p, output_dir) for p in paths] for role, paths in files.items()}}
+               "files": {role: [f.name for f in items] for role, items in files.items()},
+               "views": views or {}}
     output_count = sum(len(v) for v in files.values())
     body = "".join([
         _element("analysis_type", contract.analysis_type),
@@ -307,16 +407,19 @@ def _relabel(xml: str, label: str) -> str:
     return re.sub(r'(<analysis:SessionAnalysis[^>]*?\slabel=")[^"]*(")', lambda m: m.group(1) + escape(label) + m.group(2), xml, count=1)
 
 
-def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, list[Path]],
+def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, list],
                    timeout_seconds: float = 300.0, output_dir: Path | None = None) -> dict:
     """Create the record, then upload each role's files to its ``out`` resource. Raises RuntimeError.
 
     Create-only, enforced twice: a label that already exists on the session is refused before
     any PUT (XNAT would treat the PUT as an update of that object), and if a file upload fails
     after the create succeeded the new record is deleted again so no searchable, apparently
-    complete record is left behind. File names on the record are paths relative to
-    ``output_dir`` so nested output keeps its shape.
+    complete record is left behind. File names on the record are each :class:`RecordFile`'s
+    ``name`` (plain ``Path`` lists are named relative to ``output_dir``), so nested output keeps
+    its shape. The outcome's ``output_paths`` lists, relative to ``output_dir``, the files
+    uploaded and the empty files skipped, for a wrapup that reduces its output afterwards.
     """
+    files = _record_files(files, output_dir)
     session = urllib.parse.quote(context.session, safe="")
     label_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(label, safe='')}"
     probe = _request(context, "GET", f"{label_url}?format=json", timeout_seconds)
@@ -345,21 +448,24 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     record_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(record_id, safe='')}"
     uploaded: dict[str, list[str]] = {}
     skipped_empty: list[str] = []
+    output_paths: dict[str, list[str]] = {"uploaded": [], "skipped_empty": []}
     try:
-        for role, paths in files.items():
-            for path in paths:
-                name = upload_name(path, output_dir)
+        for role, items in files.items():
+            for item in items:
+                path, name = item.path, item.name
                 if path.stat().st_size == 0:
                     # XNAT answers an in-body PUT with an empty body with HTTP 500 ("request entity
                     # size is 0"); a tool that wrote nothing to stderr must not cost the record.
                     logger.warning("%s is empty; not uploaded to %s (XNAT refuses zero-byte in-body files)", name, role)
                     skipped_empty.append(name)
+                    output_paths["skipped_empty"].append(upload_name(path, output_dir))
                     continue
                 content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
                 url = (f"{record_url}/out/resources/{role}/files/{urllib.parse.quote(name, safe='/')}"
                        f"?inbody=true&format={urllib.parse.quote(upload_format(path), safe='')}")
                 _put(context, url, path.read_bytes(), content_type, timeout_seconds)
                 uploaded.setdefault(role, []).append(name)
+                output_paths["uploaded"].append(upload_name(path, output_dir))
     except (RuntimeError, OSError, ValueError, http.client.HTTPException) as error:   # any post-create failure
         logger.error("upload to record %s failed after create; deleting the record so no partial record stays: %s",
                      record_id, error)
@@ -373,14 +479,23 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     logger.info("analysis record %s published as %s with %d file(s)", label, record_id,
                 sum(len(v) for v in uploaded.values()))
     return {"xsi_type": XSI_TYPE, "id": record_id, "label": label, "status": status,
-            "uploaded": uploaded, "skipped_empty": skipped_empty, "url": create_url.split("?")[0]}
+            "uploaded": uploaded, "skipped_empty": skipped_empty, "url": create_url.split("?")[0],
+            "output_paths": output_paths}
 
 
 def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict],
                         source_dicom_present: bool, unmeasured_masks: int = 0,
                         context: XnatContext | None = None, facts: dict | None = None,
-                        default_resources: dict[str, list[str]] | None = None) -> dict | None:
-    """Publish when the card opted in and the context is present. Never raises."""
+                        default_resources: dict[str, list[str]] | None = None,
+                        derived_root: str | None = None, manifest: dict | None = None) -> dict | None:
+    """Publish when the card opted in and the context is present. Never raises.
+
+    ``derived_root`` is the subdirectory of ``output_dir`` that holds the tool's output tree
+    (proc-wrapup: ``raw``); ``DERIVED`` is that tree at the resource root. ``manifest`` is the
+    wrapup's ``wrapup.json`` content: the role views and any ignored overrides are written into
+    it, and to ``output_dir/wrapup.json``, before the upload, so the copy on the record's
+    ``PROVENANCE`` carries the role -> path mapping a consumer resolves ``METRICS`` through.
+    """
     if getattr(args, "no_publish", False):
         logger.info("analysis record skipped by flag")
         return None
@@ -402,18 +517,27 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
     # pattern makes Path.glob raise NotImplementedError) must be recorded, not abort delivery
     # of the masks, report and ROI collection that are already on disk.
     try:
-        files = collect_files(output_dir, contract)
+        files = collect_files(output_dir, contract, derived_root=derived_root)
         # Zero-byte files are dropped here, before the document is built, so output_file_count
         # and results_json never claim a file the upload would skip (Codex P2 on PR #10).
-        empties = [upload_name(p, output_dir) for paths in files.values() for p in paths if p.stat().st_size == 0]
-        files = {role: [p for p in paths if p.stat().st_size > 0] for role, paths in files.items()}
-        files = {role: paths for role, paths in files.items() if paths}
-        for name in empties:
-            logger.warning("%s is empty; left off the record (XNAT refuses zero-byte in-body files)", name)
+        empties = [f for items in files.values() for f in items if f.path.stat().st_size == 0]
+        files = {role: [f for f in items if f.path.stat().st_size > 0] for role, items in files.items()}
+        files = {role: items for role, items in files.items() if items}
+        for f in empties:
+            logger.warning("%s is empty; left off the record (XNAT refuses zero-byte in-body files)", f.name)
+        views = collect_views(output_dir, contract, files.get(DERIVED_ROLE, []), derived_root=derived_root)
+        if manifest is not None:
+            manifest["views"] = views
+            manifest["ignored_overrides"] = list(contract.ignored_overrides)
+            (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
         xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present,
-                               output_dir=output_dir, unmeasured_masks=unmeasured_masks, facts=facts)
+                               output_dir=output_dir, unmeasured_masks=unmeasured_masks, facts=facts, views=views)
         outcome = publish_record(context, label, xml, files, output_dir=output_dir)
-        outcome["skipped_empty"] = sorted(set(outcome.get("skipped_empty") or []) | set(empties))
+        outcome["skipped_empty"] = sorted(set(outcome.get("skipped_empty") or []) | {f.name for f in empties})
+        outcome["output_paths"]["skipped_empty"] = sorted(set(outcome["output_paths"]["skipped_empty"])
+                                                          | {upload_name(f.path, output_dir) for f in empties})
+        outcome["views"] = views
+        outcome["ignored_overrides"] = list(contract.ignored_overrides)
         return outcome
     except (RuntimeError, ValueError, NotImplementedError, OSError) as error:
         logger.error("analysis record %s not published; files and ROI collection still delivered: %s: %s",

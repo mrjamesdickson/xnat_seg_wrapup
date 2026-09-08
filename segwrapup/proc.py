@@ -19,7 +19,9 @@ import html
 import json
 import logging
 import os
+import shutil
 import sys
+import urllib.parse
 from pathlib import Path
 
 from . import __version__
@@ -31,13 +33,20 @@ from .register import XnatContext, close_session, collection_label, fetch_sessio
 
 logger = logging.getLogger(__name__)
 
-#: Roles when the card declares none: the wrapup's own artefacts by role, the tool's output
-#: under DERIVED (everything else). A card names METRICS globs (e.g. ``raw/features.csv``).
+#: The record's fixed resources are the wrapup's own artefacts by role; ``DERIVED`` is the tool's
+#: output tree (kept locally under ``raw/``, published at the resource root). A card names view
+#: roles such as ``METRICS`` with globs relative to that tree (``sub-*/**/*.json``); a view is a
+#: list of DERIVED paths in ``wrapup.json``, never a copy. ``status.json`` (the card's exit trap)
+#: and ``prereq.json`` (record-fetch's manifest, copied in by the card) are written into the
+#: tool's ``/output`` but are not the tool's: they are lifted out of the tree into PROVENANCE.
 PROC_DEFAULT_RESOURCES: dict[str, list[str]] = {
     "REPORT": ["report.html"],
-    "PROVENANCE": ["wrapup.json", STATUS_FILENAME],
+    "PROVENANCE": ["wrapup.json", STATUS_FILENAME, PREREQ_MANIFEST],
     "LOGS": ["logs/*.log"],
 }
+
+#: Files at the root of the tool's output that the card's command line, not the tool, wrote.
+NOT_THE_TOOLS = (STATUS_FILENAME, PREREQ_MANIFEST)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,11 +64,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: Where the tool's tree is, seen from the report: the record page renders ``report.html`` with a
+#: ``<base>`` at ``.../resources/REPORT/files/``, so the tool's own reports are two levels up.
+DERIVED_HREF = "../../DERIVED/files/"
+
+
 def render_report(facts: dict) -> str:
-    """One page: what ran, how it ended, what it wrote, what it said. No numbers interpreted."""
+    """One page: what ran, how it ended, what it wrote, what it said. No numbers interpreted.
+
+    The tool's own HTML reports are linked where they live, inside ``DERIVED`` next to the
+    figures they reference by relative path; a copy elsewhere would render without them."""
     e = html.escape
     rows = "".join(f"<tr><th>{e(k)}</th><td>{e(str(v))}</td></tr>" for k, v in facts["summary"].items())
     files = "".join(f"<li><code>{e(f['path'])}</code> <span class='muted'>{f['size']:,} B</span></li>" for f in facts["files"])
+    tool_reports = "".join(f'<li><a href="{e(DERIVED_HREF + urllib.parse.quote(name, safe="/"))}" target="_blank">{e(name)}</a></li>'
+                           for name in facts.get("tool_reports", []))
+    reports = (f"<h2>The tool's own reports ({len(facts['tool_reports'])})</h2><p class='muted'>Opened from the record's "
+               f"<code>DERIVED</code> resource, where their figures are.</p><ul>{tool_reports}</ul>" if tool_reports else "")
     logs = ""
     for name, tail in facts.get("log_tails", {}).items():
         logs += f"<h3>{e(name)} (last {len(tail)} lines)</h3><pre>{e(chr(10).join(tail))}</pre>"
@@ -69,9 +90,10 @@ def render_report(facts: dict) -> str:
 th{{text-align:left;padding:3px 10px 3px 0;color:#555;vertical-align:top}}td{{padding:3px 0}}pre{{background:#f6f8fa;padding:8px;overflow:auto;max-height:320px;font-size:12px}}
 .ok{{color:#155724}}.bad{{color:#721c24}}.muted{{color:#777;font-size:12px}}</style></head><body>
 <h1>{e(facts['summary']['pipeline'])} {e(facts['summary']['pipeline_version'])} <span class="{status_class}">{e(facts['summary']['run_status'])}</span></h1>
-<p class="muted">Execution report written by proc-wrapup {e(__version__)} at {e(facts['generated'])}. This page interprets nothing: the tool's own output is kept verbatim under <code>raw/</code>.</p>
+<p class="muted">Execution report written by proc-wrapup {e(__version__)} at {e(facts['generated'])}. This page interprets nothing: the tool's own output is on this record's <code>DERIVED</code> resource, unchanged.</p>
 <table>{rows}</table>
-<h2>Files kept ({len(facts['files'])})</h2><ul>{files}</ul>
+{reports}
+<h2>Files in DERIVED ({len(facts['files'])})</h2><ul>{files}</ul>
 {logs}
 </body></html>"""
 
@@ -101,9 +123,14 @@ def run(args: argparse.Namespace) -> int:
     started = dt.datetime.now(dt.timezone.utc)
 
     status = read_status(input_dir)
-    copied = copy_raw_output(input_dir, output_dir)
-    if status is not None and "error" not in status:
-        (output_dir / STATUS_FILENAME).write_text(json.dumps(status, indent=2))
+    # The tool's tree, verbatim, minus the two root files the card's command line put there
+    # (status.json from the exit trap, prereq.json from record-fetch): those are provenance of
+    # the run, not the scientists' dataset, and go to PROVENANCE as they are (plan D20).
+    copied = copy_raw_output(input_dir, output_dir, skip=tuple(input_dir / name for name in NOT_THE_TOOLS))
+    for name in NOT_THE_TOOLS:
+        if (input_dir / name).is_file():
+            shutil.copy2(input_dir / name, output_dir / name)
+    derived_names = [p[len(RAW_DIRNAME) + 1:] for p in copied]
     run_status = run_status_from(status)
 
     # The XNAT context serves log capture as well as publishing; --no-publish suppresses only
@@ -124,7 +151,7 @@ def run(args: argparse.Namespace) -> int:
             if path.exists():
                 lines = path.read_text(errors="replace").splitlines()
                 log_tails[name] = lines[-50:]
-        files = [{"path": p, "size": (output_dir / p).stat().st_size} for p in copied]
+        files = [{"path": name, "size": (output_dir / local).stat().st_size} for name, local in zip(derived_names, copied)]
         summary = {
             "pipeline": args.pipeline, "pipeline_version": args.pipeline_version, "run_status": run_status,
             "exit_code": (status or {}).get("exit_code", 0 if status is None else "unknown"),
@@ -138,11 +165,12 @@ def run(args: argparse.Namespace) -> int:
             "total_seconds": (execution or {}).get("facts", {}).get("total_seconds", ""),
             "prerequisites": ", ".join(f"{q['name']}={q.get('record', {}).get('ID') or q.get('resource', '')}" for q in prerequisites),
         }
-        facts = {"summary": summary, "files": files, "log_tails": log_tails, "generated": started.strftime("%Y-%m-%d %H:%M:%S UTC")}
+        facts = {"summary": summary, "files": files, "log_tails": log_tails, "generated": started.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                 "tool_reports": [name for name in derived_names if name.lower().endswith((".html", ".htm"))]}
         (output_dir / "report.html").write_text(render_report(facts))
         manifest = {"wrapup": "proc-wrapup", "version": __version__, "generated": facts["generated"], "pipeline": args.pipeline,
                     "pipeline_version": args.pipeline_version, "run_status": run_status, "status": status, "execution": execution,
-                    "chain": chain, "prerequisites": prerequisites, "raw_files": copied}
+                    "chain": chain, "prerequisites": prerequisites, "derived_root": RAW_DIRNAME, "raw_files": copied}
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
 
         report = {"model": args.pipeline, "model_version": args.pipeline_version, "scan": args.scan}
@@ -158,18 +186,24 @@ def run(args: argparse.Namespace) -> int:
         if not (args.record_label or "").strip():
             args.record_label = collection_label(args.pipeline, args.scan,
                                                  session_label=fetch_session_label(context) if context else "") + "_record"
-        manifest["analysis_record"] = publish_if_possible(args, output_dir, report, [], False, context=context,
-                                                          facts=record_facts, default_resources=PROC_DEFAULT_RESOURCES)
+        outcome = publish_if_possible(args, output_dir, report, [], False, context=context, facts=record_facts,
+                                      default_resources=PROC_DEFAULT_RESOURCES, derived_root=RAW_DIRNAME, manifest=manifest)
+        # Local paths of what went up (and of the empty files that could not): for the pointer
+        # reduction below, not for the manifest, which already lists the record's names.
+        output_paths = (outcome or {}).pop("output_paths", None) or {}
+        manifest["analysis_record"] = outcome
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
         if args.pointer_only and (manifest.get("analysis_record") or {}).get("id"):
             # The record owns the bytes; the output handler gets a one-file pointer resource.
-            # Only files the record confirmed uploaded are removed: an explicit DERIVED contract
-            # can leave outputs off the record, and those must stay on the session (Codex P1, PR #10).
-            uploaded = {name for names in (manifest["analysis_record"].get("uploaded") or {}).values() for name in names}
+            # Only files the record confirmed uploaded are removed (Codex P1, PR #10), plus the
+            # zero-byte files the record could not take: XNAT refuses them in-body, and a file the
+            # publisher skipped must not be uploaded anywhere else either (0.5.0 left them in the
+            # pointer resource: XNW_FMRIPREP on demo02 carried an empty stderr.log and patchdir.txt).
+            removable = set(output_paths.get("uploaded", [])) | set(output_paths.get("skipped_empty", []))
             kept = []
             for path in sorted(output_dir.rglob("*"), reverse=True):
                 if path.is_file() and path != output_dir / "wrapup.json":      # only the root manifest is the pointer
-                    if path.relative_to(output_dir).as_posix() in uploaded:
+                    if path.relative_to(output_dir).as_posix() in removable:
                         path.unlink()
                     else:
                         kept.append(path.relative_to(output_dir).as_posix())
