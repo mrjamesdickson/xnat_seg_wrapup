@@ -1,5 +1,5 @@
 # record-fetch: the prerequisite-resolving setup command (same package as seg-wrapup).
-ARG SEG_WRAPUP_VERSION=0.6.1
+ARG SEG_WRAPUP_VERSION=0.6.2
 FROM xnatworks/seg-wrapup:${SEG_WRAPUP_VERSION}
-LABEL org.nrg.commands="[{\"name\":\"record-fetch\",\"description\":\"Setup command: resolves the card's prerequisites (XNW_PREREQ_* : accepted/newest/version/explicit record, or a session resource) by REST and materialises them under prereq/<name>/ next to the pass-through input. A missing prerequisite fails the run before any compute.\",\"version\":\"0.6.1\",\"type\":\"docker-setup\",\"image\":\"xnatworks/record-fetch:0.6.1\",\"command-line\":\"record-fetch\",\"reserve-memory\":1024,\"limit-memory\":4096,\"limit-cpu\":2,\"mounts\":[],\"inputs\":[],\"outputs\":[],\"xnat\":[]}]"
+LABEL org.nrg.commands="[{\"name\":\"record-fetch\",\"description\":\"Setup command: resolves the card's prerequisites (XNW_PREREQ_* : accepted/newest/version/explicit record, or a session resource; at subject scope on every session of the subject) by REST and materialises them under prereq/<name>/ next to the pass-through input. A missing prerequisite fails the run before any compute.\",\"version\":\"0.6.2\",\"type\":\"docker-setup\",\"image\":\"xnatworks/record-fetch:0.6.2\",\"command-line\":\"record-fetch\",\"reserve-memory\":1024,\"limit-memory\":4096,\"limit-cpu\":2,\"mounts\":[],\"inputs\":[],\"outputs\":[],\"xnat\":[]}]"
 CMD ["record-fetch"]

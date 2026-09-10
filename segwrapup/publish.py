@@ -42,11 +42,82 @@ from xml.sax.saxutils import escape
 
 from . import __version__
 from .execution import is_reserved
-from .register import LABEL_MAX, XnatContext, auth_headers, collection_label, fetch_session_label
+from .register import LABEL_MAX, XnatContext, auth_headers, collection_label, fetch_target_label, list_subject_sessions
 
 logger = logging.getLogger(__name__)
 
 XSI_TYPE = "analysis:sessionAnalysisData"
+SUBJECT_XSI_TYPE = "analysis:subjectAnalysisData"
+#: The schema caps every ``*_json`` element at 65,536 characters (analysis.xsd); a record that
+#: overruns is refused outright (fmriprep full run and hippunfold on demo02, 2026-09-09).
+RESULTS_JSON_MAX = 65536
+
+
+def xsi_type_for(context: XnatContext) -> str:
+    """The record type for the run's scope: a session assessor, or a subject assessor."""
+    return SUBJECT_XSI_TYPE if context.scope == "subject" else XSI_TYPE
+
+
+def record_urls(context: XnatContext, name: str, by_id: bool = False) -> tuple[str, str]:
+    """``(object_url, files_base)`` for a record named by label (before create) or, with
+    ``by_id``, by accession id (after).
+
+    Session scope: the record is an image assessor of the session and its role resources live
+    under ``out``. Subject scope: the record is a subject assessor, an experiment of its own,
+    reached by label under the subject and by id under ``/data/experiments``, and its role
+    resources are plain experiment resources (no ``out``). Whether ``name`` is an id is stated
+    by the caller, not inferred from its prefix: a label may legitimately start with the site's
+    accession prefix, and the prefix itself is a site setting."""
+    quoted = urllib.parse.quote(name, safe="")
+    if context.scope == "subject":
+        if by_id:
+            url = f"{context.host}/data/experiments/{quoted}"
+        else:
+            url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/subjects/"
+                   f"{urllib.parse.quote(context.subject, safe='')}/experiments/{quoted}")
+        return url, f"{url}/resources"
+    session = urllib.parse.quote(context.session, safe="")
+    url = f"{context.host}/data/experiments/{session}/assessors/{quoted}"
+    return url, f"{url}/out/resources"
+
+
+def created_record_id(response_text: str) -> str:
+    """The accession id XNAT answers a create with (one bare token), or ``""`` when the body
+    is empty or not a token, so the caller keeps addressing the record by label."""
+    token = response_text.strip()
+    return token if token and re.fullmatch(r"[A-Za-z0-9_.-]+", token) else ""
+
+
+def subject_provenance(context: XnatContext, timeout_seconds: float = 60.0) -> dict:
+    """The ``inputs_json`` keys every subject record carries (``docs/SUBJECT-SCOPE.md``): ``scope``,
+    ``subject`` and the subject's ``sessions`` (the tree the App saw). Empty at session scope.
+    When XNAT does not answer the listing, ``sessions`` is ``[]`` with a warning: the record is
+    still published, a reader sees the empty list rather than a missing key."""
+    if context.scope != "subject":
+        return {}
+    try:
+        sessions = list_subject_sessions(context, context.subject, timeout_seconds)
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        logger.warning("could not list the sessions of subject %s (%s); the record will not name them", context.subject, error)
+        sessions = []
+    return {"scope": "subject", "subject": context.subject, "sessions": sessions}
+
+
+def bounded_results_json(summary: dict) -> str:
+    """``results_json`` under the schema cap. The per-role file lists are counts (the files
+    are enumerable on the record's resources); if the view lists alone still overrun, they
+    become counts too and ``truncated`` names what was dropped, so a consumer knows to read
+    ``PROVENANCE/wrapup.json`` for the full mapping."""
+    text = json.dumps(summary)
+    if len(text) <= RESULTS_JSON_MAX:
+        return text
+    reduced = dict(summary)
+    reduced["views"] = {role: len(paths) for role, paths in (summary.get("views") or {}).items()}
+    reduced["truncated"] = ["views"]
+    logger.warning("results_json would be %d characters (cap %d); the view file lists are replaced by counts, "
+                   "the full mapping stays in PROVENANCE/wrapup.json", len(text), RESULTS_JSON_MAX)
+    return json.dumps(reduced)
+
 ANALYSIS_NS = "http://xnatworks.io/analysis"
 XNAT_NS = "http://nrg.wustl.edu/xnat"
 
@@ -316,7 +387,8 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
                      report: dict, results: list[dict], files: dict[str, list],
                      source_dicom_present: bool, when: datetime | None = None,
                      output_dir: Path | None = None, unmeasured_masks: int = 0,
-                     facts: dict | None = None, views: dict[str, list[str]] | None = None) -> str:
+                     facts: dict | None = None, views: dict[str, list[str]] | None = None,
+                     provenance: dict | None = None) -> str:
     """The assessor document XNAT ingests. Fields: type, status, QC, provenance. No measurements.
 
     ``unmeasured_masks`` is how many delivered masks could not be measured: they still ship
@@ -326,7 +398,8 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
     ``config`` (execution facts: node, envelope, phases; stored as ``config_json``) and
     ``wrapup`` (the publishing wrapup's name, ``seg-wrapup`` by default). ``views`` (role ->
     paths inside DERIVED) goes into ``results_json`` so a consumer can resolve ``METRICS`` to
-    files without reading ``wrapup.json``.
+    files without reading ``wrapup.json``. ``provenance`` is :func:`subject_provenance` for a
+    subject record whose caller did not put the session list in ``inputs`` itself.
     """
     facts = facts or {}
     files = _record_files(files, output_dir)
@@ -336,10 +409,15 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
     auto_qc = facts.get("auto_qc") or ("PASS" if results and structures > 0 and unmeasured_masks == 0 else "WARN")
     inputs = facts.get("inputs") or {"scan": context.scan or report.get("scan") or "", "source_dicom": source_dicom_present,
                                      "masks": [r.get("file") for r in results], "unmeasured_masks": unmeasured_masks}
+    if context.scope == "subject":
+        # Every subject record names its scope and subject; the session list comes from
+        # ``provenance`` (publish_if_possible / the failure record) or from the caller's inputs
+        # (proc-wrapup), whichever the caller supplied. The caller's own keys win.
+        inputs = {"scope": "subject", "subject": context.subject, **(provenance or {}), **inputs}
     summary = {"model": report.get("model"), "model_version": report.get("model_version"),
                "structures": structures,
                "total_volume_ml": round(sum(r.get("total_volume_ml", 0) for r in results), 2),
-               "files": {role: [f.name for f in items] for role, items in files.items()},
+               "file_counts": {role: len(items) for role, items in files.items()},
                "views": views or {}}
     output_count = sum(len(v) for v in files.values())
     body = "".join([
@@ -362,13 +440,25 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
         _element("output_file_count", output_count),
         _element("review_state", "PENDING_REVIEW"),
         _element("auto_qc_status", auto_qc),
+        # A scan is a session fact: a subject record has no scans element even if the
+        # environment carried a scan id alongside the subject.
         (f"  <analysis:scans><analysis:scan>{escape(context.scan)}</analysis:scan></analysis:scans>\n"
-         if context.scan else ""),
+         if context.scan and context.scope == "session" else ""),
         _element("inputs_json", json.dumps(inputs)),
         _element("config_json", json.dumps(facts["config"]) if facts.get("config") else None),
         _element("notes", facts.get("notes") or f"Published by {wrapup_name} {__version__} from the {report.get('model')} run"),
-        _element("results_json", json.dumps(summary)),
+        _element("results_json", bounded_results_json(summary)),
     ])
+    if context.scope == "subject":
+        # A subject assessor: owned by the subject, spanning its sessions; no scans element.
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<analysis:SubjectAnalysis xmlns:analysis="{ANALYSIS_NS}" xmlns:xnat="{XNAT_NS}" '
+            f'project="{escape(context.project)}" label="{escape(label)}">\n'
+            f"  <xnat:date>{now.strftime('%Y-%m-%d')}</xnat:date>\n"
+            f"  <xnat:subject_ID>{escape(context.subject)}</xnat:subject_ID>\n"
+            f"{body}</analysis:SubjectAnalysis>\n"
+        )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         f'<analysis:SessionAnalysis xmlns:analysis="{ANALYSIS_NS}" xmlns:xnat="{XNAT_NS}" '
@@ -410,8 +500,10 @@ def _request(context: XnatContext, method: str, url: str, timeout: float) -> int
 
 
 def _relabel(xml: str, label: str) -> str:
-    """The record document carries its label as an attribute; a retried create must match the URL."""
-    return re.sub(r'(<analysis:SessionAnalysis[^>]*?\slabel=")[^"]*(")', lambda m: m.group(1) + escape(label) + m.group(2), xml, count=1)
+    """The record document carries its label as an attribute; a retried create must match the URL.
+    Both record roots are relabelled: a subject record retried under the old label would collide again."""
+    return re.sub(r'(<analysis:(?:Session|Subject)Analysis[^>]*?\slabel=")[^"]*(")',
+                  lambda m: m.group(1) + escape(label) + m.group(2), xml, count=1)
 
 
 def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, list],
@@ -427,17 +519,17 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     uploaded and the empty files skipped, for a wrapup that reduces its output afterwards.
     """
     files = _record_files(files, output_dir)
-    session = urllib.parse.quote(context.session, safe="")
-    label_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(label, safe='')}"
+    xsi_type = xsi_type_for(context)
+    label_url, _ = record_urls(context, label)
     probe = _request(context, "GET", f"{label_url}?format=json", timeout_seconds)
     if probe == 200:
-        raise RuntimeError(f"label {label} already exists on {context.session}; the record is create-only, "
+        raise RuntimeError(f"label {label} already exists on {context.target}; the record is create-only, "
                            "pass a fresh --record-label or let the run stamp one")
     if probe != 404:   # 401/403/5xx: cannot prove the label is free, and PUT would update if it is not
         raise RuntimeError(f"could not verify that label {label} is free (existence check answered HTTP {probe}); "
                            "not creating, because PUT to an existing label would update it")
     create_url = f"{label_url}?inbody=true"
-    logger.info("publishing %s %s", XSI_TYPE, label)
+    logger.info("publishing %s %s", xsi_type, label)
     try:
         status, text = _put(context, create_url, xml.encode(), "application/xml", timeout_seconds)
     except RuntimeError as error:
@@ -449,10 +541,11 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
         retry = f"{label[:LABEL_MAX - 5]}_{secrets.token_hex(2)}"
         logger.warning("label %s is taken elsewhere in the project (HTTP 409); retrying once as %s", label, retry)
         label = retry
-        label_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(label, safe='')}"
+        label_url, _ = record_urls(context, label)
         status, text = _put(context, f"{label_url}?inbody=true", _relabel(xml, retry).encode(), "application/xml", timeout_seconds)
-    record_id = text.strip() if text.strip().startswith("XNAT_") else label
-    record_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(record_id, safe='')}"
+    created_id = created_record_id(text)
+    record_id = created_id or label
+    record_url, files_base = record_urls(context, record_id, by_id=bool(created_id))
     uploaded: dict[str, list[str]] = {}
     skipped_empty: list[str] = []
     output_paths: dict[str, list[str]] = {"uploaded": [], "skipped_empty": []}
@@ -468,7 +561,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
                     output_paths["skipped_empty"].append(upload_name(path, output_dir))
                     continue
                 content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-                url = (f"{record_url}/out/resources/{role}/files/{urllib.parse.quote(name, safe='/')}"
+                url = (f"{files_base}/{role}/files/{urllib.parse.quote(name, safe='/')}"
                        f"?inbody=true&format={urllib.parse.quote(upload_format(path), safe='')}")
                 _put(context, url, path.read_bytes(), content_type, timeout_seconds)
                 uploaded.setdefault(role, []).append(name)
@@ -485,7 +578,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
         raise RuntimeError(f"{error}; {rollback}") from error
     logger.info("analysis record %s published as %s with %d file(s)", label, record_id,
                 sum(len(v) for v in uploaded.values()))
-    return {"xsi_type": XSI_TYPE, "id": record_id, "label": label, "status": status,
+    return {"xsi_type": xsi_type, "id": record_id, "label": label, "status": status,
             "uploaded": uploaded, "skipped_empty": skipped_empty, "url": create_url.split("?")[0],
             "output_paths": output_paths}
 
@@ -519,7 +612,7 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
         return {"error": "XNAT context incomplete"}
     label = (getattr(args, "record_label", "") or "").strip() or collection_label(
         getattr(args, "model", None) or getattr(args, "pipeline", "run"), context.scan or args.scan,
-        session_label=fetch_session_label(context))
+        session_label=fetch_target_label(context))
     # Everything from file collection onwards is guarded: a bad contract glob (an absolute
     # pattern makes Path.glob raise NotImplementedError) must be recorded, not abort delivery
     # of the masks, report and ROI collection that are already on disk.
@@ -537,8 +630,13 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
             manifest["views"] = views
             manifest["ignored_overrides"] = list(contract.ignored_overrides)
             (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
+        # A subject record from a caller that did not list the sessions itself (seg-wrapup) gets
+        # them here; proc-wrapup already put them in facts["inputs"], so no second listing.
+        caller_inputs = (facts or {}).get("inputs") or {}
+        provenance = subject_provenance(context) if "sessions" not in caller_inputs else None
         xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present,
-                               output_dir=output_dir, unmeasured_masks=unmeasured_masks, facts=facts, views=views)
+                               output_dir=output_dir, unmeasured_masks=unmeasured_masks, facts=facts, views=views,
+                               provenance=provenance)
         outcome = publish_record(context, label, xml, files, output_dir=output_dir)
         outcome["skipped_empty"] = sorted(set(outcome.get("skipped_empty") or []) | {f.name for f in empties})
         outcome["output_paths"]["skipped_empty"] = sorted(set(outcome["output_paths"]["skipped_empty"])

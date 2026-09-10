@@ -3,6 +3,7 @@
 A fake XNAT + Container Service on localhost records every request (same style as
 test_publish.py) and answers the container list and log endpoints.
 """
+import html
 import json
 import logging
 import threading
@@ -81,6 +82,14 @@ class _CS(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_CS.containers).encode(), "application/json")
         elif self.path == "/data/experiments/XNAT_E00018?format=json":
             self._send(200, json.dumps({"items": [{"data_fields": {"label": "SESS01"}}]}).encode(), "application/json")
+        elif self.path == "/data/projects/PROJ_1/subjects/XNAT_S09007?format=json":
+            self._send(200, json.dumps({"items": [{"data_fields": {"label": "292"}}]}).encode(), "application/json")
+        elif self.path.startswith("/data/projects/PROJ_1/subjects/XNAT_S09007/experiments?format=json"):
+            rows = [{"ID": "XNAT_E25641", "label": "292_postop", "xsiType": "xnat:mrSessionData"},
+                    {"ID": "XNAT_E25642", "label": "292_preop", "xsiType": "xnat:mrSessionData"}]
+            self._send(200, json.dumps({"ResultSet": {"Result": rows}}).encode(), "application/json")
+        elif "/subjects/XNAT_S09007/experiments/" in self.path and self.path.endswith("?format=json"):
+            self._send(404)                                                   # subject-scope label probe: free
         elif self.path == "/data/workflows/4990?format=json":       # the parent's workflow carries the orchestration fields
             self._send(200, json.dumps({"items": [{"data_fields": {"wrk_workflowData_id": 4990, "status": "Complete", "next_step_id": "42",
                                                                     "current_step_id": "2", "jobid": "job-abc"}}]}).encode(), "application/json")
@@ -98,8 +107,8 @@ class _CS(BaseHTTPRequestHandler):
     def do_PUT(self):
         length = int(self.headers.get("Content-Length", "0"))
         self._record(self.rfile.read(length))
-        self._send(201 if "/assessors/" in self.path and "/out/" not in self.path else 200,
-                   b"XNAT_E77777" if "/out/" not in self.path else b"")
+        create = ("/assessors/" in self.path and "/out/" not in self.path) or ("/subjects/" in self.path and "/resources/" not in self.path)
+        self._send(201 if create else 200, b"XNAT_E77777" if create else b"")
 
     def log_message(self, *args):
         pass
@@ -512,3 +521,30 @@ def test_pointer_only_exempts_only_the_root_manifest(cs, tmp_path, monkeypatch):
     assert proc.main(["--input", str(inp), "--output", str(out), "--pointer-only"]) == 0
     assert [p.relative_to(out).as_posix() for p in out.rglob("*") if p.is_file()] == ["wrapup.json"]
     assert any("DERIVED/files/previous/wrapup.json" in c["path"] for c in handler.calls)   # it went to the record, as the tool laid it out
+
+
+def test_a_subject_scoped_run_publishes_a_subject_record_naming_the_sessions_it_spanned(cs, tmp_path, monkeypatch):
+    """A subject-context wrapper sets PROC_SUBJECT_ID and no PROC_SESSION_ID (0.6.2): the record
+    is an analysis:subjectAnalysisData under the subject, its files are experiment resources,
+    and inputs_json lists the subject's sessions, which the setup assembled into one tree."""
+    host, handler = cs
+    inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
+    out = tmp_path / "out"
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "fmriprep", "PROC_PIPELINE_VERSION": "25.2.5", "PROC_SUBJECT_ID": "XNAT_S09007"})
+    monkeypatch.delenv("PROC_SESSION_ID"); monkeypatch.delenv("PROC_SCAN_ID")
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and "/subjects/" in c["path"] and "/resources/" not in c["path"]]
+    assert len(creates) == 1 and creates[0]["path"].startswith("/data/projects/PROJ_1/subjects/XNAT_S09007/experiments/fmriprep_292_")
+    xml = creates[0]["body"].decode()
+    assert xml.startswith('<?xml version="1.0" encoding="UTF-8"?>\n<analysis:SubjectAnalysis ')
+    assert "<xnat:subject_ID>XNAT_S09007</xnat:subject_ID>" in xml and "imageSession_ID" not in xml and "<analysis:scans>" not in xml
+    inputs = json.loads(html.unescape(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
+    assert inputs["scope"] == "subject" and inputs["subject"] == "XNAT_S09007"
+    assert inputs["sessions"] == [{"ID": "XNAT_E25641", "label": "292_postop"}, {"ID": "XNAT_E25642", "label": "292_preop"}]
+    uploads = [c["path"] for c in handler.calls if c["method"] == "PUT" and "/resources/" in c["path"]]
+    assert uploads and all(u.startswith("/data/experiments/XNAT_E77777/resources/") for u in uploads)
+    assert not [c for c in handler.calls if "/assessors/" in c["path"] or "/out/" in c["path"]]
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["scope"] == "subject" and [s["label"] for s in manifest["sessions"]] == ["292_postop", "292_preop"]
+    assert manifest["analysis_record"]["xsi_type"] == "analysis:subjectAnalysisData"
+    assert "292_postop, 292_preop" in (out / "report.html").read_text()

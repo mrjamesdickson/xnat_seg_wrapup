@@ -36,25 +36,46 @@ class XnatContext:
     user: str
     password: str
     project: str
+    #: The session the run belongs to (session scope), or empty at subject scope.
     session: str
     scan: str = ""
+    #: The subject the run belongs to at subject scope (a subject-context launch whose BIDS
+    #: tree spans every session of the subject); records are then subject assessors.
+    subject: str = ""
     #: JSESSIONID from ``open_session``; empty means Basic auth per request.
     jsession: str = ""
     #: True once a login was attempted, so a failed login is not retried on every request.
     session_tried: bool = False
 
+    @property
+    def scope(self) -> str:
+        """``session`` or ``subject``: what the run's records hang from."""
+        return "subject" if self.subject and not self.session else "session"
+
+    @property
+    def target(self) -> str:
+        """The XNAT id the run belongs to: the session, or the subject at subject scope."""
+        return self.session or self.subject
+
     @classmethod
     def from_env(cls, environ: dict | None = None) -> "XnatContext | None":
-        """Build the context from the container environment, or None with a log line saying what is missing."""
+        """Build the context from the container environment, or None with a log line saying what is missing.
+
+        A run is session-scoped (``SEG_SESSION_ID`` / ``PROC_SESSION_ID``) or subject-scoped
+        (``SEG_SUBJECT_ID`` / ``PROC_SUBJECT_ID``, no session id): a subject-context wrapper
+        sets the subject variable and leaves the session one unset."""
         env = os.environ if environ is None else environ
         required = {
             "XNAT_HOST": env.get("XNAT_HOST", ""),
             "XNAT_USER": env.get("XNAT_USER", ""),
             "XNAT_PASS": env.get("XNAT_PASS", ""),
             "SEG_PROJECT": env.get("SEG_PROJECT", "") or env.get("PROC_PROJECT", ""),
-            "SEG_SESSION_ID": env.get("SEG_SESSION_ID", "") or env.get("PROC_SESSION_ID", ""),
         }
+        session = (env.get("SEG_SESSION_ID", "") or env.get("PROC_SESSION_ID", "")).strip()
+        subject = (env.get("SEG_SUBJECT_ID", "") or env.get("PROC_SUBJECT_ID", "")).strip()
         missing = [name for name, value in required.items() if not value.strip()]
+        if not session and not subject:
+            missing.append("SEG_SESSION_ID (or SEG_SUBJECT_ID for a subject-scoped run)")
         if missing:
             logger.info("ROI registration skipped (and publishing); XNAT context missing %s", ", ".join(missing))
             return None
@@ -63,8 +84,9 @@ class XnatContext:
             user=required["XNAT_USER"],
             password=required["XNAT_PASS"],
             project=required["SEG_PROJECT"].strip(),
-            session=required["SEG_SESSION_ID"].strip(),
+            session=session,
             scan=(env.get("SEG_SCAN_ID", "") or env.get("PROC_SCAN_ID", "")).strip(),
+            subject=subject,
         )
 
 
@@ -141,6 +163,45 @@ def collection_label(model_name: str, scan: str, when: datetime | None = None, s
     model = _LABEL_SAFE.sub("_", model_name).strip("_") or "SEG"
     model = model[:max(LABEL_MAX - len(suffix) - 1, 1)].rstrip("_") or "SEG"
     return f"{model}_{suffix}"[:LABEL_MAX]
+
+
+def fetch_target_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:
+    """The label of what the run belongs to: the session's, or the subject's at subject scope."""
+    if context.scope == "subject":
+        return fetch_subject_label(context, timeout_seconds)
+    return fetch_session_label(context, timeout_seconds)
+
+
+def fetch_subject_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:
+    """The subject's label for ``context.subject`` (``XNAT_S09007`` -> ``292``); the id when XNAT
+    does not answer, so the record label is still unique."""
+    url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/subjects/"
+           f"{urllib.parse.quote(context.subject, safe='')}?format=json")
+    request = urllib.request.Request(url, headers=auth_headers(context))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode())
+        label = str(payload["items"][0]["data_fields"].get("label") or "").strip()
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError) as error:
+        logger.warning("could not read the label of subject %s (%s); the record label carries the id instead", context.subject, error)
+        return context.subject
+    return label or context.subject
+
+
+def list_subject_sessions(context: XnatContext, subject: str, timeout_seconds: float = 60.0) -> list[dict]:
+    """``[{"ID", "label"}]`` of the subject's image sessions, by label. Project-scoped: the
+    site-wide ``/data/subjects/<id>/experiments`` returns the subject document, not rows.
+    Raises (URLError/OSError/ValueError) when XNAT does not answer; the caller decides what a
+    record without its session list means."""
+    url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/subjects/"
+           f"{urllib.parse.quote(subject, safe='')}/experiments?format=json&columns=ID,label,xsiType")
+    request = urllib.request.Request(url, headers=auth_headers(context))
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        payload = json.loads(response.read().decode())
+    rows = payload.get("ResultSet", {}).get("Result", []) if isinstance(payload, dict) else []
+    sessions = [{"ID": r.get("ID"), "label": r.get("label") or r.get("ID")} for r in rows
+                if r.get("ID") and "SessionData" in str(r.get("xsiType") or "SessionData")]
+    return sorted(sessions, key=lambda s: s["label"])
 
 
 def fetch_session_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:

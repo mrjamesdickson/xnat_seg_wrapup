@@ -217,3 +217,28 @@ def test_viewer_sidecars_no_companion_for_byte_labels(tmp_path):
     assert "case_seg.tsv" in names
     assert not any(n.endswith("_uint8.nii.gz") for n in names)  # control
     assert "uint8_companions" not in json.loads((out / "wrapup.json").read_text())
+
+
+def test_register_if_possible_skips_roi_registration_at_subject_scope(tmp_path, caplog, monkeypatch):
+    """Codex on PR #15: the ROI collection API is per session; a subject-scoped run used to PUT to
+    ``/sessions//collections/...`` and record a spurious ROI error in the manifest."""
+    import logging
+    from types import SimpleNamespace
+    from segwrapup import register
+    seg = tmp_path / "seg.dcm"; seg.write_bytes(b"x")
+
+    def must_not_be_called(*args, **kwargs):
+        raise AssertionError("register_roi_collection must not run at subject scope")
+    monkeypatch.setattr(register, "register_roi_collection", must_not_be_called)
+    env = {"XNAT_HOST": "http://x", "XNAT_USER": "u", "XNAT_PASS": "p", "PROC_PROJECT": "P", "PROC_SUBJECT_ID": "XNAT_S1"}
+    context = register.XnatContext.from_env(env)
+    assert context is not None and context.scope == "subject"
+    args = SimpleNamespace(no_register=False, roi_label="", model="m", scan="")
+    with caplog.at_level(logging.INFO):
+        assert cli.register_if_possible(args, seg, context) is None
+    assert "ROI registration skipped: subject-scoped run (XNAT_S1)" in caplog.text
+    session_context = register.XnatContext.from_env({**env, "PROC_SESSION_ID": "XNAT_E1"})
+    assert session_context.scope == "session"     # control: a session-scoped run still reaches registration
+    monkeypatch.setattr(register, "register_roi_collection", lambda *a, **k: {"label": "ok"})
+    monkeypatch.setattr(register, "fetch_target_label", lambda c: "SESS")
+    assert cli.register_if_possible(args, seg, session_context) == {"label": "ok"}

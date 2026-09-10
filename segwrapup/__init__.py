@@ -5,4 +5,4 @@ and produces the volumetrics report, viewer label files, and (when the source
 DICOM is available) a DICOM SEG, in one consistent resource layout.
 """
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"

@@ -244,7 +244,7 @@ def run(args: argparse.Namespace) -> int:
 
 def register_if_possible(args: argparse.Namespace, seg_path: Path, context=None) -> dict | None:
     """Register the SEG as an ROI collection when the parent passed the XNAT context. Never raises."""
-    from .register import XnatContext, collection_label, fetch_session_label, register_roi_collection
+    from .register import XnatContext, collection_label, fetch_target_label, register_roi_collection
 
     if args.no_register:
         logger.info("ROI registration skipped by flag")
@@ -252,8 +252,13 @@ def register_if_possible(args: argparse.Namespace, seg_path: Path, context=None)
     context = context or XnatContext.from_env()
     if context is None:
         return None
+    if context.scope == "subject":
+        # The ROI collection API is per session; a subject-scoped run has no session to
+        # register under, so the SEG stays in the resource and no failed PUT is attempted.
+        logger.info("ROI registration skipped: subject-scoped run (%s) has no session to register the SEG under", context.subject)
+        return None
     label = args.roi_label.strip() or collection_label(args.model, context.scan or args.scan,
-                                                       session_label=fetch_session_label(context))
+                                                       session_label=fetch_target_label(context))
     try:
         return register_roi_collection(context, seg_path, label)
     except RuntimeError as error:
