@@ -127,7 +127,7 @@ XNAT_NS = "http://nrg.wustl.edu/xnat"
 DEFAULT_RESOURCES: dict[str, list[str]] = {
     "METRICS": ["volumes.json", "volumes.csv", "segmentation.tsv"],
     "REPORT": ["report.html"],
-    "PROVENANCE": ["wrapup.json", "labels.txt", "labels.ctbl"],
+    "PROVENANCE": ["wrapup.json", "labels.txt", "labels.ctbl", "card/**/*"],
 }
 
 #: The role for the data output itself (design §6; plan D16: the derivatives dataset). It holds

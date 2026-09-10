@@ -341,7 +341,7 @@ def test_unmet_prerequisite_is_recorded_as_a_failed_record_with_the_reason(xnat,
         assert prereq.main(["--input", str(inp), "--output", str(out)]) == 3
     m = json.loads((out / "prereq.json").read_text())
     assert m["analysis_record"]["id"] == "XNAT_E77" and m["analysis_record"]["label"].startswith("fake-recon_S1_")
-    assert m["analysis_record"]["uploaded"] == {"PROVENANCE": ["prereq.json"]}
+    assert m["analysis_record"]["uploaded"] == {"PROVENANCE": ["prereq.json", "card/card.json"]}   # the certificate, even for a run that never started (D27)
     create = next(c for c in handler.calls if c[0] == "PUT" and "/out/" not in c[1])
     xml = create[3].decode()
     assert create[1].startswith("/data/experiments/XNAT_E1/assessors/fake-recon_S1_") and create[1].endswith("_record?inbody=true")
@@ -527,6 +527,7 @@ def test_a_subject_run_reports_which_sessions_lack_the_prerequisite_and_records_
     manifest = json.loads((out / "prereq.json").read_text())
     got = manifest["prerequisites"][0]
     assert "on every session of subject XNAT_S1; 1 of 2 unmet: S2:" in got["error"] and "S1" not in got["error"].split("unmet:")[1].split(":")[0]
+    assert got["error"].endswith("; nor do the subject's 1 record(s)")           # the subject's own records were tried first (0.6.3)
     assert not (out / "prereq" / "qc").exists() or not any((out / "prereq" / "qc").rglob("*")), "nothing is downloaded for an unmet prerequisite"
     creates = [c for c in server.calls if c[0] == "PUT" and "/subjects/XNAT_S1/experiments/" in c[1] and "?inbody=true" in c[1]]
     assert len(creates) == 1 and b"<analysis:SubjectAnalysis" in creates[0][3] and b"<xnat:subject_ID>XNAT_S1</xnat:subject_ID>" in creates[0][3]
@@ -537,6 +538,23 @@ def test_a_subject_run_reports_which_sessions_lack_the_prerequisite_and_records_
     inputs = json.loads(html.unescape(body.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
     assert inputs["scope"] == "subject" and inputs["subject"] == "XNAT_S1" and inputs["stage"] == "setup"
     assert inputs["sessions"] == [{"ID": "XNAT_E1", "label": "S1"}, {"ID": "XNAT_E2", "label": "S2"}]
+
+
+def test_a_subject_run_takes_the_subjects_own_record_before_per_session_records(xnat, tmp_path, monkeypatch, caplog):
+    """0.6.3 (plan D26 consumers): xcp-d at subject scope after a subject-scoped fMRIPrep. The
+    session-scoped prerequisite is satisfied by the subject's own record, one dataset spanning
+    every session, laid out at prereq/<name>/ (not per session); the sessions are not even listed."""
+    host, server = xnat
+    _subject_run(monkeypatch)
+    inp, out = tmp_path / "in", tmp_path / "out"; inp.mkdir()
+    monkeypatch.setenv("XNW_PREREQ_PREPROC", "pipeline=fmriprep;accepted=true;role=DERIVED")
+    with caplog.at_level(logging.INFO):
+        assert prereq.main(["--input", str(inp), "--output", str(out), "--no-passthrough"]) == 0
+    got = json.loads((out / "prereq.json").read_text())["prerequisites"][0]
+    assert got["record"]["ID"] == "XNAT_E50" and got["record"]["scope"] == "subject" and "sessions" not in got and got["files"] == 2
+    assert _read(out, "preproc/sub-292/ses-preop/func/bold.nii.gz") == b"data:bold.nii.gz"
+    assert "subject record XNAT_E50 (fmriprep 25.2.5) covers every session of subject XNAT_S1" in caplog.text
+    assert not any(c[0] == "GET" and "xsiType=analysis:sessionAnalysisData" in c[1] for c in server.calls), "no per-session listing was needed"
 
 
 def test_a_subject_run_finds_a_subject_scoped_prerequisite_on_the_subject_itself(xnat, tmp_path, monkeypatch):

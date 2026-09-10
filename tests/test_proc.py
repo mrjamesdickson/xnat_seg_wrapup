@@ -191,8 +191,13 @@ def test_proc_wrapup_keeps_everything_captures_logs_reports_and_publishes(cs, tm
     inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
     out = tmp_path / "out"
     set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "PyRadiomics", "PROC_PIPELINE_VERSION": "3.1"})
+    from test_card import bundle
+    monkeypatch.setenv("XNW_CARD_BUNDLE", bundle())
     assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
 
+    # the certificate of the run (D27): the card at the adopted revision, under card/, never in DERIVED
+    assert (out / "card" / "metadata.json").exists() and json.loads((out / "card" / "card.json").read_text())["wrapup"] == "proc-wrapup"
+    assert not (out / "raw" / "card").exists()
     # everything the tool wrote, verbatim, under raw/; the DICOM copy not
     assert (out / "raw" / "features.csv").exists() and (out / "raw" / "sub" / "log.txt").exists()
     assert not (out / "raw" / ".source_dicom").exists()
@@ -219,6 +224,8 @@ def test_proc_wrapup_keeps_everything_captures_logs_reports_and_publishes(cs, tm
     uploads = [c["path"].split("/out/resources/")[1].split("?")[0] for c in handler.calls if "/out/resources/" in c["path"]]
     assert "DERIVED/files/features.csv" in uploads and "REPORT/files/report.html" in uploads
     assert "PROVENANCE/files/wrapup.json" in uploads and "PROVENANCE/files/status.json" in uploads
+    assert "PROVENANCE/files/card/metadata.json" in uploads and "PROVENANCE/files/card/card.json" in uploads and "PROVENANCE/files/card/LICENSE" in uploads
+    assert manifest["card"]["card_id"] == "pyradiomics" and manifest["card"]["bundle_files"] == ["LICENSE", "README.md", "command.json", "metadata.json"]
     assert "LOGS/files/logs/stdout.log" in uploads and "DERIVED/files/sub/log.txt" in uploads
     assert not [u for u in uploads if u.startswith("METRICS/") or "/raw/" in u]     # METRICS is a view; DERIVED is the tree at its root
     assert manifest["analysis_record"]["id"] == "XNAT_E77777"

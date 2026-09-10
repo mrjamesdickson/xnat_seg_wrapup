@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.3 (unreleased, local snapshot 2026-09-10)
+
+The consumers' subject scope, the fetch image label, and the card copy (plan D26 consumers, D27).
+
+- **Either-scope prerequisites at subject scope.** A subject-scoped run with a session-scoped record prerequisite takes the subject's own record when one satisfies it (a subject-level fMRIPrep is one dataset spanning every session, laid out at `prereq/<name>/`, what xcp-d at subject scope reads), and only otherwise needs it on every session of the subject (per-session layout, unchanged). The unmet message names both (`; nor do the subject's N record(s)`). This is what the consumer cards (xcp-d, fmripost-aroma, giga-connectome, bidsmreye, qsirecon) need before their `-subject` wrappers.
+- **`record-fetch-subject` in the image label.** `Dockerfile.fetch` advertises both setup commands, generated from `commands/record-fetch.json` and `commands/record-fetch-subject.json`; label tests now cover the fetch and proc images as well as seg-wrapup (the proc JSON's description had drifted from its label; the label's wording is kept).
+- **The card copy on every record (D27).** `segwrapup.card`: `XNW_CARD_BUNDLE` (base64 tar of the card's `metadata.json`, `README.md`, `command.json`, `LICENSE`, embedded by the adopt tool) is laid out under `card/` with `card/card.json` (card id and revision, `XNW_CARD_URL`, image and digest, wrapup and version, file list, sha256); `card/**/*` joins both wrapups' `PROVENANCE` defaults, and record-fetch's failure record attaches it too. Only regular files at safe relative paths are written; 4 MB cap; a malformed bundle is logged and recorded as `bundle_error`, never fatal. Without a bundle the record gets `card.json` alone. `wrapup.json` carries the summary as `card`.
+- 212 tests (13 new; 1 assertion extended: the failure record's uploads now include `card/card.json`; none removed).
+
+Cards: re-pin to 0.6.3 and let the adopt tool set `XNW_CARD_BUNDLE`/`XNW_CARD_URL` (workshop side, next). Subject wrappers for the consumers follow.
+
 ## 0.6.2 (2026-09-10)
 
 Subject scope, and the results_json cap. Plan D23/D26: every BIDS App card runs at session and at subject scope; a subject-context wrapper (xnat2bids-setup 2.0 assembling every session of the subject) needs records and a prerequisite gate of its own.

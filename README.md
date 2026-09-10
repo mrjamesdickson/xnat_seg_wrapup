@@ -30,7 +30,7 @@ run**, and since 0.6.0 there are exactly four of them (`docs/ROLES-AS-VIEWS.md`)
 |---|---|---|---|
 | `DERIVED` | the tool's output, complete, unchanged, at the resource root; never a wrapup file | the delivered mask(s), their `.tsv` sidecars and 8-bit companions, `volumes.json`/`volumes.csv`, the DICOM SEG when kept, and the tool's other output under `raw/` | the tool's whole `/output` tree as the tool laid it out (`dataset_description.json`, `sub-<label>/...`) |
 | `REPORT` | the wrapup's `report.html` and nothing else | volumetrics report | did-it-run report, linking the tool's own HTML reports inside `DERIVED` |
-| `PROVENANCE` | what the wrapup knows about the run | `wrapup.json`, `labels.txt`, `labels.ctbl` | `wrapup.json`, `status.json`, `prereq.json` |
+| `PROVENANCE` | what the wrapup knows about the run, and the card copy `card/` (since 0.6.3) | `wrapup.json`, `labels.txt`, `labels.ctbl`, `card/` | `wrapup.json`, `status.json`, `prereq.json`, `card/` |
 | `LOGS` | the parent container's captured stdout/stderr | – | `logs/stdout.log`, `logs/stderr.log` |
 
 `METRICS` is **not a resource**: it is a *view*, a list of paths inside `DERIVED` (seg-wrapup:
@@ -99,7 +99,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.6.2"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.6.3"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -212,8 +212,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.6.2 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.6.2
+docker build -t xnatworks/seg-wrapup:0.6.3 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.6.3
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
@@ -292,13 +292,32 @@ session, where the reviewer looks. A FAILED record never satisfies a prerequisit
 A subject-scoped wrapper (plan D26: `<app>-subject` beside `<app>-session`) mounts the project
 archive through a derived Project input, because a Subject has no directory of its own. Its
 records mount is a second Project input carrying `via-setup-command
-xnatworks/record-fetch:0.6.2:record-fetch-subject`, which is `record-fetch --no-passthrough`
+xnatworks/record-fetch:0.6.3:record-fetch-subject`, which is `record-fetch --no-passthrough`
 (`commands/record-fetch-subject.json`, the same image): the prerequisites are resolved on every
 session of the subject and written to `prereq/<name>/<session label>/`, and nothing is passed
 through, since passing the archive through would copy it. Register it beside `record-fetch`
-(`install_workflow.py --setup commands/record-fetch-subject.json`); it is not in the image label
-of 0.6.2 (the image was published before the command existed) and joins the label at the next
-image release.
+(`install_workflow.py --setup commands/record-fetch-subject.json`); since 0.6.3 it is in the
+image label beside `record-fetch`, so a site that registers commands from the image gets both.
+
+At subject scope a session-scoped record prerequisite is satisfied **either** by the subject's
+own record (since 0.6.3: a subject-level run of the pipeline is one dataset spanning every
+session, laid out at `prereq/<name>/`, which is what a subject-scoped consumer such as xcp-d
+reads) **or**, when the subject has none, by a record on every session of the subject
+(per-session layout `prereq/<name>/<session label>/`). The subject's record is tried first;
+the unmet message names both.
+
+## The card copy on every record (since 0.6.3, plan D27)
+
+Every record carries the card it was run from, the certificate of the run: `PROVENANCE/card/`
+holds the card's `metadata.json`, `README.md`, `command.json` and `LICENSE` at the adopted
+revision, plus `card.json` saying what the run actually used (card id and revision, image and
+digest, wrapup and version, the bundle's file list and sha256, `card_url`). The adopt tool
+embeds the bundle in the command as `XNW_CARD_BUNDLE` (base64 tar, gzipped or plain, a few KB)
+and points `XNW_CARD_URL` at the registry's readable original; the wrapup needs no network, and
+the copy is exactly the revision that ran. seg-wrapup, proc-wrapup and record-fetch's failure
+record all write it. Without a bundle (an older card) the record still gets `card.json`; a
+malformed bundle (not base64, not a tar, a member outside `card/`, over 4 MB) is logged,
+recorded as `bundle_error` in `card.json`, and never fails the run.
 
 ## proc-wrapup: the generic wrapup (since 0.4.0)
 

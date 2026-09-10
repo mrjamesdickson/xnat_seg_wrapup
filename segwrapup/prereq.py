@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import __version__
+from .card import CARD_DIRNAME, write_card_copy
 from .publish import FIXED_ROLES, RecordContract, build_record_xml, publish_record, subject_provenance
 from .register import XnatContext, auth_headers, close_session, collection_label, fetch_target_label, list_subject_sessions
 
@@ -434,11 +435,13 @@ class Resolution:
 def resolve(context: XnatContext, prereqs: list[Prerequisite], records: list[dict] | None = None) -> list[Resolution]:
     """Decide, without downloading, which record or resource satisfies each prerequisite.
 
-    Scope rules (0.6.2). A session-scoped run looks at its own session's records first and,
-    when none satisfies a session-scoped prerequisite, at the subject's records (a subject-level
-    fMRIPrep covers each of its sessions); ``scope=subject`` looks only at the subject's records.
-    A subject-scoped run needs a session-scoped prerequisite on every session of the subject
-    (the setup assembled them all) and finds ``scope=subject`` ones on the subject itself.
+    Scope rules (0.6.2, either-scope at subject level since 0.6.3). A session-scoped run looks
+    at its own session's records first and, when none satisfies a session-scoped prerequisite,
+    at the subject's records (a subject-level fMRIPrep covers each of its sessions);
+    ``scope=subject`` looks only at the subject's records. A subject-scoped run takes the
+    subject's own record when one satisfies a session-scoped prerequisite (one dataset spanning
+    every session, laid out at ``prereq/<name>/``), else needs it on every session of the
+    subject (per-session layout), and finds ``scope=subject`` ones on the subject itself.
     """
     if records is None and context.scope == "session" and any(not p.is_resource and p.scope == "session" for p in prereqs):
         records = list_session_records(context)          # only when a session-record prerequisite needs it (Codex P2, PR #10)
@@ -471,6 +474,17 @@ def resolve(context: XnatContext, prereqs: list[Prerequisite], records: list[dic
                                   error=why.replace("this session", f"subject {subject or '?'}") if why else ""))
             continue
         if not p.is_resource and context.scope == "subject":
+            # 0.6.3: the subject's own record first. A subject-level run of the pipeline is one
+            # dataset spanning every session (sub-X/ses-*), which is what a subject-scoped consumer
+            # reads at prereq/<name>/; only without one must every session carry its own record.
+            if subject_records is None:
+                subject_records = list_records(context, "subject", {subject}) if subject else []
+            own, _ = choose_record(p, subject_records)
+            if own is not None:
+                logger.info("prerequisite %s: subject record %s (%s %s) covers every session of subject %s",
+                            p.name, own.get("ID"), own.get("pipeline_name"), own.get("pipeline_version"), subject)
+                out.append(Resolution(name=p.name, kind="record", record=own, role=p.role))
+                continue
             # Every session of the subject must satisfy it: the tree the App sees spans them all.
             subject_sessions = list_subject_sessions(context, subject) if subject_sessions is None else subject_sessions
             if not session_records_by_owner and subject_sessions:
@@ -489,7 +503,8 @@ def resolve(context: XnatContext, prereqs: list[Prerequisite], records: list[dic
                 error = f"needs {p.describe()}; subject {subject} has no image sessions"
             elif unmet:
                 error = (f"needs {p.describe()} on every session of subject {subject}; "
-                         f"{len(unmet)} of {len(subject_sessions)} unmet: " + " | ".join(unmet))
+                         f"{len(unmet)} of {len(subject_sessions)} unmet: " + " | ".join(unmet)
+                         + (f"; nor do the subject's {len(subject_records)} record(s)" if subject_records else ""))
             out.append(Resolution(name=p.name, kind="record", record=newest, role=p.role, per_session=per_session, error=error))
             continue
         if p.is_resource and p.scope == "scan":
@@ -628,7 +643,9 @@ def publish_failure_record(context: XnatContext, resolutions: list["Resolution"]
                        f"Nothing was computed; recorded at setup by record-fetch {__version__}."),
              "inputs": {"scan": context.scan, "stage": "setup", "prerequisites": [r.as_dict() for r in resolutions],
                         **subject_provenance(context)}}
-    files = {"PROVENANCE": [output_dir / MANIFEST]}
+    card = write_card_copy(output_dir, "record-fetch", extra={"stage": "setup"})
+    files = {"PROVENANCE": [output_dir / MANIFEST, *sorted(p for p in (output_dir / CARD_DIRNAME).rglob("*") if p.is_file())]}
+    facts["inputs"]["card"] = card
     try:
         xml = build_record_xml(context, contract, label, {"model": pipeline, "model_version": version, "scan": context.scan},
                                [], files, False, output_dir=output_dir, facts=facts)

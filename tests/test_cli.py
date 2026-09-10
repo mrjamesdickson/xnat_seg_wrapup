@@ -244,6 +244,35 @@ def test_register_if_possible_skips_roi_registration_at_subject_scope(tmp_path, 
     assert cli.register_if_possible(args, seg, session_context) == {"label": "ok"}
 
 
+def _label_commands(dockerfile):
+    label_line = next(line for line in dockerfile.read_text().splitlines() if line.startswith("LABEL org.nrg.commands="))
+    return json.loads(json.loads(label_line[len("LABEL org.nrg.commands="):].strip()))
+
+
+def test_record_fetch_image_label_carries_both_setup_commands():
+    """Since 0.6.3 the record-fetch image advertises record-fetch and record-fetch-subject, so a
+    site that registers commands from the image label gets the subject-scope setup too."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    fetch = json.loads((root / "commands" / "record-fetch.json").read_text())
+    subject = json.loads((root / "commands" / "record-fetch-subject.json").read_text())
+    assert _label_commands(root / "Dockerfile.fetch") == [fetch, subject]
+    version = next(line.split('"')[1] for line in (root / "pyproject.toml").read_text().splitlines() if line.startswith("version = "))
+    assert fetch["version"] == subject["version"] == version and fetch["image"] == f"xnatworks/record-fetch:{version}"
+    assert f"SEG_WRAPUP_VERSION={version}" in (root / "Dockerfile.fetch").read_text()
+
+
+def test_proc_wrapup_image_label_matches_its_command_json():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    command = json.loads((root / "commands" / "proc-wrapup.json").read_text())
+    assert _label_commands(root / "Dockerfile.proc") == [command]
+    version = next(line.split('"')[1] for line in (root / "pyproject.toml").read_text().splitlines() if line.startswith("version = "))
+    assert command["version"] == version and command["image"] == f"xnatworks/proc-wrapup:{version}"
+
+
 def test_record_fetch_subject_command_is_record_fetch_without_passthrough():
     """The subject-scope setup (plan D26): the same image and version as record-fetch, the same
     command apart from name, description and the --no-passthrough flag, so the two cannot drift."""

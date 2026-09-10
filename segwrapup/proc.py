@@ -26,6 +26,7 @@ import urllib.parse
 from pathlib import Path
 
 from . import __version__
+from .card import write_card_copy
 from .execution import (RAW_DIRNAME, STATUS_FILENAME, chain_from_workflow, copy_raw_output, fetch_parent_logs,
                         own_workflow_id, read_status, run_status_from)
 from .prereq import MANIFEST as PREREQ_MANIFEST
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 #: tool's ``/output`` but are not the tool's: they are lifted out of the tree into PROVENANCE.
 PROC_DEFAULT_RESOURCES: dict[str, list[str]] = {
     "REPORT": ["report.html"],
-    "PROVENANCE": ["wrapup.json", STATUS_FILENAME, PREREQ_MANIFEST],
+    "PROVENANCE": ["wrapup.json", STATUS_FILENAME, PREREQ_MANIFEST, "card/**/*"],
     "LOGS": ["logs/*.log"],
 }
 
@@ -134,6 +135,8 @@ def run(args: argparse.Namespace) -> int:
             shutil.copy2(input_dir / name, output_dir / name)
     derived_names = [p[len(RAW_DIRNAME) + 1:] for p in copied]
     run_status = run_status_from(status)
+    # The certificate of the run (plan D27): the card at the adopted revision, under card/.
+    card = write_card_copy(output_dir, "proc-wrapup")
 
     # The XNAT context serves log capture as well as publishing; --no-publish suppresses only
     # the record (publish_if_possible checks the flag), never the execution state.
@@ -183,7 +186,7 @@ def run(args: argparse.Namespace) -> int:
         manifest = {"wrapup": "proc-wrapup", "version": __version__, "generated": facts["generated"], "pipeline": args.pipeline,
                     "pipeline_version": args.pipeline_version, "run_status": run_status, "status": status, "execution": execution,
                     "chain": chain, "prerequisites": prerequisites, "derived_root": RAW_DIRNAME, "raw_files": copied,
-                    "scope": context.scope if context else "session", "sessions": sessions}
+                    "scope": context.scope if context else "session", "sessions": sessions, "card": card}
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
 
         report = {"model": args.pipeline, "model_version": args.pipeline_version, "scan": args.scan}

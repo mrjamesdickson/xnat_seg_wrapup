@@ -1,9 +1,9 @@
 {
   "name": "record-fetch-subject",
   "description": "Setup command for a subject-scoped wrapper: resolves the card's prerequisites on every session of the subject (XNW_PREREQ_*, PROC_SUBJECT_ID) and materialises them under prereq/<name>/<session label>/ in its mount. Runs record-fetch --no-passthrough: the mount is the project archive (a Subject cannot feed a mount), which must not be copied through. A missing prerequisite fails the run before any compute.",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "type": "docker-setup",
-  "image": "xnatworks/record-fetch:0.6.2",
+  "image": "xnatworks/record-fetch:0.6.3",
   "command-line": "record-fetch --no-passthrough",
   "reserve-memory": 1024,
   "limit-memory": 4096,

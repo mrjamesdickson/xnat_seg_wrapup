@@ -30,11 +30,14 @@ either duplicate files or leave each session record incomplete.
 
 ## Prerequisites at subject scope
 
-- A session-scoped record prerequisite (the default, e.g. the BIDS conversion) must be
-  satisfied on **every** image session of the subject, because the setup assembled them all.
-  The records are materialised under `prereq/<name>/<session label>/` and `prereq.json`
-  lists them per session; `record` is the newest of them. One unmet session fails the gate
-  and the message names which.
+- A session-scoped record prerequisite (the default, e.g. the BIDS conversion) is satisfied
+  either way (0.6.3): by the subject's **own** record when one fits (a subject-level run of the
+  pipeline is one dataset spanning every session; it lands at `prereq/<name>/` and `prereq.json`
+  says `scope: subject`), or else on **every** image session of the subject, because the setup
+  assembled them all: the records are materialised under `prereq/<name>/<session label>/` and
+  `prereq.json` lists them per session, `record` being the newest. The subject's record is
+  tried first, so a consumer of a subject-scoped producer reads one tree. One unmet session
+  fails the gate and the message names which, and how many subject records were tried.
 - A session resource prerequisite (`resource=BIDS`) is gathered from every session the same
   way. A scan resource prerequisite is refused: a subject run has no scan.
 - `scope=subject` on a record prerequisite selects a subject record of the subject (xcp-d
