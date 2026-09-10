@@ -287,6 +287,19 @@ record on this session`), the full resolution in `inputs_json` and `prereq.json`
 `PROVENANCE`. The Container Service alone only says `Failed (Setup)`; the record says why, on the
 session, where the reviewer looks. A FAILED record never satisfies a prerequisite.
 
+### record-fetch-subject (since 0.6.2)
+
+A subject-scoped wrapper (plan D26: `<app>-subject` beside `<app>-session`) mounts the project
+archive through a derived Project input, because a Subject has no directory of its own. Its
+records mount is a second Project input carrying `via-setup-command
+xnatworks/record-fetch:0.6.2:record-fetch-subject`, which is `record-fetch --no-passthrough`
+(`commands/record-fetch-subject.json`, the same image): the prerequisites are resolved on every
+session of the subject and written to `prereq/<name>/<session label>/`, and nothing is passed
+through, since passing the archive through would copy it. Register it beside `record-fetch`
+(`install_workflow.py --setup commands/record-fetch-subject.json`); it is not in the image label
+of 0.6.2 (the image was published before the command existed) and joins the label at the next
+image release.
+
 ## proc-wrapup: the generic wrapup (since 0.4.0)
 
 For cards that are not segmentations (QC pipelines, diffusion, radiomics, anything). Same

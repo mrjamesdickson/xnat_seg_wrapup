@@ -242,3 +242,19 @@ def test_register_if_possible_skips_roi_registration_at_subject_scope(tmp_path, 
     monkeypatch.setattr(register, "register_roi_collection", lambda *a, **k: {"label": "ok"})
     monkeypatch.setattr(register, "fetch_target_label", lambda c: "SESS")
     assert cli.register_if_possible(args, seg, session_context) == {"label": "ok"}
+
+
+def test_record_fetch_subject_command_is_record_fetch_without_passthrough():
+    """The subject-scope setup (plan D26): the same image and version as record-fetch, the same
+    command apart from name, description and the --no-passthrough flag, so the two cannot drift."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    base = json.loads((root / "commands" / "record-fetch.json").read_text())
+    subject = json.loads((root / "commands" / "record-fetch-subject.json").read_text())
+    assert subject["name"] == "record-fetch-subject" and subject["command-line"] == "record-fetch --no-passthrough"
+    assert subject["image"] == base["image"] and subject["version"] == base["version"] and subject["type"] == "docker-setup"
+    for key in base:
+        if key not in ("name", "description", "command-line"):
+            assert subject[key] == base[key], key
+    assert "no-passthrough" in subject["description"] or "--no-passthrough" in subject["description"]
