@@ -74,11 +74,14 @@ class _Xnat(BaseHTTPRequestHandler):
     def do_GET(self):
         _Xnat.calls.append(("GET", self.path, self.headers.get("Cookie")))
         p = self.path
-        if p.startswith("/data/projects/P/experiments?xsiType=analysis:sessionAnalysisData"):
-            return self._json({"ResultSet": {"Result": RECORDS}})
-        if p.startswith("/data/projects/P/experiments?xsiType=analysis:subjectAnalysisData"):
+        if p.startswith("/data/projects/P/experiments?"):
+            raise AssertionError("the project-wide listing must not be used; records are listed per owner: " + p)
+        if p.startswith(("/data/experiments/XNAT_E1/assessors?xsiType=analysis:sessionAnalysisData", "/data/experiments/XNAT_E2/assessors?xsiType=analysis:sessionAnalysisData")):
+            owner = p.split("/data/experiments/")[1].split("/")[0]
+            return self._json({"ResultSet": {"Result": [r for r in RECORDS if r[T + "imagesession_id"] == owner]}})
+        if p.startswith("/data/projects/P/subjects/XNAT_S1/experiments?xsiType=analysis:subjectAnalysisData"):
             assert "analysis:subjectAnalysisData/subject_ID" in p, "the subject record listing must ask for the owner column"
-            return self._json({"ResultSet": {"Result": SUBJECT_RECORDS}})
+            return self._json({"ResultSet": {"Result": [r for r in SUBJECT_RECORDS if r[TS + "subject_id"] == "XNAT_S1"]}})
         if p == "/data/experiments/XNAT_E1?format=json":                      # session label (and subject) for the record label
             return self._json({"items": [{"data_fields": {"label": "S1", "subject_ID": "XNAT_S1"}}]})
         if p == "/data/projects/P/subjects/XNAT_S1?format=json":
@@ -249,10 +252,10 @@ def test_record_fetch_passes_input_through_and_materialises_record_and_resource(
     q = next(p for p in m["prerequisites"] if p["name"] == "qsiprep")
     assert q["record"]["ID"] == "XNAT_E12" and q["role"] == "DERIVED" and q["files"] == 2 and q["path"] == "prereq/qsiprep"
     assert "prerequisite qsiprep: XNAT_E12" in caplog.text
-    # one session, cookie on every call, closed at the end; the listing is project-scoped
+    # one session, cookie on every call, closed at the end; records are listed per owner
     assert [c[0] for c in handler.calls if c[1] == "/data/JSESSION"] == ["POST", "DELETE"]
     assert all(c[2] == "JSESSIONID=FAKESESSION" for c in handler.calls if c[0] == "GET")
-    assert any(c[1].startswith("/data/projects/P/experiments?xsiType=analysis:sessionAnalysisData") for c in handler.calls)
+    assert any(c[1].startswith("/data/experiments/XNAT_E1/assessors?xsiType=analysis:sessionAnalysisData") for c in handler.calls), "records are listed through the session's own assessors endpoint"
 
 
 def test_a_view_role_resolves_through_wrapup_json_to_the_derived_paths_it_names(xnat, tmp_path, monkeypatch, caplog):

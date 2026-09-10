@@ -188,22 +188,30 @@ def _get_json(context: XnatContext, url: str, timeout: float):
 def list_records(context: XnatContext, scope: str, owners: set[str], timeout: float = 60.0) -> list[dict]:
     """Every generic record of ``scope`` owned by one of ``owners`` (session ids, or subject ids
     at subject scope), newest first, as flat dicts with the record fields plus ``scope`` and
-    ``owner``. The project listing is used because it carries the record columns; the
-    session-scoped listing returns the session document instead of rows."""
+    ``owner``. Listed per owner through the owner's own endpoint, filtered by xsiType on the
+    server: ``/data/experiments/<session>/assessors`` for session records,
+    ``/data/projects/<project>/subjects/<subject>/experiments`` for subject records (both verified
+    on demo02, 2026-09-10, to return the record columns). The project-wide listing is not used:
+    it scales with the project, not with the run."""
     record_type = SUBJECT_RECORD_TYPE if scope == "subject" else RECORD_TYPE
     wanted = SUBJECT_RECORD_COLUMNS if scope == "subject" else RECORD_COLUMNS
     columns = ",".join(c if c in ("ID", "label", "insert_date") else f"{record_type}/{c}" for c in wanted)
-    url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/experiments"
-           f"?xsiType={record_type}&format=json&columns={urllib.parse.quote(columns, safe=',:/')}")
-    payload = _get_json(context, url, timeout)
-    rows = payload.get("ResultSet", {}).get("Result", []) if isinstance(payload, dict) else []
     key = record_type.lower() + "/"
     records = []
-    for r in rows:
-        flat = {"ID": r.get("ID"), "label": r.get("label"), "insert_date": r.get("insert_date")}
-        flat.update({k[len(key):]: v for k, v in r.items() if k.startswith(key)})
-        owner = flat.get("subject_id") if scope == "subject" else flat.get("imagesession_id")
-        if owner in owners:
+    for owner in sorted(owners):
+        if scope == "subject":
+            url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/subjects/"
+                   f"{urllib.parse.quote(owner, safe='')}/experiments")
+        else:
+            url = f"{context.host}/data/experiments/{urllib.parse.quote(owner, safe='')}/assessors"
+        payload = _get_json(context, f"{url}?xsiType={record_type}&format=json&columns={urllib.parse.quote(columns, safe=',:/')}", timeout)
+        rows = payload.get("ResultSet", {}).get("Result", []) if isinstance(payload, dict) else []
+        for r in rows:
+            flat = {"ID": r.get("ID"), "label": r.get("label"), "insert_date": r.get("insert_date")}
+            flat.update({k[len(key):]: v for k, v in r.items() if k.startswith(key)})
+            listed_owner = flat.get("subject_id") if scope == "subject" else flat.get("imagesession_id")
+            if listed_owner and listed_owner != owner:
+                continue                       # a shared or mis-scoped row is not this owner's record
             flat["scope"], flat["owner"] = scope, owner
             records.append(flat)
     return sorted(records, key=lambda r: r.get("insert_date") or "", reverse=True)
