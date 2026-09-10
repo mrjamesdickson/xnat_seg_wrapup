@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.2 (2026-09-10)
+
+Subject scope, and the results_json cap. Plan D23/D26: every BIDS App card runs at session and at subject scope; a subject-context wrapper (xnat2bids-setup 2.0 assembling every session of the subject) needs records and a prerequisite gate of its own.
+
+- **Subject records.** A run whose environment names `PROC_SUBJECT_ID` (or `SEG_SUBJECT_ID`) and no session id is subject-scoped: proc-wrapup, seg-wrapup and record-fetch publish an `analysis:subjectAnalysisData` record under the subject (`PUT /data/projects/P/subjects/S/experiments/<label>`, files as experiment resources, no `out`), with the same fields as a session record minus `scans`; `inputs_json` carries `scope`, `subject` and the subject's sessions (the tree the App saw), the label carries the subject's label. `XnatContext.scope` / `.target`, `publish.record_urls`, `xsi_type_for`.
+- **Subject-scope prerequisites.** At subject scope a session-scoped record prerequisite must hold on every session of the subject; the records are laid out under `prereq/<name>/<session label>/` and `prereq.json` lists them per session (`sessions`). A session resource prerequisite is gathered from every session the same way; scan resources are refused at subject scope. `scope=subject` on a record prerequisite selects a subject record (a consumer of a subject-level run). At session scope a prerequisite that no session record satisfies falls back to the subject's records, own scope first, because a subject-level run covers each of its sessions. A failed gate at subject scope is recorded on the subject.
+- **results_json under the schema cap.** The per-role file lists became `file_counts`; a view list that would still overrun 65,536 characters is reduced to counts with `truncated: ["views"]` (the full mapping stays in `PROVENANCE/wrapup.json`). Live defect: the fmriprep full run (wf 269464, 1,036 files, 79,940 characters) and hippunfold on demo02 were refused outright and left no record.
+- 192 tests (13 new: subject XML and URLs, rollback by experiment id, the cap, context from a subject environment, subject labels, per-session gating, unmet sessions named, subject-record fallback, scope=subject, scan refusal at subject scope, proc-wrapup end to end at subject scope; 3 assertions updated to the new contract, none removed).
+
+Cards: subject wrappers set `PROC_SUBJECT_ID` from the subject input and leave `PROC_SESSION_ID` unset; the records mount at subject scope is a derived Project input with `record-fetch --no-passthrough` (nothing to pass through). Session wrappers re-pin only.
+
 ## 0.6.1 (2026-09-08)
 
 Fidelity fix for D20 ("DERIVED is the scientists' dataset byte-for-byte, path-for-path"): the dataset's own dotfiles were being dropped.

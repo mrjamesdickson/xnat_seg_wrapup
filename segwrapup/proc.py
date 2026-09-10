@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import shutil
+import urllib.error
 import sys
 import urllib.parse
 from pathlib import Path
@@ -29,7 +30,8 @@ from .execution import (RAW_DIRNAME, STATUS_FILENAME, chain_from_workflow, copy_
                         own_workflow_id, read_status, run_status_from)
 from .prereq import MANIFEST as PREREQ_MANIFEST
 from .publish import RecordContract, publish_if_possible
-from .register import XnatContext, close_session, collection_label, fetch_session_label
+from .prereq import list_subject_sessions
+from .register import XnatContext, close_session, collection_label, fetch_target_label
 
 logger = logging.getLogger(__name__)
 
@@ -138,10 +140,18 @@ def run(args: argparse.Namespace) -> int:
     context = XnatContext.from_env()
     execution = None
     chain = None
+    sessions: list[dict] = []
     prerequisites = read_prerequisites(input_dir)
     try:
         if context is not None:
             execution = fetch_parent_logs(context, output_dir, status, own_workflow_id())
+            if context.scope == "subject":
+                # A subject-scoped run (a subject-context wrapper, the tree assembled from every
+                # session of the subject): the record names the sessions it spanned.
+                try:
+                    sessions = list_subject_sessions(context, context.subject)
+                except (urllib.error.URLError, OSError, ValueError) as error:
+                    logger.warning("could not list the sessions of subject %s (%s); the record will not name them", context.subject, error)
             # The orchestration fields sit on the parent's (main) workflow; the wrapup's own
             # workflow carries none (demo02 wrk_workflowdata, 2026-09-07).
             chain = chain_from_workflow(context, (execution or {}).get("workflow_id")) or chain_from_workflow(context, own_workflow_id())
@@ -164,13 +174,16 @@ def run(args: argparse.Namespace) -> int:
             "envelope": json.dumps((execution or {}).get("facts", {}).get("envelope", {})),
             "total_seconds": (execution or {}).get("facts", {}).get("total_seconds", ""),
             "prerequisites": ", ".join(f"{q['name']}={q.get('record', {}).get('ID') or q.get('resource', '')}" for q in prerequisites),
+            "scope": context.scope if context else "session",
+            "sessions": ", ".join(s["label"] for s in sessions),
         }
         facts = {"summary": summary, "files": files, "log_tails": log_tails, "generated": started.strftime("%Y-%m-%d %H:%M:%S UTC"),
                  "tool_reports": [name for name in derived_names if name.lower().endswith((".html", ".htm"))]}
         (output_dir / "report.html").write_text(render_report(facts))
         manifest = {"wrapup": "proc-wrapup", "version": __version__, "generated": facts["generated"], "pipeline": args.pipeline,
                     "pipeline_version": args.pipeline_version, "run_status": run_status, "status": status, "execution": execution,
-                    "chain": chain, "prerequisites": prerequisites, "derived_root": RAW_DIRNAME, "raw_files": copied}
+                    "chain": chain, "prerequisites": prerequisites, "derived_root": RAW_DIRNAME, "raw_files": copied,
+                    "scope": context.scope if context else "session", "sessions": sessions}
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
 
         report = {"model": args.pipeline, "model_version": args.pipeline_version, "scan": args.scan}
@@ -179,13 +192,16 @@ def run(args: argparse.Namespace) -> int:
                         "config": (execution or {}).get("facts"),
                         "notes": f"Published by proc-wrapup {__version__}; tool output kept verbatim under {RAW_DIRNAME}/; nothing interpreted",
                         "inputs": {"scan": args.scan, "status_json": status is not None, "raw_files": len(copied),
+                                   "scope": context.scope if context else "session",
+                                   "subject": context.subject if context else "",
+                                   "sessions": sessions,
                                    "chain": chain,
                                    "prerequisites": [{"name": q["name"], "record": (q.get("record") or {}).get("ID"),
                                                       "resource": q.get("resource"), "role": q.get("role")} for q in prerequisites],
                                    "upstream_record": next(((q.get("record") or {}).get("ID") for q in prerequisites if q.get("record")), None)}}
         if not (args.record_label or "").strip():
             args.record_label = collection_label(args.pipeline, args.scan,
-                                                 session_label=fetch_session_label(context) if context else "") + "_record"
+                                                 session_label=fetch_target_label(context) if context else "") + "_record"
         outcome = publish_if_possible(args, output_dir, report, [], False, context=context, facts=record_facts,
                                       default_resources=PROC_DEFAULT_RESOURCES, derived_root=RAW_DIRNAME, manifest=manifest)
         # Local paths of what went up (and of the empty files that could not): for the pointer

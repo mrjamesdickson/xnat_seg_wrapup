@@ -244,7 +244,7 @@ def run(args: argparse.Namespace) -> int:
 
 def register_if_possible(args: argparse.Namespace, seg_path: Path, context=None) -> dict | None:
     """Register the SEG as an ROI collection when the parent passed the XNAT context. Never raises."""
-    from .register import XnatContext, collection_label, fetch_session_label, register_roi_collection
+    from .register import XnatContext, collection_label, fetch_target_label, register_roi_collection
 
     if args.no_register:
         logger.info("ROI registration skipped by flag")
@@ -253,7 +253,7 @@ def register_if_possible(args: argparse.Namespace, seg_path: Path, context=None)
     if context is None:
         return None
     label = args.roi_label.strip() or collection_label(args.model, context.scan or args.scan,
-                                                       session_label=fetch_session_label(context))
+                                                       session_label=fetch_target_label(context))
     try:
         return register_roi_collection(context, seg_path, label)
     except RuntimeError as error:

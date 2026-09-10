@@ -48,8 +48,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         _Handler.calls.append({"path": self.path, "method": "GET", "auth": self.headers.get("Authorization"), "cookie": self.headers.get("Cookie")})
+        if "/subjects/" in self.path and "/experiments/" in self.path and self.path.endswith("?format=json"):
+            # a subject-scope label probe: /data/projects/P/subjects/S/experiments/<label>
+            label = self.path.split("/experiments/")[-1].split("?")[0]
+            self.send_response(_Handler.get_status or (200 if label in _Handler.existing_labels else 404))
+            self.end_headers()
+            return
         if "/assessors/" not in self.path and self.path.endswith("?format=json"):
-            body = json.dumps({"items": [{"data_fields": {"label": "SESS01"}}]}).encode()
+            body = json.dumps({"items": [{"data_fields": {"label": "SUBJ01" if "/subjects/" in self.path else "SESS01"}}]}).encode()
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
             return
         label = self.path.split("/assessors/")[-1].split("?")[0]
@@ -73,11 +79,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if "/assessors/" in self.path and "/out/" not in self.path and (_Handler.conflict_labels is None or self.path.split("/assessors/")[1].split("?")[0] in _Handler.conflict_labels):
             self.send_response(409); self.end_headers(); self.wfile.write(b"<h3>Conflict: Duplicate experiment label</h3>"); return
-        self.send_response(201 if "/assessors/" in self.path and "/out/" not in self.path else 200)
+        is_create = ("/assessors/" in self.path and "/out/" not in self.path) or ("/subjects/" in self.path and "/experiments/" in self.path)
+        self.send_response(201 if is_create else 200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
-        # XNAT answers an assessor create with the new accession ID as plain text.
-        self.wfile.write(b"XNAT_E99999" if "/out/" not in self.path else b"")
+        # XNAT answers an assessor (or subject assessor) create with the new accession ID as plain text.
+        self.wfile.write(b"XNAT_E99999" if is_create else b"")
 
     def log_message(self, *args):
         pass
@@ -445,7 +452,8 @@ def test_publish_if_possible_leaves_empty_files_out_of_the_record_document(xnat,
     assert "<analysis:output_file_count>1</analysis:output_file_count>" in xml and "empty.txt" not in xml
     # the record's own field carries the views, so a consumer resolves METRICS without wrapup.json
     results = json.loads(html_unescape(xml.split("<analysis:results_json>")[1].split("</analysis:results_json>")[0]))
-    assert results["views"] == {"METRICS": ["volumes.json"]} and results["files"] == {"DERIVED": ["volumes.json"]}
+    # per-role counts, not file lists: the lists overran the 65,536-character cap on big trees (0.6.2)
+    assert results["views"] == {"METRICS": ["volumes.json"]} and results["file_counts"] == {"DERIVED": 1}
     assert outcome["views"] == {"METRICS": ["volumes.json"]}
     assert "empty.txt is empty; left off the record" in caplog.text
 
@@ -781,3 +789,78 @@ def test_create_409_twice_is_reported_not_looped(xnat, tmp_path):
     with pytest.raises(RuntimeError, match="HTTP 409"):
         publish.publish_record(context, "L", xml, {"REPORT": [out / "report.html"]}, output_dir=out)
     assert len([c for c in handler.calls if c["method"] == "PUT"]) == 2
+
+
+# ── subject scope (0.6.2) ───────────────────────────────────────────────────────
+
+def _subject_context(host):
+    return XnatContext(host=host, user="alias", password="secret", project="PROJ_1", session="", subject="XNAT_S09007")
+
+
+def test_record_xml_at_subject_scope_is_a_subject_assessor_without_scans(tmp_path):
+    from segwrapup.publish import SUBJECT_XSI_TYPE, xsi_type_for
+    (tmp_path / "volumes.json").write_text("{}")
+    contract = RecordContract.from_env({"XNW_CONTRACT": json.dumps(CONTRACT)})
+    context = _subject_context("http://x")
+    assert context.scope == "subject" and context.target == "XNAT_S09007" and xsi_type_for(context) == SUBJECT_XSI_TYPE
+    xml = build_record_xml(context, contract, "fmriprep_292_X", _report(), [], collect_files(tmp_path, contract), False)
+    assert xml.startswith('<?xml version="1.0" encoding="UTF-8"?>\n<analysis:SubjectAnalysis ')
+    assert 'project="PROJ_1" label="fmriprep_292_X"' in xml
+    assert "<xnat:subject_ID>XNAT_S09007</xnat:subject_ID>" in xml and "imageSession_ID" not in xml
+    assert "<analysis:scans>" not in xml and xml.rstrip().endswith("</analysis:SubjectAnalysis>")
+    assert "<analysis:pipeline_name>DeepWMH<" in xml       # the same fields as a session record
+
+
+def test_publish_at_subject_scope_creates_under_the_subject_and_uploads_to_experiment_resources(xnat, tmp_path):
+    from segwrapup.publish import SUBJECT_XSI_TYPE
+    host, handler = xnat
+    (tmp_path / "report.html").write_text("<html/>")
+    (tmp_path / "sub-292").mkdir()
+    (tmp_path / "sub-292" / "ses-preop_T1w.json").write_text("{}")
+    files = collect_files(tmp_path, RecordContract())
+    outcome = publish_record(_subject_context(host), "fmriprep_292_X", "<xml/>", files, output_dir=tmp_path)
+    assert outcome["id"] == "XNAT_E99999" and outcome["xsi_type"] == SUBJECT_XSI_TYPE
+    calls = [c for c in handler.calls if c["path"] != "/data/JSESSION"]
+    paths = [c["path"] for c in calls]
+    assert paths[0] == "/data/projects/PROJ_1/subjects/XNAT_S09007/experiments/fmriprep_292_X?format=json" and calls[0]["method"] == "GET"
+    assert paths[1] == "/data/projects/PROJ_1/subjects/XNAT_S09007/experiments/fmriprep_292_X?inbody=true"
+    assert "/data/experiments/XNAT_E99999/resources/REPORT/files/report.html?inbody=true&format=HTML" in paths
+    assert "/data/experiments/XNAT_E99999/resources/DERIVED/files/sub-292/ses-preop_T1w.json?inbody=true&format=JSON" in paths
+    assert not [p for p in paths if "/out/" in p or "/assessors/" in p]
+
+
+def test_publish_at_subject_scope_refuses_an_existing_label_and_rolls_back_by_experiment_id(xnat, tmp_path):
+    host, handler = xnat
+    handler.existing_labels = {"taken_X"}
+    (tmp_path / "a.txt").write_text("a")
+    files = collect_files(tmp_path, RecordContract())
+    with pytest.raises(RuntimeError, match="already exists on XNAT_S09007"):
+        publish_record(_subject_context(host), "taken_X", "<xml/>", files, output_dir=tmp_path)
+    handler.existing_labels = set()
+    handler.fail_paths = {"/data/experiments/XNAT_E99999/resources/DERIVED/files/a.txt"}
+    with pytest.raises(RuntimeError, match="record XNAT_E99999 deleted"):
+        publish_record(_subject_context(host), "fresh_X", "<xml/>", files, output_dir=tmp_path)
+    deletes = [c["path"] for c in handler.calls if c["method"] == "DELETE" and c["path"] != "/data/JSESSION"]
+    assert deletes == ["/data/experiments/XNAT_E99999?removeFiles=true"]
+
+
+def test_results_json_stays_under_the_schema_cap_on_a_big_tree(tmp_path, caplog):
+    """fmriprep's full run (1,036 files) and hippunfold were refused with results_json at
+    79,940 characters against the 65,536 cap; the file lists are counts now and an
+    overrunning view list is reduced to counts with a note."""
+    from segwrapup.publish import RESULTS_JSON_MAX, bounded_results_json
+    contract = RecordContract.from_env({"XNW_CONTRACT": json.dumps(CONTRACT)})
+    files = {"DERIVED": [tmp_path / f"sub-01/func/sub-01_task-rest_run-{i:04d}_desc-preproc_bold.nii.gz" for i in range(3000)]}
+    views = {"METRICS": [f"sub-01/func/sub-01_task-rest_run-{i:04d}_desc-confounds_timeseries.tsv" for i in range(3000)]}
+    for f in files["DERIVED"]:
+        f.parent.mkdir(parents=True, exist_ok=True); f.write_bytes(b"x")
+    with caplog.at_level(logging.WARNING):
+        xml = build_record_xml(_context("http://x"), contract, "big_X", _report(), [], files, False, output_dir=tmp_path, views=views)
+    text = xml.split("<analysis:results_json>")[1].split("</analysis:results_json>")[0]
+    assert len(text) <= RESULTS_JSON_MAX
+    summary = json.loads(html_unescape(text))
+    assert summary["file_counts"] == {"DERIVED": 3000} and summary["views"] == {"METRICS": 3000} and summary["truncated"] == ["views"]
+    assert "replaced by counts" in caplog.text
+    # a small tree keeps its view paths verbatim
+    small = json.loads(bounded_results_json({"views": {"METRICS": ["a.json"]}, "file_counts": {"DERIVED": 1}}))
+    assert small["views"] == {"METRICS": ["a.json"]} and "truncated" not in small

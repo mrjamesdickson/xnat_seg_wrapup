@@ -225,3 +225,47 @@ def test_fetch_session_label_falls_back_to_the_id(caplog):
     with caplog.at_level("WARNING"):
         assert fetch_session_label(context, timeout_seconds=1) == "XNAT_E1"
     assert "could not read the label of session XNAT_E1" in caplog.text
+
+
+def test_from_env_subject_scope_needs_a_subject_when_there_is_no_session(caplog):
+    from segwrapup import register
+    base = {"XNAT_HOST": "http://x/", "XNAT_USER": "u", "XNAT_PASS": "p", "PROC_PROJECT": "P1"}
+    with caplog.at_level("INFO"):
+        assert register.XnatContext.from_env(base) is None
+    assert "SEG_SESSION_ID (or SEG_SUBJECT_ID for a subject-scoped run)" in caplog.text
+    context = register.XnatContext.from_env({**base, "PROC_SUBJECT_ID": "XNAT_S1"})
+    assert context.scope == "subject" and context.subject == "XNAT_S1" and context.session == "" and context.target == "XNAT_S1"
+    both = register.XnatContext.from_env({**base, "PROC_SUBJECT_ID": "XNAT_S1", "PROC_SESSION_ID": "XNAT_E1"})
+    assert both.scope == "session" and both.target == "XNAT_E1"     # a session run keeps session scope even if a subject is named
+
+
+def test_fetch_target_label_reads_the_subject_at_subject_scope_and_falls_back_to_the_id(caplog):
+    import json, threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from segwrapup.register import XnatContext, fetch_target_label
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.path)
+            body = json.dumps({"items": [{"data_fields": {"label": "292"}}]}).encode()
+            self.send_response(200); self.end_headers(); self.wfile.write(body)
+
+        def do_POST(self):
+            self.send_response(500); self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        context = XnatContext(f"http://127.0.0.1:{server.server_port}", "u", "p", "P", "", subject="XNAT_S09007")
+        assert fetch_target_label(context) == "292"
+        assert seen[-1] == "/data/projects/P/subjects/XNAT_S09007?format=json"
+    finally:
+        server.shutdown()
+    dead = XnatContext("http://127.0.0.1:9", "u", "p", "P", "", subject="XNAT_S09007")
+    with caplog.at_level("WARNING"):
+        assert fetch_target_label(dead) == "XNAT_S09007"
+    assert "could not read the label of subject XNAT_S09007" in caplog.text

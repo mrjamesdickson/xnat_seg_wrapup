@@ -37,6 +37,17 @@ FILES = {"XNAT_E12": {"DERIVED": ["sub-1/dwi/preproc.nii.gz", "sub-1/qc.json"], 
 WRAPUP_JSON = {"XNAT_E12": {"wrapup": "proc-wrapup", "version": "0.6.0", "views": {"METRICS": ["sub-1/qc.json"]}},
                "XNAT_E11": {"wrapup": "proc-wrapup", "version": "0.5.0"}}
 SESSION_RESOURCES = {"BIDS": ["sub-1/anat/sub-1_T1w.nii.gz", "dataset_description.json"]}
+TS = "analysis:subjectanalysisdata/"
+def subrec(id_, label, pipeline, version, review, run, insert, subject="XNAT_S1", atype="functional-preprocessing"):
+    return {"ID": id_, "label": label, "insert_date": insert, TS + "subject_id": subject, TS + "pipeline_name": pipeline,
+            TS + "pipeline_version": version, TS + "analysis_type": atype, TS + "review_state": review, TS + "run_status": run,
+            TS + "publication_status": "DRAFT"}
+SUBJECT_RECORDS = [subrec("XNAT_E50", "fmriprep_292_record", "fmriprep", "25.2.5", "ACCEPTED", "SUCCEEDED", "2026-09-10 03:00:00"),
+                   subrec("XNAT_E51", "fmriprep_other_subject", "fmriprep", "25.2.5", "ACCEPTED", "SUCCEEDED", "2026-09-10 04:00:00", subject="XNAT_S2")]
+SUBJECT_SESSIONS = [{"ID": "XNAT_E1", "label": "S1", "xsiType": "xnat:mrSessionData"}, {"ID": "XNAT_E2", "label": "S2", "xsiType": "xnat:mrSessionData"},
+                    {"ID": "XNAT_E77", "label": "S1_record", "xsiType": "analysis:subjectAnalysisData"}]
+FILES["XNAT_E50"] = {"DERIVED": ["sub-292/ses-preop/func/bold.nii.gz", "sub-292/ses-postop/func/bold.nii.gz"], "PROVENANCE": ["wrapup.json"]}
+FILES["XNAT_E99"] = {"DERIVED": ["sub-1/dwi/preproc.nii.gz"], "PROVENANCE": ["wrapup.json"]}
 SCANS = {"2": {"type": "T1w", "DICOM": ["1.dcm", "2.dcm"]}, "3": {"type": "BOLD", "DICOM": ["b1.dcm"]}, "4": {"type": "T1w", "DICOM": []}}
 
 
@@ -54,7 +65,7 @@ class _Xnat(BaseHTTPRequestHandler):
     def do_PUT(self):
         n = int(self.headers.get("Content-Length", "0")); body = self.rfile.read(n)
         _Xnat.calls.append(("PUT", self.path, self.headers.get("Cookie"), body))
-        create = "/assessors/" in self.path and "/out/" not in self.path
+        create = ("/assessors/" in self.path and "/out/" not in self.path) or ("/subjects/" in self.path and "/experiments/" in self.path and "/resources/" not in self.path)
         self.send_response(201 if create else 200); self.end_headers(); self.wfile.write(b"XNAT_E77" if create else b"")
 
     def do_DELETE(self):
@@ -65,29 +76,45 @@ class _Xnat(BaseHTTPRequestHandler):
         p = self.path
         if p.startswith("/data/projects/P/experiments?xsiType=analysis:sessionAnalysisData"):
             return self._json({"ResultSet": {"Result": RECORDS}})
-        if p == "/data/experiments/XNAT_E1?format=json":                      # session label for the record label
-            return self._json({"items": [{"data_fields": {"label": "S1"}}]})
+        if p.startswith("/data/projects/P/experiments?xsiType=analysis:subjectAnalysisData"):
+            assert "analysis:subjectAnalysisData/subject_ID" in p, "the subject record listing must ask for the owner column"
+            return self._json({"ResultSet": {"Result": SUBJECT_RECORDS}})
+        if p == "/data/experiments/XNAT_E1?format=json":                      # session label (and subject) for the record label
+            return self._json({"items": [{"data_fields": {"label": "S1", "subject_ID": "XNAT_S1"}}]})
+        if p == "/data/projects/P/subjects/XNAT_S1?format=json":
+            return self._json({"items": [{"data_fields": {"label": "292"}}]})
+        if p.startswith("/data/projects/P/subjects/XNAT_S1/experiments?format=json"):
+            return self._json({"ResultSet": {"Result": SUBJECT_SESSIONS}})
+        if "/subjects/" in p and "/experiments/" in p and p.endswith("?format=json"):   # subject-scope label probe: free
+            self.send_response(404); self.end_headers(); return
+        if p.startswith("/data/experiments/XNAT_E50/resources/") and p.endswith("/files?format=json"):
+            role = p.split("/resources/")[1].split("/")[0]
+            names = FILES["XNAT_E50"].get(role, [])
+            return self._json({"ResultSet": {"Result": [{"Name": n.rsplit("/", 1)[-1], "URI": f"/data/experiments/XNAT_E50/resources/{role}/files/{n}", "Size": 3} for n in names]}})
         if "/assessors/" in p and "/out/" not in p:                          # label probe: free
             self.send_response(404); self.end_headers(); return
         if "/out/resources/" in p and p.endswith("/files?format=json"):
-            assert p.startswith("/data/experiments/XNAT_E1/assessors/"), "record files are listed assessor-scoped (experiment-scoped answers the document)"
+            assert p.startswith(("/data/experiments/XNAT_E1/assessors/", "/data/experiments/XNAT_E2/assessors/")), "record files are listed assessor-scoped (experiment-scoped answers the document)"
+            owner = p.split("/data/experiments/")[1].split("/")[0]
             rid = p.split("/assessors/")[1].split("/")[0]; role = p.split("/out/resources/")[1].split("/")[0]
+            assert (rid == "XNAT_E99") == (owner == "XNAT_E2"), f"record {rid} is not an assessor of {owner}"
             names = FILES.get(rid, {}).get(role, [])
-            return self._json({"ResultSet": {"Result": [{"Name": n.rsplit("/", 1)[-1], "URI": f"/data/experiments/XNAT_E1/assessors/{rid}/out/resources/{role}/files/{n}", "Size": 3} for n in names]}})
+            return self._json({"ResultSet": {"Result": [{"Name": n.rsplit("/", 1)[-1], "URI": f"/data/experiments/{owner}/assessors/{rid}/out/resources/{role}/files/{n}", "Size": 3} for n in names]}})
         if p == "/data/experiments/XNAT_E1/scans?format=json":
             return self._json({"ResultSet": {"Result": [{"ID": k, "type": v["type"], "series_description": v["type"]} for k, v in SCANS.items()]}})
         if "/data/experiments/XNAT_E1/scans/" in p and p.endswith("/files?format=json"):
             scan = p.split("/scans/")[1].split("/")[0]; label = p.split("/resources/")[1].split("/")[0]
             names = SCANS.get(scan, {}).get(label, [])
             return self._json({"ResultSet": {"Result": [{"Name": n, "URI": f"/data/experiments/XNAT_E1/scans/{scan}/resources/{label}/files/{n}", "Size": 3} for n in names]}})
-        if "/data/experiments/XNAT_E1/resources/" in p and p.endswith("/files?format=json"):
+        if ("/data/experiments/XNAT_E1/resources/" in p or "/data/experiments/XNAT_E2/resources/" in p) and p.endswith("/files?format=json"):
+            owner = p.split("/data/experiments/")[1].split("/")[0]
             label = p.split("/resources/")[1].split("/")[0]
             if label not in SESSION_RESOURCES:                                   # XNAT: 404 for a resource that does not exist
                 self.send_response(404); self.end_headers(); return
             names = SESSION_RESOURCES.get(label, [])
-            return self._json({"ResultSet": {"Result": [{"Name": n.rsplit("/", 1)[-1], "URI": f"/data/experiments/XNAT_E1/resources/{label}/files/{n}", "Size": 3} for n in names]}})
-        if p.endswith("/PROVENANCE/files/wrapup.json") and "/assessors/" in p:
-            rid = p.split("/assessors/")[1].split("/")[0]
+            return self._json({"ResultSet": {"Result": [{"Name": n.rsplit("/", 1)[-1], "URI": f"/data/experiments/{owner}/resources/{label}/files/{n}", "Size": 3} for n in names]}})
+        if p.endswith("/PROVENANCE/files/wrapup.json") and ("/assessors/" in p or p.startswith("/data/experiments/XNAT_E50/")):
+            rid = p.split("/assessors/")[1].split("/")[0] if "/assessors/" in p else "XNAT_E50"
             if rid in WRAPUP_JSON:
                 return self._json(WRAPUP_JSON[rid])
             self.send_response(404); self.end_headers(); return
@@ -157,9 +184,10 @@ def test_prerequisite_is_a_resource_or_a_record_never_both():
         Prerequisite.parse("X", "resource=BIDS;pipeline=qsiprep;accepted=true")
     with pytest.raises(ValueError, match="resource= cannot be combined with type=, min=, role=, id="):
         Prerequisite.parse("X", "resource=BIDS;type=qc;min=1;role=DERIVED;id=XNAT_E1")
-    with pytest.raises(ValueError, match="scope= and scan_type= apply only to resource="):
-        Prerequisite.parse("X", "pipeline=qsiprep;scope=session")
-    with pytest.raises(ValueError, match="scope= and scan_type= apply only to resource="):
+    # 0.6.2: a record prerequisite carries scope=session (default) or scope=subject; scan_type stays a resource clause
+    assert Prerequisite.parse("X", "pipeline=qsiprep;scope=session").scope == "session"
+    assert Prerequisite.parse("X", "pipeline=fmriprep;scope=subject").scope == "subject"
+    with pytest.raises(ValueError, match="scan_type= applies only to resource="):
         Prerequisite.parse("X", "pipeline=qsiprep;scan_type=T1*")
     assert Prerequisite.parse("X", "resource=DICOM;scope=scan;scan_type=T1*").scan_type == "T1*"
     with pytest.raises(ValueError, match="resource= cannot be combined with accepted="):   # even accepted=false is a record clause
@@ -367,9 +395,9 @@ def test_parse_scan_scope():
     p = Prerequisite.parse("DICOM", "resource=DICOM;scope=scan")
     assert (p.is_resource, p.scope, p.scan_type) == (True, "scan", "")
     assert Prerequisite.parse("T1", "resource=DICOM;scope=scan;scan_type=T1*").scan_type == "T1*"
-    with pytest.raises(ValueError, match="scope=scan needs resource="):
+    with pytest.raises(ValueError, match="scope must be session or subject for a record"):
         Prerequisite.parse("X", "pipeline=qsiprep;scope=scan")
-    with pytest.raises(ValueError, match="scope must be"):
+    with pytest.raises(ValueError, match="scope must be session or scan for a resource"):
         Prerequisite.parse("X", "resource=DICOM;scope=subject")
 
 
@@ -423,3 +451,100 @@ def test_a_missing_resource_is_an_unmet_prerequisite_with_a_record_not_a_transpo
     assert m["prerequisites"][0]["error"] == "needs the session resource FIELDMAPS; the FIELDMAPS resource does not exist on this session (XNAT answered 404)"
     assert m["analysis_record"]["id"] == "XNAT_E77"
     assert "prerequisite fmap: needs the session resource FIELDMAPS; the FIELDMAPS resource does not exist" in caplog.text
+
+
+# ── scope rules (0.6.2) ──────────────────────────────────────────────────────
+
+def _read(out, rel):
+    return (out / "prereq" / rel).read_bytes()
+
+
+def test_a_session_run_falls_back_to_the_subjects_record_when_no_session_record_fits(xnat, tmp_path, monkeypatch, caplog):
+    """xcp-d on ses-preop after a subject-scoped fMRIPrep: the session has no fmriprep record,
+    the subject does, and it covers the session."""
+    host, server = xnat
+    inp, out = tmp_path / "in", tmp_path / "out"; inp.mkdir()
+    monkeypatch.setenv("XNW_PREREQ_PREPROC", "pipeline=fmriprep;accepted=true;role=DERIVED")
+    with caplog.at_level(logging.INFO):
+        assert prereq.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "prereq.json").read_text())
+    got = manifest["prerequisites"][0]
+    assert got["record"]["ID"] == "XNAT_E50" and got["record"]["scope"] == "subject" and got["files"] == 2
+    assert _read(out, "preproc/sub-292/ses-preop/func/bold.nii.gz") == b"data:bold.nii.gz"
+    assert "using subject record XNAT_E50" in caplog.text
+    paths = [c[1] for c in server.calls if c[0] == "GET"]
+    assert "/data/experiments/XNAT_E1?format=json" in paths                                    # the session's subject
+    assert any(p.startswith("/data/experiments/XNAT_E50/resources/DERIVED/files?format=json") for p in paths)   # experiment resources, no /out/
+
+
+def test_scope_subject_prerequisite_on_a_session_run_looks_only_at_the_subject(xnat, tmp_path, monkeypatch):
+    host, server = xnat
+    inp, out = tmp_path / "in", tmp_path / "out"; inp.mkdir()
+    monkeypatch.setenv("XNW_PREREQ_QSIPREP", "pipeline=qsiprep;scope=subject")      # the subject has no qsiprep record
+    assert prereq.main(["--input", str(inp), "--output", str(out)]) == 3
+    got = json.loads((out / "prereq.json").read_text())["prerequisites"][0]
+    assert "subject XNAT_S1" in got["error"] and "a subject record from pipeline qsiprep" in got["error"]
+    assert not any(c[0] == "GET" and "xsiType=analysis:sessionAnalysisData" in c[1] for c in server.calls)
+
+
+def _subject_run(monkeypatch):
+    monkeypatch.delenv("PROC_SESSION_ID"); monkeypatch.setenv("PROC_SUBJECT_ID", "XNAT_S1")
+
+
+def test_a_subject_run_needs_the_session_prerequisite_on_every_session_and_lays_them_out_by_label(xnat, tmp_path, monkeypatch):
+    host, server = xnat
+    _subject_run(monkeypatch)
+    inp, out = tmp_path / "in", tmp_path / "out"; inp.mkdir()
+    monkeypatch.setenv("XNW_PREREQ_QSIPREP", "pipeline=qsiprep;accepted=true;role=DERIVED")
+    monkeypatch.setenv("XNW_PREREQ_BIDS", "resource=BIDS")
+    assert prereq.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "prereq.json").read_text())
+    by_name = {q["name"]: q for q in manifest["prerequisites"]}
+    assert by_name["qsiprep"]["sessions"] == {"S1": {"ID": "XNAT_E11", "label": "qsiprep_S1_20260907T110000Z_record", "pipeline_name": "qsiprep",
+                                                     "pipeline_version": "1.1.1", "review_state": "ACCEPTED", "run_status": "SUCCEEDED"},
+                                              "S2": {"ID": "XNAT_E99", "label": "qsiprep_other_session", "pipeline_name": "qsiprep",
+                                                     "pipeline_version": "1.1.1", "review_state": "ACCEPTED", "run_status": "SUCCEEDED"}}
+    assert by_name["qsiprep"]["record"]["ID"] == "XNAT_E99" and by_name["qsiprep"]["files"] == 2       # newest of the two
+    assert _read(out, "qsiprep/S1/sub-1/dwi/preproc.nii.gz") == b"data:preproc.nii.gz"
+    assert _read(out, "qsiprep/S2/sub-1/dwi/preproc.nii.gz") == b"data:preproc.nii.gz"
+    assert by_name["bids"]["files"] == 4 and _read(out, "bids/S2/dataset_description.json") == b"data:dataset_description.json"
+    listed = [c[1] for c in server.calls if c[0] == "GET" and "/subjects/XNAT_S1/experiments?format=json" in c[1]]
+    assert len(listed) == 1, "the subject's sessions are listed once for the whole run"
+
+
+def test_a_subject_run_reports_which_sessions_lack_the_prerequisite_and_records_the_failure_on_the_subject(xnat, tmp_path, monkeypatch, caplog):
+    host, server = xnat
+    _subject_run(monkeypatch)
+    for k, v in CONTRACT_ENV.items(): monkeypatch.setenv(k, v)
+    inp, out = tmp_path / "in", tmp_path / "out"; inp.mkdir()
+    monkeypatch.setenv("XNW_PREREQ_QC", "pipeline=mriqc;role=PROVENANCE")           # only S1 has an mriqc record
+    with caplog.at_level(logging.ERROR):
+        assert prereq.main(["--input", str(inp), "--output", str(out)]) == 3
+    manifest = json.loads((out / "prereq.json").read_text())
+    got = manifest["prerequisites"][0]
+    assert "on every session of subject XNAT_S1; 1 of 2 unmet: S2:" in got["error"] and "S1" not in got["error"].split("unmet:")[1].split(":")[0]
+    assert not (out / "prereq" / "qc").exists() or not any((out / "prereq" / "qc").rglob("*")), "nothing is downloaded for an unmet prerequisite"
+    creates = [c for c in server.calls if c[0] == "PUT" and "/subjects/XNAT_S1/experiments/" in c[1] and "?inbody=true" in c[1]]
+    assert len(creates) == 1 and b"<analysis:SubjectAnalysis" in creates[0][3] and b"<xnat:subject_ID>XNAT_S1</xnat:subject_ID>" in creates[0][3]
+    assert b"did not run on subject 292" in creates[0][3]
+    assert manifest["analysis_record"]["id"] == "XNAT_E77" and manifest["analysis_record"]["xsi_type"] == "analysis:subjectAnalysisData"
+
+
+def test_a_subject_run_finds_a_subject_scoped_prerequisite_on_the_subject_itself(xnat, tmp_path, monkeypatch):
+    host, server = xnat
+    _subject_run(monkeypatch)
+    inp, out = tmp_path / "in", tmp_path / "out"; inp.mkdir()
+    monkeypatch.setenv("XNW_PREREQ_PREPROC", "pipeline=fmriprep;scope=subject;accepted=true")
+    assert prereq.main(["--input", str(inp), "--output", str(out)]) == 0
+    got = json.loads((out / "prereq.json").read_text())["prerequisites"][0]
+    assert got["record"]["ID"] == "XNAT_E50" and got["files"] == 2 and "sessions" not in got
+
+
+def test_a_subject_run_refuses_a_scan_resource_prerequisite(xnat, tmp_path, monkeypatch):
+    host, server = xnat
+    _subject_run(monkeypatch)
+    inp, out = tmp_path / "in", tmp_path / "out"; inp.mkdir()
+    monkeypatch.setenv("XNW_PREREQ_DICOM", "resource=DICOM;scope=scan;scan_type=T1*")
+    assert prereq.main(["--input", str(inp), "--output", str(out)]) == 3
+    got = json.loads((out / "prereq.json").read_text())["prerequisites"][0]
+    assert "cannot be gathered for a subject-scoped run" in got["error"]

@@ -42,16 +42,19 @@ from pathlib import Path
 
 from . import __version__
 from .publish import FIXED_ROLES, RecordContract, build_record_xml, publish_record
-from .register import XnatContext, auth_headers, close_session, collection_label, fetch_session_label
+from .register import XnatContext, auth_headers, close_session, collection_label, fetch_target_label
 
 logger = logging.getLogger(__name__)
 
 RECORD_TYPE = "analysis:sessionAnalysisData"
+SUBJECT_RECORD_TYPE = "analysis:subjectAnalysisData"
 PREFIX = "XNW_PREREQ_"
 NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
 MANIFEST = "prereq.json"
 RECORD_COLUMNS = ["ID", "label", "insert_date", "imagesession_id", "pipeline_name", "pipeline_version",
                   "analysis_type", "review_state", "run_status", "publication_status"]
+#: A subject record is a subject assessor: its owner column is the subject, not a session.
+SUBJECT_RECORD_COLUMNS = [c if c != "imagesession_id" else "subject_ID" for c in RECORD_COLUMNS]
 
 
 @dataclass
@@ -64,11 +67,13 @@ class Prerequisite:
     accepted: bool = False
     record_id: str = ""
     resource: str = ""
-    scope: str = "session"          # "session" (a session resource) or "scan" (a resource on a scan)
+    scope: str = "session"          # resource: "session" or "scan"; record: "session" (default) or "subject"
     scan_type: str = ""             # scope=scan on a session-level run: the scans whose type matches this glob
     raw: str = ""
 
     KEYS = ("type", "pipeline", "min", "role", "accepted", "id", "resource", "scope", "scan_type")
+    RECORD_SCOPES = ("session", "subject")
+    RESOURCE_SCOPES = ("session", "scan")
 
     @classmethod
     def parse(cls, name: str, spec: str) -> "Prerequisite":
@@ -106,12 +111,16 @@ class Prerequisite:
             # pipeline or review requirement (Codex P2, PR #10).
             raise ValueError(f"{PREFIX}{name}: resource= cannot be combined with {', '.join(k + '=' for k in record_keys)} "
                              f"(a prerequisite is either a resource or a record) ({spec!r})")
-        if p.scope not in ("session", "scan"):
-            raise ValueError(f"{PREFIX}{name}: scope must be session or scan ({spec!r})")
+        if p.resource and p.scope not in cls.RESOURCE_SCOPES:
+            raise ValueError(f"{PREFIX}{name}: scope must be session or scan for a resource prerequisite ({spec!r})")
+        if not p.resource and p.scope not in cls.RECORD_SCOPES:
+            # scope=subject (0.6.2): the record is a subject record (analysis:subjectAnalysisData),
+            # for a consumer of a subject-level run such as xcp-d after a subject-scoped fMRIPrep.
+            raise ValueError(f"{PREFIX}{name}: scope must be session or subject for a record prerequisite ({spec!r})")
         if p.scope == "scan" and not p.resource:
             raise ValueError(f"{PREFIX}{name}: scope=scan needs resource=<label on the scan> ({spec!r})")
-        if not p.resource and (p.scan_type or "scope" in fields):
-            raise ValueError(f"{PREFIX}{name}: scope= and scan_type= apply only to resource= prerequisites ({spec!r})")
+        if not p.resource and p.scan_type:
+            raise ValueError(f"{PREFIX}{name}: scan_type= applies only to resource= prerequisites ({spec!r})")
         if p.scan_type and p.scope != "scan":
             # resolve() takes the session-resource branch and never reads scan_type, so the filter
             # would be dropped and the whole session resource used instead (Codex P1, PR #10).
@@ -133,7 +142,8 @@ class Prerequisite:
                  else f"the DERIVED files its {self.role} view names")
         if self.record_id:
             return f"record {self.record_id} ({files})"
-        what = " ".join(x for x in [f"a {self.analysis_type}" if self.analysis_type else "a", "record",
+        what = " ".join(x for x in [f"a {self.analysis_type}" if self.analysis_type else "a",
+                                     "subject record" if self.scope == "subject" else "record",
                                      f"from pipeline {self.pipeline}" if self.pipeline else "from any pipeline"] if x)
         conds = [f"version >= {self.min_version}" if self.min_version else "any version",
                  "ACCEPTED in review" if self.accepted else "review not required", "run SUCCEEDED"]
@@ -175,23 +185,57 @@ def _get_json(context: XnatContext, url: str, timeout: float):
         return json.loads(response.read().decode())
 
 
-def list_session_records(context: XnatContext, timeout: float = 60.0) -> list[dict]:
-    """Every generic session record on this session, newest first, as flat dicts with the
-    record fields. The project listing is used because it carries the record columns; the
+def list_records(context: XnatContext, scope: str, owners: set[str], timeout: float = 60.0) -> list[dict]:
+    """Every generic record of ``scope`` owned by one of ``owners`` (session ids, or subject ids
+    at subject scope), newest first, as flat dicts with the record fields plus ``scope`` and
+    ``owner``. The project listing is used because it carries the record columns; the
     session-scoped listing returns the session document instead of rows."""
-    columns = ",".join(c if c in ("ID", "label", "insert_date") else f"{RECORD_TYPE}/{c}" for c in RECORD_COLUMNS)
+    record_type = SUBJECT_RECORD_TYPE if scope == "subject" else RECORD_TYPE
+    wanted = SUBJECT_RECORD_COLUMNS if scope == "subject" else RECORD_COLUMNS
+    columns = ",".join(c if c in ("ID", "label", "insert_date") else f"{record_type}/{c}" for c in wanted)
     url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/experiments"
-           f"?xsiType={RECORD_TYPE}&format=json&columns={urllib.parse.quote(columns, safe=',:/')}")
+           f"?xsiType={record_type}&format=json&columns={urllib.parse.quote(columns, safe=',:/')}")
     payload = _get_json(context, url, timeout)
     rows = payload.get("ResultSet", {}).get("Result", []) if isinstance(payload, dict) else []
-    key = RECORD_TYPE.lower() + "/"
+    key = record_type.lower() + "/"
     records = []
     for r in rows:
         flat = {"ID": r.get("ID"), "label": r.get("label"), "insert_date": r.get("insert_date")}
         flat.update({k[len(key):]: v for k, v in r.items() if k.startswith(key)})
-        if flat.get("imagesession_id") == context.session:
+        owner = flat.get("subject_id") if scope == "subject" else flat.get("imagesession_id")
+        if owner in owners:
+            flat["scope"], flat["owner"] = scope, owner
             records.append(flat)
     return sorted(records, key=lambda r: r.get("insert_date") or "", reverse=True)
+
+
+def list_session_records(context: XnatContext, timeout: float = 60.0) -> list[dict]:
+    """Every generic session record on the run's session, newest first."""
+    return list_records(context, "session", {context.session}, timeout)
+
+
+def list_subject_sessions(context: XnatContext, subject: str, timeout: float = 60.0) -> list[dict]:
+    """``[{"ID", "label"}]`` of the subject's image sessions, by label. Project-scoped: the
+    site-wide ``/data/subjects/<id>/experiments`` returns the subject document, not rows."""
+    url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/subjects/"
+           f"{urllib.parse.quote(subject, safe='')}/experiments?format=json&columns=ID,label,xsiType")
+    payload = _get_json(context, url, timeout)
+    rows = payload.get("ResultSet", {}).get("Result", []) if isinstance(payload, dict) else []
+    sessions = [{"ID": r.get("ID"), "label": r.get("label") or r.get("ID")} for r in rows
+                if r.get("ID") and "SessionData" in str(r.get("xsiType") or "SessionData")]
+    return sorted(sessions, key=lambda s: s["label"])
+
+
+def fetch_session_subject(context: XnatContext, timeout: float = 60.0) -> str:
+    """The subject id of the run's session (for a session-scoped consumer that falls back to a
+    subject record); empty when XNAT does not answer."""
+    url = f"{context.host}/data/experiments/{urllib.parse.quote(context.session, safe='')}?format=json"
+    try:
+        payload = _get_json(context, url, timeout)
+        return str(payload["items"][0]["data_fields"].get("subject_ID") or "").strip()
+    except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError, TypeError) as error:
+        logger.warning("could not read the subject of session %s (%s); no subject-record fallback", context.session, error)
+        return ""
 
 
 def choose_record(prereq: Prerequisite, records: list[dict]) -> tuple[dict | None, str]:
@@ -230,19 +274,33 @@ def choose_record(prereq: Prerequisite, records: list[dict]) -> tuple[dict | Non
     return ok[0], ""
 
 
-def _record_resource_url(context: XnatContext, record_id: str, role: str) -> str:
+def _as_record(context: XnatContext, record) -> dict:
+    """A record dict from an id (a session record of the run's session) or a dict as listed."""
+    if isinstance(record, dict):
+        return record
+    return {"ID": str(record), "scope": "session", "imagesession_id": context.session, "owner": context.session}
+
+
+def _record_resource_url(context: XnatContext, record, role: str) -> str:
+    record = _as_record(context, record)
+    if record.get("scope") == "subject":
+        # A subject record is an experiment of its own; its roles are plain experiment resources.
+        return (f"{context.host}/data/experiments/{urllib.parse.quote(record['ID'], safe='')}"
+                f"/resources/{urllib.parse.quote(role, safe='')}/files")
     # Assessor-scoped: ``/data/experiments/<record>/out/resources/<role>/files`` answers with the
     # record document, not a file list (demo02, 2026-09-07), and the listing then looks empty.
-    return (f"{context.host}/data/experiments/{urllib.parse.quote(context.session, safe='')}/assessors/"
-            f"{urllib.parse.quote(record_id, safe='')}/out/resources/{urllib.parse.quote(role, safe='')}/files")
+    owner = record.get("imagesession_id") or record.get("owner") or context.session
+    return (f"{context.host}/data/experiments/{urllib.parse.quote(owner, safe='')}/assessors/"
+            f"{urllib.parse.quote(record['ID'], safe='')}/out/resources/{urllib.parse.quote(role, safe='')}/files")
 
 
-def download_role(context: XnatContext, record_id: str, role: str, dest: Path, timeout: float = 300.0,
+def download_role(context: XnatContext, record, role: str, dest: Path, timeout: float = 300.0,
                   only: set[str] | None = None) -> list[str]:
-    """Copy every file of the record's ``out`` resource ``role`` into ``dest`` keeping the paths.
+    """Copy every file of the record's resource ``role`` into ``dest`` keeping the paths.
+    ``record`` is a record dict as listed, or the id of a session record of the run's session.
 
     ``only`` restricts the copy to those record paths (a view resolved through ``record_views``)."""
-    listing = _get_json(context, f"{_record_resource_url(context, record_id, role)}?format=json", timeout)
+    listing = _get_json(context, f"{_record_resource_url(context, record, role)}?format=json", timeout)
     files = listing.get("ResultSet", {}).get("Result", []) if isinstance(listing, dict) else []
     written: list[str] = []
     for f in files:
@@ -260,12 +318,13 @@ def download_role(context: XnatContext, record_id: str, role: str, dest: Path, t
     return written
 
 
-def record_views(context: XnatContext, record_id: str, timeout: float = 60.0) -> dict[str, list[str]] | None:
+def record_views(context: XnatContext, record, timeout: float = 60.0) -> dict[str, list[str]] | None:
     """The record's role -> DERIVED-path views from its ``PROVENANCE/wrapup.json``.
 
     ``None`` when the record predates 0.6.0 (no ``views`` in the manifest, or no manifest):
     such a record carries its views as resources of the same name instead."""
-    url = f"{_record_resource_url(context, record_id, 'PROVENANCE')}/wrapup.json"
+    record_id = _as_record(context, record)["ID"]
+    url = f"{_record_resource_url(context, record, 'PROVENANCE')}/wrapup.json"
     try:
         manifest = _get_json(context, url, timeout)
     except urllib.error.HTTPError as error:
@@ -281,22 +340,23 @@ def record_views(context: XnatContext, record_id: str, timeout: float = 60.0) ->
     return {str(role).upper(): [str(p) for p in paths] for role, paths in views.items() if isinstance(paths, list)}
 
 
-def download_view(context: XnatContext, record_id: str, role: str, dest: Path, timeout: float = 300.0) -> tuple[list[str], str]:
+def download_view(context: XnatContext, record, role: str, dest: Path, timeout: float = 300.0) -> tuple[list[str], str]:
     """Materialise a view role (``METRICS``, ...): the DERIVED files its mapping names, at their
     DERIVED paths. Returns ``(files, reason)``; a non-empty reason means the view could not be
     resolved. A record from before 0.6.0 has no views and a resource of that name instead, which
     is used as it was (a 404 there propagates as before)."""
-    views = record_views(context, record_id, timeout=min(timeout, 60.0))
+    record_id = _as_record(context, record)["ID"]
+    views = record_views(context, record, timeout=min(timeout, 60.0))
     if views is None:
         logger.info("record %s carries no views (published before 0.6.0); reading its %s resource", record_id, role)
-        return download_role(context, record_id, role, dest, timeout), ""
+        return download_role(context, record, role, dest, timeout), ""
     if role not in views:
         return [], (f"record {record_id} has no {role} view; its wrapup.json maps "
                     + (", ".join(sorted(views)) if views else "no view roles"))
     wanted = set(views[role])
     if not wanted:
         return [], f"record {record_id}'s {role} view names no files (its globs matched nothing in DERIVED)"
-    got = download_role(context, record_id, "DERIVED", dest, timeout, only=wanted)
+    got = download_role(context, record, "DERIVED", dest, timeout, only=wanted)
     missing = sorted(wanted - set(got))
     if missing:
         return got, (f"record {record_id}'s {role} view names {len(missing)} file(s) that are not on its DERIVED "
@@ -304,8 +364,9 @@ def download_view(context: XnatContext, record_id: str, role: str, dest: Path, t
     return got, ""
 
 
-def download_session_resource(context: XnatContext, label: str, dest: Path, timeout: float = 300.0) -> list[str]:
-    sid = urllib.parse.quote(context.session, safe="")
+def download_session_resource(context: XnatContext, label: str, dest: Path, timeout: float = 300.0,
+                              session: str = "") -> list[str]:
+    sid = urllib.parse.quote(session or context.session, safe="")
     listing = _get_json(context, f"{context.host}/data/experiments/{sid}/resources/{urllib.parse.quote(label, safe='')}/files?format=json", timeout)
     return _download_listing(context, listing, dest, timeout)
 
@@ -353,13 +414,19 @@ class Resolution:
     files: list[str] = field(default_factory=list)
     path: str = ""
     error: str = ""
+    #: Subject scope, a session-scoped prerequisite: one record per session of the subject,
+    #: by session label; ``record`` is then the newest of them.
+    per_session: dict[str, dict] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         d = {"name": self.name, "kind": self.kind, "path": self.path, "files": len(self.files)}
         if self.scans:
             d["scans"] = list(self.scans)
+        if self.per_session:
+            d["sessions"] = {label: {k: r.get(k) for k in ("ID", "label", "pipeline_name", "pipeline_version", "review_state", "run_status")}
+                             for label, r in self.per_session.items()}
         if self.record:
-            d["record"] = {k: self.record.get(k) for k in ("ID", "label", "pipeline_name", "pipeline_version", "review_state", "run_status")}
+            d["record"] = {k: self.record.get(k) for k in ("ID", "label", "pipeline_name", "pipeline_version", "review_state", "run_status", "scope")}
             d["role"] = self.role
         if self.resource:
             d["resource"] = self.resource
@@ -369,13 +436,66 @@ class Resolution:
 
 
 def resolve(context: XnatContext, prereqs: list[Prerequisite], records: list[dict] | None = None) -> list[Resolution]:
-    """Decide, without downloading, which record or resource satisfies each prerequisite."""
-    if records is None and any(not p.is_resource for p in prereqs):
-        records = list_session_records(context)          # only when a record prerequisite needs it (Codex P2, PR #10)
+    """Decide, without downloading, which record or resource satisfies each prerequisite.
+
+    Scope rules (0.6.2). A session-scoped run looks at its own session's records first and,
+    when none satisfies a session-scoped prerequisite, at the subject's records (a subject-level
+    fMRIPrep covers each of its sessions); ``scope=subject`` looks only at the subject's records.
+    A subject-scoped run needs a session-scoped prerequisite on every session of the subject
+    (the setup assembled them all) and finds ``scope=subject`` ones on the subject itself.
+    """
+    if records is None and context.scope == "session" and any(not p.is_resource and p.scope == "session" for p in prereqs):
+        records = list_session_records(context)          # only when a session-record prerequisite needs it (Codex P2, PR #10)
     records = records or []
     out: list[Resolution] = []
     scans: list[dict] | None = None
+    subject_records: list[dict] | None = None
+    subject_sessions: list[dict] | None = None
+    session_records_by_owner: dict[str, list[dict]] = {}
+    subject = context.subject
     for p in prereqs:
+        if context.scope == "subject" and p.is_resource and p.scope == "scan":
+            out.append(Resolution(name=p.name, kind="scan-resource", resource=p.resource,
+                                  error=f"needs {p.describe()}; scan resources cannot be gathered for a subject-scoped run"))
+            continue
+        if context.scope == "subject" and p.is_resource:
+            # The session resource of every session of the subject, each under its label.
+            subject_sessions = list_subject_sessions(context, subject) if subject_sessions is None else subject_sessions
+            out.append(Resolution(name=p.name, kind="resource", resource=p.resource,
+                                  per_session={s["label"]: {"ID": s["ID"], "label": s["label"]} for s in subject_sessions},
+                                  error="" if subject_sessions else f"needs {p.describe()}; subject {subject} has no image sessions"))
+            continue
+        if not p.is_resource and p.scope == "subject":
+            if not subject:
+                subject = fetch_session_subject(context)
+            if subject_records is None:
+                subject_records = list_records(context, "subject", {subject}) if subject else []
+            hit, why = choose_record(p, subject_records)
+            out.append(Resolution(name=p.name, kind="record", record=hit, role=p.role,
+                                  error=why.replace("this session", f"subject {subject or '?'}") if why else ""))
+            continue
+        if not p.is_resource and context.scope == "subject":
+            # Every session of the subject must satisfy it: the tree the App sees spans them all.
+            subject_sessions = list_subject_sessions(context, subject) if subject_sessions is None else subject_sessions
+            if not session_records_by_owner and subject_sessions:
+                for r in list_records(context, "session", {s["ID"] for s in subject_sessions}):
+                    session_records_by_owner.setdefault(r["owner"], []).append(r)
+            per_session, unmet = {}, []
+            for s in subject_sessions:
+                hit, why = choose_record(p, session_records_by_owner.get(s["ID"], []))
+                if hit:
+                    per_session[s["label"]] = hit
+                else:
+                    unmet.append(f"{s['label']}: {why}")
+            newest = max(per_session.values(), key=lambda r: r.get("insert_date") or "") if per_session else None
+            error = ""
+            if not subject_sessions:
+                error = f"needs {p.describe()}; subject {subject} has no image sessions"
+            elif unmet:
+                error = (f"needs {p.describe()} on every session of subject {subject}; "
+                         f"{len(unmet)} of {len(subject_sessions)} unmet: " + " | ".join(unmet))
+            out.append(Resolution(name=p.name, kind="record", record=newest, role=p.role, per_session=per_session, error=error))
+            continue
         if p.is_resource and p.scope == "scan":
             if context.scan:
                 out.append(Resolution(name=p.name, kind="scan-resource", resource=p.resource, scans=[context.scan]))
@@ -393,6 +513,20 @@ def resolve(context: XnatContext, prereqs: list[Prerequisite], records: list[dic
             out.append(Resolution(name=p.name, kind="resource", resource=p.resource))
             continue
         hit, why = choose_record(p, records)
+        if hit is None and not p.record_id:
+            # Own scope first, then the subject: a subject-level run of the same pipeline
+            # covers this session (it holds sub-X/ses-Y for every session).
+            if not subject:
+                subject = fetch_session_subject(context)
+            if subject_records is None:
+                subject_records = list_records(context, "subject", {subject}) if subject else []
+            fallback, _ = choose_record(p, subject_records)
+            if fallback is not None:
+                logger.info("prerequisite %s: no session record satisfies it; using subject record %s (%s %s)",
+                            p.name, fallback.get("ID"), fallback.get("pipeline_name"), fallback.get("pipeline_version"))
+                hit, why = fallback, ""
+            elif subject_records:
+                why += f"; nor do the subject's {len(subject_records)} record(s)"
         out.append(Resolution(name=p.name, kind="record", record=hit, role=p.role, error=why))
     return out
 
@@ -408,6 +542,28 @@ def materialise(context: XnatContext, resolutions: list[Resolution], output_dir:
         dest.mkdir(parents=True, exist_ok=True)
         r.path = f"prereq/{r.name}"
         try:
+            if r.per_session and r.kind == "resource":
+                for label, s in r.per_session.items():
+                    got = download_session_resource(context, r.resource, dest / label, session=s["ID"])
+                    r.files.extend(f"{label}/{f}" for f in got)
+                    if not got:
+                        r.error = f"{needs}session {label} holds no files in its {r.resource} resource"
+                continue
+            if r.per_session and r.kind == "record":
+                # One directory per session label, each holding that session's record role.
+                for label, record in r.per_session.items():
+                    if r.role in FIXED_ROLES:
+                        got = download_role(context, record, r.role, dest / label)
+                    else:
+                        got, why = download_view(context, record, r.role, dest / label)
+                        if why:
+                            r.error = f"{needs}{why}"
+                            break
+                    r.files.extend(f"{label}/{f}" for f in got)
+                    if not got:
+                        r.error = (f"{needs}session {label}: chose {record.get('ID')} but its {r.role} resource holds no files")
+                        break
+                continue
             if r.kind == "scan-resource":
                 missing = []
                 for scan in r.scans:
@@ -421,10 +577,10 @@ def materialise(context: XnatContext, resolutions: list[Resolution], output_dir:
             if r.kind == "resource":
                 r.files = download_session_resource(context, r.resource, dest)
             elif r.role in FIXED_ROLES:
-                r.files = download_role(context, r.record["ID"], r.role, dest)
+                r.files = download_role(context, r.record, r.role, dest)
             else:
                 # A view role (METRICS, ...) is a mapping onto DERIVED since 0.6.0, not a resource.
-                r.files, why = download_view(context, r.record["ID"], r.role, dest)
+                r.files, why = download_view(context, r.record, r.role, dest)
                 if why:
                     r.error = f"{needs}{why}"
                     continue
@@ -437,7 +593,7 @@ def materialise(context: XnatContext, resolutions: list[Resolution], output_dir:
                     else f"the {r.resource} resource does not exist" + (f" on scan(s) {', '.join(r.scans)}" if r.scans else " on this session"))
             r.error = f"{needs}{what} (XNAT answered 404)"
             continue
-        if not r.files:
+        if not r.files and not r.error:
             if r.record:
                 r.error = (f"{needs}chose {r.record.get('ID')} ({r.record.get('pipeline_name')} {r.record.get('pipeline_version')}, "
                            f"{r.record.get('run_status')}, {r.record.get('review_state')}) but its {r.role} resource holds no files")
@@ -468,10 +624,10 @@ def publish_failure_record(context: XnatContext, resolutions: list["Resolution"]
     version = (os.environ.get("PROC_PIPELINE_VERSION") or os.environ.get("SEG_MODEL_VERSION")
                or contract.card_revision or "")
     reasons = " | ".join(f"prerequisite '{r.name}' {r.error}" for r in resolutions if r.error)
-    session_label = fetch_session_label(context)
+    session_label = fetch_target_label(context)
     label = collection_label(pipeline, context.scan, session_label=session_label) + "_record"
     facts = {"wrapup": "record-fetch", "run_status": "FAILED", "auto_qc": "FAIL",
-             "notes": (f"{pipeline} {version} did not run on session {session_label}"
+             "notes": (f"{pipeline} {version} did not run on {context.scope} {session_label}"
                        + (f" scan {context.scan}" if context.scan else "") + f": {reasons}. "
                        f"Nothing was computed; recorded at setup by record-fetch {__version__}."),
              "inputs": {"scan": context.scan, "stage": "setup", "prerequisites": [r.as_dict() for r in resolutions]}}
@@ -525,7 +681,7 @@ def run(args: argparse.Namespace) -> int:
         return 0
     context = XnatContext.from_env()
     if context is None:
-        logger.error("prerequisites declared but the XNAT context is incomplete (XNAT_HOST/USER/PASS, PROC_PROJECT, PROC_SESSION_ID)")
+        logger.error("prerequisites declared but the XNAT context is incomplete (XNAT_HOST/USER/PASS, PROC_PROJECT, PROC_SESSION_ID or PROC_SUBJECT_ID)")
         return 2
     try:
         try:

@@ -42,11 +42,57 @@ from xml.sax.saxutils import escape
 
 from . import __version__
 from .execution import is_reserved
-from .register import LABEL_MAX, XnatContext, auth_headers, collection_label, fetch_session_label
+from .register import LABEL_MAX, XnatContext, auth_headers, collection_label, fetch_target_label
 
 logger = logging.getLogger(__name__)
 
 XSI_TYPE = "analysis:sessionAnalysisData"
+SUBJECT_XSI_TYPE = "analysis:subjectAnalysisData"
+#: The schema caps every ``*_json`` element at 65,536 characters (analysis.xsd); a record that
+#: overruns is refused outright (fmriprep full run and hippunfold on demo02, 2026-09-09).
+RESULTS_JSON_MAX = 65536
+
+
+def xsi_type_for(context: XnatContext) -> str:
+    """The record type for the run's scope: a session assessor, or a subject assessor."""
+    return SUBJECT_XSI_TYPE if context.scope == "subject" else XSI_TYPE
+
+
+def record_urls(context: XnatContext, label_or_id: str) -> tuple[str, str]:
+    """``(object_url, files_base)`` for a record named by label (before create) or id (after).
+
+    Session scope: the record is an image assessor of the session and its role resources live
+    under ``out``. Subject scope: the record is a subject assessor, an experiment of its own,
+    reached by label under the subject and by id under ``/data/experiments``, and its role
+    resources are plain experiment resources (no ``out``)."""
+    name = urllib.parse.quote(label_or_id, safe="")
+    if context.scope == "subject":
+        if label_or_id.startswith("XNAT_"):
+            url = f"{context.host}/data/experiments/{name}"
+        else:
+            url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/subjects/"
+                   f"{urllib.parse.quote(context.subject, safe='')}/experiments/{name}")
+        return url, f"{url}/resources"
+    session = urllib.parse.quote(context.session, safe="")
+    url = f"{context.host}/data/experiments/{session}/assessors/{name}"
+    return url, f"{url}/out/resources"
+
+
+def bounded_results_json(summary: dict) -> str:
+    """``results_json`` under the schema cap. The per-role file lists are counts (the files
+    are enumerable on the record's resources); if the view lists alone still overrun, they
+    become counts too and ``truncated`` names what was dropped, so a consumer knows to read
+    ``PROVENANCE/wrapup.json`` for the full mapping."""
+    text = json.dumps(summary)
+    if len(text) <= RESULTS_JSON_MAX:
+        return text
+    reduced = dict(summary)
+    reduced["views"] = {role: len(paths) for role, paths in (summary.get("views") or {}).items()}
+    reduced["truncated"] = ["views"]
+    logger.warning("results_json would be %d characters (cap %d); the view file lists are replaced by counts, "
+                   "the full mapping stays in PROVENANCE/wrapup.json", len(text), RESULTS_JSON_MAX)
+    return json.dumps(reduced)
+
 ANALYSIS_NS = "http://xnatworks.io/analysis"
 XNAT_NS = "http://nrg.wustl.edu/xnat"
 
@@ -339,7 +385,7 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
     summary = {"model": report.get("model"), "model_version": report.get("model_version"),
                "structures": structures,
                "total_volume_ml": round(sum(r.get("total_volume_ml", 0) for r in results), 2),
-               "files": {role: [f.name for f in items] for role, items in files.items()},
+               "file_counts": {role: len(items) for role, items in files.items()},
                "views": views or {}}
     output_count = sum(len(v) for v in files.values())
     body = "".join([
@@ -367,8 +413,18 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
         _element("inputs_json", json.dumps(inputs)),
         _element("config_json", json.dumps(facts["config"]) if facts.get("config") else None),
         _element("notes", facts.get("notes") or f"Published by {wrapup_name} {__version__} from the {report.get('model')} run"),
-        _element("results_json", json.dumps(summary)),
+        _element("results_json", bounded_results_json(summary)),
     ])
+    if context.scope == "subject":
+        # A subject assessor: owned by the subject, spanning its sessions; no scans element.
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<analysis:SubjectAnalysis xmlns:analysis="{ANALYSIS_NS}" xmlns:xnat="{XNAT_NS}" '
+            f'project="{escape(context.project)}" label="{escape(label)}">\n'
+            f"  <xnat:date>{now.strftime('%Y-%m-%d')}</xnat:date>\n"
+            f"  <xnat:subject_ID>{escape(context.subject)}</xnat:subject_ID>\n"
+            f"{body}</analysis:SubjectAnalysis>\n"
+        )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         f'<analysis:SessionAnalysis xmlns:analysis="{ANALYSIS_NS}" xmlns:xnat="{XNAT_NS}" '
@@ -427,17 +483,17 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     uploaded and the empty files skipped, for a wrapup that reduces its output afterwards.
     """
     files = _record_files(files, output_dir)
-    session = urllib.parse.quote(context.session, safe="")
-    label_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(label, safe='')}"
+    xsi_type = xsi_type_for(context)
+    label_url, _ = record_urls(context, label)
     probe = _request(context, "GET", f"{label_url}?format=json", timeout_seconds)
     if probe == 200:
-        raise RuntimeError(f"label {label} already exists on {context.session}; the record is create-only, "
+        raise RuntimeError(f"label {label} already exists on {context.target}; the record is create-only, "
                            "pass a fresh --record-label or let the run stamp one")
     if probe != 404:   # 401/403/5xx: cannot prove the label is free, and PUT would update if it is not
         raise RuntimeError(f"could not verify that label {label} is free (existence check answered HTTP {probe}); "
                            "not creating, because PUT to an existing label would update it")
     create_url = f"{label_url}?inbody=true"
-    logger.info("publishing %s %s", XSI_TYPE, label)
+    logger.info("publishing %s %s", xsi_type, label)
     try:
         status, text = _put(context, create_url, xml.encode(), "application/xml", timeout_seconds)
     except RuntimeError as error:
@@ -449,10 +505,10 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
         retry = f"{label[:LABEL_MAX - 5]}_{secrets.token_hex(2)}"
         logger.warning("label %s is taken elsewhere in the project (HTTP 409); retrying once as %s", label, retry)
         label = retry
-        label_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(label, safe='')}"
+        label_url, _ = record_urls(context, label)
         status, text = _put(context, f"{label_url}?inbody=true", _relabel(xml, retry).encode(), "application/xml", timeout_seconds)
     record_id = text.strip() if text.strip().startswith("XNAT_") else label
-    record_url = f"{context.host}/data/experiments/{session}/assessors/{urllib.parse.quote(record_id, safe='')}"
+    record_url, files_base = record_urls(context, record_id)
     uploaded: dict[str, list[str]] = {}
     skipped_empty: list[str] = []
     output_paths: dict[str, list[str]] = {"uploaded": [], "skipped_empty": []}
@@ -468,7 +524,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
                     output_paths["skipped_empty"].append(upload_name(path, output_dir))
                     continue
                 content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-                url = (f"{record_url}/out/resources/{role}/files/{urllib.parse.quote(name, safe='/')}"
+                url = (f"{files_base}/{role}/files/{urllib.parse.quote(name, safe='/')}"
                        f"?inbody=true&format={urllib.parse.quote(upload_format(path), safe='')}")
                 _put(context, url, path.read_bytes(), content_type, timeout_seconds)
                 uploaded.setdefault(role, []).append(name)
@@ -485,7 +541,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
         raise RuntimeError(f"{error}; {rollback}") from error
     logger.info("analysis record %s published as %s with %d file(s)", label, record_id,
                 sum(len(v) for v in uploaded.values()))
-    return {"xsi_type": XSI_TYPE, "id": record_id, "label": label, "status": status,
+    return {"xsi_type": xsi_type, "id": record_id, "label": label, "status": status,
             "uploaded": uploaded, "skipped_empty": skipped_empty, "url": create_url.split("?")[0],
             "output_paths": output_paths}
 
@@ -519,7 +575,7 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
         return {"error": "XNAT context incomplete"}
     label = (getattr(args, "record_label", "") or "").strip() or collection_label(
         getattr(args, "model", None) or getattr(args, "pipeline", "run"), context.scan or args.scan,
-        session_label=fetch_session_label(context))
+        session_label=fetch_target_label(context))
     # Everything from file collection onwards is guarded: a bad contract glob (an absolute
     # pattern makes Path.glob raise NotImplementedError) must be recorded, not abort delivery
     # of the masks, report and ROI collection that are already on disk.
