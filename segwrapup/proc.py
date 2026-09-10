@@ -26,7 +26,7 @@ import urllib.parse
 from pathlib import Path
 
 from . import __version__
-from .card import write_card_copy
+from .card import card_for_run, write_card_copy
 from .execution import (RAW_DIRNAME, STATUS_FILENAME, chain_from_workflow, copy_raw_output, fetch_parent_logs,
                         own_workflow_id, read_status, run_status_from)
 from .prereq import MANIFEST as PREREQ_MANIFEST
@@ -135,8 +135,6 @@ def run(args: argparse.Namespace) -> int:
             shutil.copy2(input_dir / name, output_dir / name)
     derived_names = [p[len(RAW_DIRNAME) + 1:] for p in copied]
     run_status = run_status_from(status)
-    # The certificate of the run (plan D27): the card at the adopted revision, under card/.
-    card = write_card_copy(output_dir, "proc-wrapup")
 
     # The XNAT context serves log capture as well as publishing; --no-publish suppresses only
     # the record (publish_if_possible checks the flag), never the execution state.
@@ -158,6 +156,10 @@ def run(args: argparse.Namespace) -> int:
             # The orchestration fields sit on the parent's (main) workflow; the wrapup's own
             # workflow carries none (demo02 wrk_workflowdata, 2026-09-07).
             chain = chain_from_workflow(context, (execution or {}).get("workflow_id")) or chain_from_workflow(context, own_workflow_id())
+        # The certificate of the run (plan D27): the card block of the command that ran, under card/.
+        card_block, card_error = card_for_run(context, {"command-id": (execution or {}).get("command_id")} if execution else None)
+        card = write_card_copy(output_dir, "proc-wrapup", card_block, card_error, command_id=(execution or {}).get("command_id"),
+                               wrapper_id=(execution or {}).get("wrapper_id"), scope=context.scope if context else "session")
         log_tails = {}
         for name in ("stdout", "stderr"):
             path = output_dir / "logs" / f"{name}.log"

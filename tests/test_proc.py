@@ -25,10 +25,12 @@ CONTEXT_ENV = {"XNAT_HOST": "http://x", "XNAT_USER": "alias", "XNAT_PASS": "secr
 # just before the wrapup's own 5001, so any "previous workflow id" guess picks the wrong run.
 # The real link is the mount: CS resolves the wrapup's /input from the parent's output mount
 # (same xnat-host-path on both), as seen on demo02 for containers 35531/35532.
+CARD_BLOCK = {"id": "pyradiomics", "version": "0.3.1", "name": "PyRadiomics", "dockerImage": "radiomics/pyradiomics:CLI", "imageDigest": "sha256:" + "b" * 64,
+              "license": "BSD-3-Clause", "url": "https://github.com/mrjamesdickson/container-workshop/tree/main/wrappers/pyradiomics"}
 BUILD = "/data/xnat/build/1727a620-4b73-4aad-872d-681a14a98d77"
 SETUP_OUT = "/data/xnat/build/0c0c-setup-output"
 CONTAINERS = [
-    {"id": 900, "workflow-id": "4990", "subtype": "docker", "status": "Complete", "docker-image": "radiomics/pyradiomics:CLI",
+    {"id": 900, "workflow-id": "4990", "subtype": "docker", "status": "Complete", "docker-image": "radiomics/pyradiomics:CLI", "command-id": 77, "wrapper-id": 88,
      "backend": "swarm", "node-id": "laz2ephdgvajpbg96rhc6lfmn", "service-id": "svc1", "task-id": "task1", "container-id": "5687d46dcb7c", "user-id": "admin",
      "reserve-memory": 256, "limit-memory": 1024, "limit-cpu": 1.0, "generic-resources": {"GPU": "1"},
      "mounts": [{"name": "input-mount", "writable": False, "xnat-host-path": SETUP_OUT},
@@ -80,6 +82,8 @@ class _CS(BaseHTTPRequestHandler):
         self._record()
         if self.path == "/xapi/containers":
             self._send(200, json.dumps(_CS.containers).encode(), "application/json")
+        elif self.path == "/xapi/commands/77":                       # the registered command carries the card (plan D27)
+            self._send(200, json.dumps({"id": 77, "name": "pyradiomics", "version": "0.3.1", "command-metadata": {"card": CARD_BLOCK}}).encode(), "application/json")
         elif self.path == "/data/experiments/XNAT_E00018?format=json":
             self._send(200, json.dumps({"items": [{"data_fields": {"label": "SESS01"}}]}).encode(), "application/json")
         elif self.path == "/data/projects/PROJ_1/subjects/XNAT_S09007?format=json":
@@ -191,12 +195,12 @@ def test_proc_wrapup_keeps_everything_captures_logs_reports_and_publishes(cs, tm
     inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
     out = tmp_path / "out"
     set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "PyRadiomics", "PROC_PIPELINE_VERSION": "3.1"})
-    from test_card import bundle
-    monkeypatch.setenv("XNW_CARD_BUNDLE", bundle())
     assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
 
-    # the certificate of the run (D27): the card at the adopted revision, under card/, never in DERIVED
-    assert (out / "card" / "metadata.json").exists() and json.loads((out / "card" / "card.json").read_text())["wrapup"] == "proc-wrapup"
+    # the certificate of the run (D27): the card block of command 77, read back from CS, under card/, never in DERIVED
+    assert json.loads((out / "card" / "metadata.json").read_text()) == CARD_BLOCK
+    card_json = json.loads((out / "card" / "card.json").read_text())
+    assert card_json["wrapup"] == "proc-wrapup" and card_json["command_id"] == 77 and card_json["wrapper_id"] == 88 and "error" not in card_json
     assert not (out / "raw" / "card").exists()
     # everything the tool wrote, verbatim, under raw/; the DICOM copy not
     assert (out / "raw" / "features.csv").exists() and (out / "raw" / "sub" / "log.txt").exists()
@@ -224,8 +228,8 @@ def test_proc_wrapup_keeps_everything_captures_logs_reports_and_publishes(cs, tm
     uploads = [c["path"].split("/out/resources/")[1].split("?")[0] for c in handler.calls if "/out/resources/" in c["path"]]
     assert "DERIVED/files/features.csv" in uploads and "REPORT/files/report.html" in uploads
     assert "PROVENANCE/files/wrapup.json" in uploads and "PROVENANCE/files/status.json" in uploads
-    assert "PROVENANCE/files/card/metadata.json" in uploads and "PROVENANCE/files/card/card.json" in uploads and "PROVENANCE/files/card/LICENSE" in uploads
-    assert manifest["card"]["card_id"] == "pyradiomics" and manifest["card"]["bundle_files"] == ["LICENSE", "README.md", "command.json", "metadata.json"]
+    assert "PROVENANCE/files/card/metadata.json" in uploads and "PROVENANCE/files/card/card.json" in uploads
+    assert manifest["card"]["card_id"] == "pyradiomics" and manifest["card"]["card_revision"] == "0.3.1"
     assert "LOGS/files/logs/stdout.log" in uploads and "DERIVED/files/sub/log.txt" in uploads
     assert not [u for u in uploads if u.startswith("METRICS/") or "/raw/" in u]     # METRICS is a view; DERIVED is the tree at its root
     assert manifest["analysis_record"]["id"] == "XNAT_E77777"

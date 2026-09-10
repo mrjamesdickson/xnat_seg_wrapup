@@ -275,6 +275,7 @@ def fetch_parent_logs(context: XnatContext, output_dir: Path, status: dict | Non
         (logs_dir / f"{stream}.log").write_text(text)
         written.append(f"{LOGS_DIRNAME}/{stream}.log")
     info = {"container_id": parent.get("id"), "status": parent.get("status"), "docker_image": parent.get("docker-image"),
+            "command_id": parent.get("command-id"), "wrapper_id": parent.get("wrapper-id"),
             "workflow_id": parent.get("workflow-id"), "duration_seconds": _duration_seconds(parent), "logs": written,
             "facts": describe_execution(found.get("containers") or [], parent, found.get("own"), now=dt.datetime.now(dt.timezone.utc))}
     logger.info("execution state from Container Service container %s: %s, %s s", info["container_id"], info["status"], info["duration_seconds"])

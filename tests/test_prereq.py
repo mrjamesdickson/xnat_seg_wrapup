@@ -75,6 +75,11 @@ class _Xnat(BaseHTTPRequestHandler):
     def do_GET(self):
         _Xnat.calls.append(("GET", self.path, self.headers.get("Cookie")))
         p = self.path
+        if p == "/xapi/containers":                                       # the setup finds the main of its own workflow (plan D27)
+            return self._json([{"id": 1, "workflow-id": "9001", "subtype": "docker", "command-id": 77, "wrapper-id": 88},
+                               {"id": 2, "workflow-id": "9001", "subtype": "docker-setup", "command-id": 5}])
+        if p == "/xapi/commands/77":
+            return self._json({"id": 77, "name": "fake-recon", "command-metadata": {"card": {"id": "fake-recon", "version": "0.3.0", "license": "MIT"}}})
         if p.startswith("/data/projects/P/experiments?"):
             raise AssertionError("the project-wide listing must not be used; records are listed per owner: " + p)
         if p.startswith(("/data/experiments/XNAT_E1/assessors?xsiType=analysis:sessionAnalysisData", "/data/experiments/XNAT_E2/assessors?xsiType=analysis:sessionAnalysisData")):
@@ -335,13 +340,18 @@ def test_unmet_prerequisite_is_recorded_as_a_failed_record_with_the_reason(xnat,
     host, handler = xnat
     inp = tmp_path / "in"; inp.mkdir(); out = tmp_path / "out"
     for k, v in CONTRACT_ENV.items(): monkeypatch.setenv(k, v)
+    monkeypatch.setenv("XNAT_WORKFLOW_ID", "9001")                         # the launch's workflow: the setup finds the main by it
     monkeypatch.setenv("XNW_PREREQ_PREPROC", "type=diffusion-preprocessing;pipeline=qsiprep;accepted=true;min=2.0")
     monkeypatch.setenv("XNW_PREREQ_BIDS", "resource=BIDS")
     with caplog.at_level(logging.INFO):
         assert prereq.main(["--input", str(inp), "--output", str(out)]) == 3
     m = json.loads((out / "prereq.json").read_text())
     assert m["analysis_record"]["id"] == "XNAT_E77" and m["analysis_record"]["label"].startswith("fake-recon_S1_")
-    assert m["analysis_record"]["uploaded"] == {"PROVENANCE": ["prereq.json", "card/card.json"]}   # the certificate, even for a run that never started (D27)
+    # the certificate, even for a run that never started (D27): the card of the main command of the setup's workflow
+    assert m["analysis_record"]["uploaded"] == {"PROVENANCE": ["prereq.json", "card/card.json", "card/metadata.json"]}
+    assert json.loads((out / "card" / "metadata.json").read_text()) == {"id": "fake-recon", "version": "0.3.0", "license": "MIT"}
+    card_json = json.loads((out / "card" / "card.json").read_text())
+    assert card_json["stage"] == "setup" and card_json["command_id"] == 77 and card_json["wrapup"] == "record-fetch"
     create = next(c for c in handler.calls if c[0] == "PUT" and "/out/" not in c[1])
     xml = create[3].decode()
     assert create[1].startswith("/data/experiments/XNAT_E1/assessors/fake-recon_S1_") and create[1].endswith("_record?inbody=true")

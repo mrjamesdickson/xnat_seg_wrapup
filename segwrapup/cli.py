@@ -19,8 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
-from .card import write_card_copy
-from .execution import SOURCE_DICOM_DIRNAME, copy_raw_output
+from .card import card_for_run, write_card_copy
+from .execution import SOURCE_DICOM_DIRNAME, copy_raw_output, find_parent_container, own_workflow_id
 from .labels import (bids_dseg_tsv, collect_labels, discover_labels, itksnap_label_file, load_labels,
                      sidecar_labels, slicer_color_table)
 from .report import render_html
@@ -215,8 +215,12 @@ def run(args: argparse.Namespace) -> int:
                 dropped = drop_registered_seg(args, seg_path, manifest["roi_collection"])
                 manifest["dicom_seg"]["retained_in_resource"] = not dropped
 
-        # The certificate of the run (plan D27): the card at the adopted revision, under card/.
-        manifest["card"] = write_card_copy(output_dir, "seg-wrapup")
+        # The certificate of the run (plan D27): the card block of the command that ran, under card/.
+        # (only when publishing: --no-publish must touch XNAT for nothing)
+        parent = find_parent_container(context, None, own_workflow_id()) if context is not None and not args.no_publish else None
+        card_block, card_error = card_for_run(context if not args.no_publish else None, parent)
+        manifest["card"] = write_card_copy(output_dir, "seg-wrapup", card_block, card_error, command_id=(parent or {}).get("command-id"),
+                                           wrapper_id=(parent or {}).get("wrapper-id"), scope=context.scope if context else "session")
         # wrapup.json first so it can ride along in PROVENANCE, then the record, then the manifest
         # again with the publish outcome (the uploaded copy predates the outcome by design).
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))

@@ -308,16 +308,18 @@ the unmet message names both.
 
 ## The card copy on every record (since 0.6.3, plan D27)
 
-Every record carries the card it was run from, the certificate of the run: `PROVENANCE/card/`
-holds the card's `metadata.json`, `README.md`, `command.json` and `LICENSE` at the adopted
-revision, plus `card.json` saying what the run actually used (card id and revision, image and
-digest, wrapup and version, the bundle's file list and sha256, `card_url`). The adopt tool
-embeds the bundle in the command as `XNW_CARD_BUNDLE` (base64 tar, gzipped or plain, a few KB)
-and points `XNW_CARD_URL` at the registry's readable original; the wrapup needs no network, and
-the copy is exactly the revision that ran. seg-wrapup, proc-wrapup and record-fetch's failure
-record all write it. Without a bundle (an older card) the record still gets `card.json`; a
-malformed bundle (not base64, not a tar, a member outside `card/`, over 4 MB) is logged,
-recorded as `bundle_error` in `card.json`, and never fails the run.
+Every record carries the card it was run from, the certificate of the run. The adopt tool puts
+the card's `metadata.json` (verbatim, plus `imageDigest` and links to the README and LICENSE)
+into the Container Service command as `command-metadata.card`: plain JSON in the command's
+jsonb metadata column, readable in the command definition itself. (An environment variable was
+rejected: the Container Service stores env values in a 255-character column.) The wrapup reads
+its command back from the Container Service (`GET /xapi/commands/<id>`, the id from the parent
+container it already locates for logs; record-fetch finds the main container of its own
+workflow) and writes the block as `PROVENANCE/card/metadata.json`, beside `card/card.json`
+with what only the run knew: command and wrapper ids, the wrapup and its version, the scope,
+when. seg-wrapup, proc-wrapup and record-fetch's failure record all write it. When the command
+carries no block (an older card) or cannot be read, the record still gets `card.json` with the
+reason in `error`; the card copy never fails a run. `wrapup.json` carries the summary as `card`.
 
 ## proc-wrapup: the generic wrapup (since 0.4.0)
 
