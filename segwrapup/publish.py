@@ -58,24 +58,34 @@ def xsi_type_for(context: XnatContext) -> str:
     return SUBJECT_XSI_TYPE if context.scope == "subject" else XSI_TYPE
 
 
-def record_urls(context: XnatContext, label_or_id: str) -> tuple[str, str]:
-    """``(object_url, files_base)`` for a record named by label (before create) or id (after).
+def record_urls(context: XnatContext, name: str, by_id: bool = False) -> tuple[str, str]:
+    """``(object_url, files_base)`` for a record named by label (before create) or, with
+    ``by_id``, by accession id (after).
 
     Session scope: the record is an image assessor of the session and its role resources live
     under ``out``. Subject scope: the record is a subject assessor, an experiment of its own,
     reached by label under the subject and by id under ``/data/experiments``, and its role
-    resources are plain experiment resources (no ``out``)."""
-    name = urllib.parse.quote(label_or_id, safe="")
+    resources are plain experiment resources (no ``out``). Whether ``name`` is an id is stated
+    by the caller, not inferred from its prefix: a label may legitimately start with the site's
+    accession prefix, and the prefix itself is a site setting."""
+    quoted = urllib.parse.quote(name, safe="")
     if context.scope == "subject":
-        if label_or_id.startswith("XNAT_"):
-            url = f"{context.host}/data/experiments/{name}"
+        if by_id:
+            url = f"{context.host}/data/experiments/{quoted}"
         else:
             url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/subjects/"
-                   f"{urllib.parse.quote(context.subject, safe='')}/experiments/{name}")
+                   f"{urllib.parse.quote(context.subject, safe='')}/experiments/{quoted}")
         return url, f"{url}/resources"
     session = urllib.parse.quote(context.session, safe="")
-    url = f"{context.host}/data/experiments/{session}/assessors/{name}"
+    url = f"{context.host}/data/experiments/{session}/assessors/{quoted}"
     return url, f"{url}/out/resources"
+
+
+def created_record_id(response_text: str) -> str:
+    """The accession id XNAT answers a create with (one bare token), or ``""`` when the body
+    is empty or not a token, so the caller keeps addressing the record by label."""
+    token = response_text.strip()
+    return token if token and re.fullmatch(r"[A-Za-z0-9_.-]+", token) else ""
 
 
 def bounded_results_json(summary: dict) -> str:
@@ -408,8 +418,10 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
         _element("output_file_count", output_count),
         _element("review_state", "PENDING_REVIEW"),
         _element("auto_qc_status", auto_qc),
+        # A scan is a session fact: a subject record has no scans element even if the
+        # environment carried a scan id alongside the subject.
         (f"  <analysis:scans><analysis:scan>{escape(context.scan)}</analysis:scan></analysis:scans>\n"
-         if context.scan else ""),
+         if context.scan and context.scope == "session" else ""),
         _element("inputs_json", json.dumps(inputs)),
         _element("config_json", json.dumps(facts["config"]) if facts.get("config") else None),
         _element("notes", facts.get("notes") or f"Published by {wrapup_name} {__version__} from the {report.get('model')} run"),
@@ -466,8 +478,10 @@ def _request(context: XnatContext, method: str, url: str, timeout: float) -> int
 
 
 def _relabel(xml: str, label: str) -> str:
-    """The record document carries its label as an attribute; a retried create must match the URL."""
-    return re.sub(r'(<analysis:SessionAnalysis[^>]*?\slabel=")[^"]*(")', lambda m: m.group(1) + escape(label) + m.group(2), xml, count=1)
+    """The record document carries its label as an attribute; a retried create must match the URL.
+    Both record roots are relabelled: a subject record retried under the old label would collide again."""
+    return re.sub(r'(<analysis:(?:Session|Subject)Analysis[^>]*?\slabel=")[^"]*(")',
+                  lambda m: m.group(1) + escape(label) + m.group(2), xml, count=1)
 
 
 def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, list],
@@ -507,8 +521,9 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
         label = retry
         label_url, _ = record_urls(context, label)
         status, text = _put(context, f"{label_url}?inbody=true", _relabel(xml, retry).encode(), "application/xml", timeout_seconds)
-    record_id = text.strip() if text.strip().startswith("XNAT_") else label
-    record_url, files_base = record_urls(context, record_id)
+    created_id = created_record_id(text)
+    record_id = created_id or label
+    record_url, files_base = record_urls(context, record_id, by_id=bool(created_id))
     uploaded: dict[str, list[str]] = {}
     skipped_empty: list[str] = []
     output_paths: dict[str, list[str]] = {"uploaded": [], "skipped_empty": []}

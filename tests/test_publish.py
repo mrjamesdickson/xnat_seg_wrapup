@@ -77,9 +77,11 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"boom")
             return
-        if "/assessors/" in self.path and "/out/" not in self.path and (_Handler.conflict_labels is None or self.path.split("/assessors/")[1].split("?")[0] in _Handler.conflict_labels):
-            self.send_response(409); self.end_headers(); self.wfile.write(b"<h3>Conflict: Duplicate experiment label</h3>"); return
         is_create = ("/assessors/" in self.path and "/out/" not in self.path) or ("/subjects/" in self.path and "/experiments/" in self.path)
+        if is_create:
+            created_label = self.path.split("/assessors/" if "/assessors/" in self.path else "/experiments/")[1].split("?")[0]
+            if _Handler.conflict_labels is None or created_label in _Handler.conflict_labels:
+                self.send_response(409); self.end_headers(); self.wfile.write(b"<h3>Conflict: Duplicate experiment label</h3>"); return
         self.send_response(201 if is_create else 200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
@@ -93,6 +95,7 @@ class _Handler(BaseHTTPRequestHandler):
 @pytest.fixture
 def xnat():
     _Handler.calls, _Handler.fail_paths, _Handler.existing_labels, _Handler.get_status = [], set(), set(), None
+    _Handler.conflict_labels = set()
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_port}", _Handler
@@ -864,3 +867,53 @@ def test_results_json_stays_under_the_schema_cap_on_a_big_tree(tmp_path, caplog)
     # a small tree keeps its view paths verbatim
     small = json.loads(bounded_results_json({"views": {"METRICS": ["a.json"]}, "file_counts": {"DERIVED": 1}}))
     assert small["views"] == {"METRICS": ["a.json"]} and "truncated" not in small
+
+
+def test_create_409_at_subject_scope_relabels_the_subject_document(xnat, tmp_path):
+    """Codex on PR #15: ``_relabel`` matched only the session root, so a subject record retried
+    after a 409 carried the colliding label inside the document while the URL had the suffix."""
+    from segwrapup import publish
+    host, handler = xnat
+    handler.conflict_labels = {"fmriprep_292_X"}
+    out = tmp_path / "out"; out.mkdir(); (out / "report.html").write_text("<p>r</p>")
+    xml = ('<analysis:SubjectAnalysis xmlns:analysis="x" project="PROJ_1" label="fmriprep_292_X">\n'
+           '</analysis:SubjectAnalysis>')
+    result = publish.publish_record(_subject_context(host), "fmriprep_292_X", xml, {"REPORT": [out / "report.html"]}, output_dir=out)
+    creates = [c for c in handler.calls if c["method"] == "PUT" and "/subjects/XNAT_S09007/experiments/" in c["path"]]
+    assert len(creates) == 2 and creates[0]["path"].startswith("/data/projects/PROJ_1/subjects/XNAT_S09007/experiments/fmriprep_292_X?")
+    retry_label = creates[1]["path"].split("/experiments/")[1].split("?")[0]
+    assert retry_label.startswith("fmriprep_292_X_") and len(retry_label) == len("fmriprep_292_X_") + 4
+    body = creates[1]["body"].decode()
+    assert f'label="{retry_label}"' in body and 'label="fmriprep_292_X"' not in body and body.startswith("<analysis:SubjectAnalysis")
+    assert result["label"] == retry_label and result["id"] == "XNAT_E99999"
+
+
+def test_subject_label_with_the_accession_prefix_is_still_addressed_under_the_subject(xnat, tmp_path):
+    """Codex on PR #15: a label such as ``XNAT_preproc_X`` was taken for an accession id and sent
+    to ``/data/experiments/<label>``; whether a name is an id is now stated by the caller."""
+    from segwrapup.publish import created_record_id, record_urls
+    context = _subject_context("http://x")
+    assert record_urls(context, "XNAT_preproc_X")[0] == "http://x/data/projects/PROJ_1/subjects/XNAT_S09007/experiments/XNAT_preproc_X"
+    assert record_urls(context, "CNDA_E7", by_id=True) == ("http://x/data/experiments/CNDA_E7", "http://x/data/experiments/CNDA_E7/resources")
+    assert created_record_id(" CNDA_E7\n") == "CNDA_E7" and created_record_id("") == "" and created_record_id("<h3>ok</h3>") == ""
+    host, handler = xnat
+    (tmp_path / "report.html").write_text("<html/>")
+    outcome = publish_record(_subject_context(host), "XNAT_preproc_X", "<xml/>", collect_files(tmp_path, RecordContract()), output_dir=tmp_path)
+    paths = [c["path"] for c in handler.calls if c["path"] != "/data/JSESSION"]
+    assert paths[0] == "/data/projects/PROJ_1/subjects/XNAT_S09007/experiments/XNAT_preproc_X?format=json"
+    assert paths[1] == "/data/projects/PROJ_1/subjects/XNAT_S09007/experiments/XNAT_preproc_X?inbody=true"
+    assert outcome["id"] == "XNAT_E99999" and "/data/experiments/XNAT_E99999/resources/REPORT/files/report.html?inbody=true&format=HTML" in paths
+    assert "/data/experiments/XNAT_preproc_X" not in " ".join(paths)
+
+
+def test_record_xml_at_subject_scope_drops_a_scan_id_carried_in_the_environment(tmp_path):
+    """Codex on PR #15: a subject-scoped environment that also carries ``PROC_SCAN_ID`` must not
+    put an ``<analysis:scans>`` element on the subject record (the subject type has none)."""
+    (tmp_path / "volumes.json").write_text("{}")
+    contract = RecordContract.from_env({"XNW_CONTRACT": json.dumps(CONTRACT)})
+    context = XnatContext(host="http://x", user="alias", password="secret", project="PROJ_1", session="", subject="XNAT_S09007", scan="2")
+    assert context.scope == "subject"
+    xml = build_record_xml(context, contract, "fmriprep_292_X", _report(), [], collect_files(tmp_path, contract), False)
+    assert "<analysis:scans>" not in xml and xml.startswith('<?xml version="1.0" encoding="UTF-8"?>\n<analysis:SubjectAnalysis ')
+    session_xml = build_record_xml(_context("http://x"), contract, "DeepWMH_scan2_X", _report(), [], collect_files(tmp_path, contract), False)
+    assert "<analysis:scans><analysis:scan>2</analysis:scan></analysis:scans>" in session_xml   # control: session scope keeps it

@@ -252,6 +252,11 @@ def register_if_possible(args: argparse.Namespace, seg_path: Path, context=None)
     context = context or XnatContext.from_env()
     if context is None:
         return None
+    if context.scope == "subject":
+        # The ROI collection API is per session; a subject-scoped run has no session to
+        # register under, so the SEG stays in the resource and no failed PUT is attempted.
+        logger.info("ROI registration skipped: subject-scoped run (%s) has no session to register the SEG under", context.subject)
+        return None
     label = args.roi_label.strip() or collection_label(args.model, context.scan or args.scan,
                                                        session_label=fetch_target_label(context))
     try:
