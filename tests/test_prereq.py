@@ -3,6 +3,7 @@
 A fake XNAT answers the project record listing, the record/resource file listings and the file
 downloads; every request is recorded.
 """
+import html
 import json
 import logging
 from html import unescape as html_unescape
@@ -531,6 +532,11 @@ def test_a_subject_run_reports_which_sessions_lack_the_prerequisite_and_records_
     assert len(creates) == 1 and b"<analysis:SubjectAnalysis" in creates[0][3] and b"<xnat:subject_ID>XNAT_S1</xnat:subject_ID>" in creates[0][3]
     assert b"did not run on subject 292" in creates[0][3]
     assert manifest["analysis_record"]["id"] == "XNAT_E77" and manifest["analysis_record"]["xsi_type"] == "analysis:subjectAnalysisData"
+    # the failure record names its scope, subject and sessions like any subject record (Codex on PR #15)
+    body = creates[0][3].decode()
+    inputs = json.loads(html.unescape(body.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
+    assert inputs["scope"] == "subject" and inputs["subject"] == "XNAT_S1" and inputs["stage"] == "setup"
+    assert inputs["sessions"] == [{"ID": "XNAT_E1", "label": "S1"}, {"ID": "XNAT_E2", "label": "S2"}]
 
 
 def test_a_subject_run_finds_a_subject_scoped_prerequisite_on_the_subject_itself(xnat, tmp_path, monkeypatch):

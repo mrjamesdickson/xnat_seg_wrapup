@@ -42,7 +42,7 @@ from xml.sax.saxutils import escape
 
 from . import __version__
 from .execution import is_reserved
-from .register import LABEL_MAX, XnatContext, auth_headers, collection_label, fetch_target_label
+from .register import LABEL_MAX, XnatContext, auth_headers, collection_label, fetch_target_label, list_subject_sessions
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +86,21 @@ def created_record_id(response_text: str) -> str:
     is empty or not a token, so the caller keeps addressing the record by label."""
     token = response_text.strip()
     return token if token and re.fullmatch(r"[A-Za-z0-9_.-]+", token) else ""
+
+
+def subject_provenance(context: XnatContext, timeout_seconds: float = 60.0) -> dict:
+    """The ``inputs_json`` keys every subject record carries (``docs/SUBJECT-SCOPE.md``): ``scope``,
+    ``subject`` and the subject's ``sessions`` (the tree the App saw). Empty at session scope.
+    When XNAT does not answer the listing, ``sessions`` is ``[]`` with a warning: the record is
+    still published, a reader sees the empty list rather than a missing key."""
+    if context.scope != "subject":
+        return {}
+    try:
+        sessions = list_subject_sessions(context, context.subject, timeout_seconds)
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        logger.warning("could not list the sessions of subject %s (%s); the record will not name them", context.subject, error)
+        sessions = []
+    return {"scope": "subject", "subject": context.subject, "sessions": sessions}
 
 
 def bounded_results_json(summary: dict) -> str:
@@ -372,7 +387,8 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
                      report: dict, results: list[dict], files: dict[str, list],
                      source_dicom_present: bool, when: datetime | None = None,
                      output_dir: Path | None = None, unmeasured_masks: int = 0,
-                     facts: dict | None = None, views: dict[str, list[str]] | None = None) -> str:
+                     facts: dict | None = None, views: dict[str, list[str]] | None = None,
+                     provenance: dict | None = None) -> str:
     """The assessor document XNAT ingests. Fields: type, status, QC, provenance. No measurements.
 
     ``unmeasured_masks`` is how many delivered masks could not be measured: they still ship
@@ -382,7 +398,8 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
     ``config`` (execution facts: node, envelope, phases; stored as ``config_json``) and
     ``wrapup`` (the publishing wrapup's name, ``seg-wrapup`` by default). ``views`` (role ->
     paths inside DERIVED) goes into ``results_json`` so a consumer can resolve ``METRICS`` to
-    files without reading ``wrapup.json``.
+    files without reading ``wrapup.json``. ``provenance`` is :func:`subject_provenance` for a
+    subject record whose caller did not put the session list in ``inputs`` itself.
     """
     facts = facts or {}
     files = _record_files(files, output_dir)
@@ -392,6 +409,11 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
     auto_qc = facts.get("auto_qc") or ("PASS" if results and structures > 0 and unmeasured_masks == 0 else "WARN")
     inputs = facts.get("inputs") or {"scan": context.scan or report.get("scan") or "", "source_dicom": source_dicom_present,
                                      "masks": [r.get("file") for r in results], "unmeasured_masks": unmeasured_masks}
+    if context.scope == "subject":
+        # Every subject record names its scope and subject; the session list comes from
+        # ``provenance`` (publish_if_possible / the failure record) or from the caller's inputs
+        # (proc-wrapup), whichever the caller supplied. The caller's own keys win.
+        inputs = {"scope": "subject", "subject": context.subject, **(provenance or {}), **inputs}
     summary = {"model": report.get("model"), "model_version": report.get("model_version"),
                "structures": structures,
                "total_volume_ml": round(sum(r.get("total_volume_ml", 0) for r in results), 2),
@@ -608,8 +630,13 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
             manifest["views"] = views
             manifest["ignored_overrides"] = list(contract.ignored_overrides)
             (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
+        # A subject record from a caller that did not list the sessions itself (seg-wrapup) gets
+        # them here; proc-wrapup already put them in facts["inputs"], so no second listing.
+        caller_inputs = (facts or {}).get("inputs") or {}
+        provenance = subject_provenance(context) if "sessions" not in caller_inputs else None
         xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present,
-                               output_dir=output_dir, unmeasured_masks=unmeasured_masks, facts=facts, views=views)
+                               output_dir=output_dir, unmeasured_masks=unmeasured_masks, facts=facts, views=views,
+                               provenance=provenance)
         outcome = publish_record(context, label, xml, files, output_dir=output_dir)
         outcome["skipped_empty"] = sorted(set(outcome.get("skipped_empty") or []) | {f.name for f in empties})
         outcome["output_paths"]["skipped_empty"] = sorted(set(outcome["output_paths"]["skipped_empty"])

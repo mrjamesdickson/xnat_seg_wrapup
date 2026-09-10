@@ -41,8 +41,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import __version__
-from .publish import FIXED_ROLES, RecordContract, build_record_xml, publish_record
-from .register import XnatContext, auth_headers, close_session, collection_label, fetch_target_label
+from .publish import FIXED_ROLES, RecordContract, build_record_xml, publish_record, subject_provenance
+from .register import XnatContext, auth_headers, close_session, collection_label, fetch_target_label, list_subject_sessions
 
 logger = logging.getLogger(__name__)
 
@@ -220,18 +220,6 @@ def list_records(context: XnatContext, scope: str, owners: set[str], timeout: fl
 def list_session_records(context: XnatContext, timeout: float = 60.0) -> list[dict]:
     """Every generic session record on the run's session, newest first."""
     return list_records(context, "session", {context.session}, timeout)
-
-
-def list_subject_sessions(context: XnatContext, subject: str, timeout: float = 60.0) -> list[dict]:
-    """``[{"ID", "label"}]`` of the subject's image sessions, by label. Project-scoped: the
-    site-wide ``/data/subjects/<id>/experiments`` returns the subject document, not rows."""
-    url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/subjects/"
-           f"{urllib.parse.quote(subject, safe='')}/experiments?format=json&columns=ID,label,xsiType")
-    payload = _get_json(context, url, timeout)
-    rows = payload.get("ResultSet", {}).get("Result", []) if isinstance(payload, dict) else []
-    sessions = [{"ID": r.get("ID"), "label": r.get("label") or r.get("ID")} for r in rows
-                if r.get("ID") and "SessionData" in str(r.get("xsiType") or "SessionData")]
-    return sorted(sessions, key=lambda s: s["label"])
 
 
 def fetch_session_subject(context: XnatContext, timeout: float = 60.0) -> str:
@@ -638,7 +626,8 @@ def publish_failure_record(context: XnatContext, resolutions: list["Resolution"]
              "notes": (f"{pipeline} {version} did not run on {context.scope} {session_label}"
                        + (f" scan {context.scan}" if context.scan else "") + f": {reasons}. "
                        f"Nothing was computed; recorded at setup by record-fetch {__version__}."),
-             "inputs": {"scan": context.scan, "stage": "setup", "prerequisites": [r.as_dict() for r in resolutions]}}
+             "inputs": {"scan": context.scan, "stage": "setup", "prerequisites": [r.as_dict() for r in resolutions],
+                        **subject_provenance(context)}}
     files = {"PROVENANCE": [output_dir / MANIFEST]}
     try:
         xml = build_record_xml(context, contract, label, {"model": pipeline, "model_version": version, "scan": context.scan},

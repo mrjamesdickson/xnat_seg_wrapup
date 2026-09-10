@@ -188,6 +188,22 @@ def fetch_subject_label(context: XnatContext, timeout_seconds: float = 60.0) -> 
     return label or context.subject
 
 
+def list_subject_sessions(context: XnatContext, subject: str, timeout_seconds: float = 60.0) -> list[dict]:
+    """``[{"ID", "label"}]`` of the subject's image sessions, by label. Project-scoped: the
+    site-wide ``/data/subjects/<id>/experiments`` returns the subject document, not rows.
+    Raises (URLError/OSError/ValueError) when XNAT does not answer; the caller decides what a
+    record without its session list means."""
+    url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/subjects/"
+           f"{urllib.parse.quote(subject, safe='')}/experiments?format=json&columns=ID,label,xsiType")
+    request = urllib.request.Request(url, headers=auth_headers(context))
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        payload = json.loads(response.read().decode())
+    rows = payload.get("ResultSet", {}).get("Result", []) if isinstance(payload, dict) else []
+    sessions = [{"ID": r.get("ID"), "label": r.get("label") or r.get("ID")} for r in rows
+                if r.get("ID") and "SessionData" in str(r.get("xsiType") or "SessionData")]
+    return sorted(sessions, key=lambda s: s["label"])
+
+
 def fetch_session_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:
     """The session's label (``RSNA0002``) for ``context.session`` (``XNAT_E25251``); empty when
     XNAT does not answer, so callers fall back to the id and still get a unique label."""

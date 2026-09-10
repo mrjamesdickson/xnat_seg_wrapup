@@ -33,7 +33,8 @@ CONTEXT_ENV = {"XNAT_HOST": "http://x", "XNAT_USER": "alias", "XNAT_PASS": "secr
 
 class _Handler(BaseHTTPRequestHandler):
     calls: list = []
-    fail_paths: set = set()
+    fail_paths: set = set()       # PUT to these prefixes answers 500
+    fail_get_paths: set = set()   # GET of these prefixes answers 500
     existing_labels: set = set()      # GET .../assessors/<label> answers 200 for these
     get_status: int | None = None     # when set, every GET answers this instead
 
@@ -48,11 +49,20 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         _Handler.calls.append({"path": self.path, "method": "GET", "auth": self.headers.get("Authorization"), "cookie": self.headers.get("Cookie")})
+        if any(self.path.startswith(p) for p in _Handler.fail_get_paths):
+            self.send_response(500); self.end_headers(); self.wfile.write(b"boom"); return
         if "/subjects/" in self.path and "/experiments/" in self.path and self.path.endswith("?format=json"):
             # a subject-scope label probe: /data/projects/P/subjects/S/experiments/<label>
             label = self.path.split("/experiments/")[-1].split("?")[0]
             self.send_response(_Handler.get_status or (200 if label in _Handler.existing_labels else 404))
             self.end_headers()
+            return
+        if "/subjects/" in self.path and self.path.endswith("/experiments?format=json&columns=ID,label,xsiType"):
+            # the subject's session listing (subject_provenance)
+            body = json.dumps({"ResultSet": {"Result": [{"ID": "XNAT_E2", "label": "292_postop", "xsiType": "xnat:mrSessionData"},
+                                                        {"ID": "XNAT_E1", "label": "292_preop", "xsiType": "xnat:mrSessionData"},
+                                                        {"ID": "XNAT_E9", "label": "old_record", "xsiType": "analysis:subjectAnalysisData"}]}}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
             return
         if "/assessors/" not in self.path and self.path.endswith("?format=json"):
             body = json.dumps({"items": [{"data_fields": {"label": "SUBJ01" if "/subjects/" in self.path else "SESS01"}}]}).encode()
@@ -95,7 +105,7 @@ class _Handler(BaseHTTPRequestHandler):
 @pytest.fixture
 def xnat():
     _Handler.calls, _Handler.fail_paths, _Handler.existing_labels, _Handler.get_status = [], set(), set(), None
-    _Handler.conflict_labels = set()
+    _Handler.conflict_labels, _Handler.fail_get_paths = set(), set()
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_port}", _Handler
@@ -917,3 +927,46 @@ def test_record_xml_at_subject_scope_drops_a_scan_id_carried_in_the_environment(
     assert "<analysis:scans>" not in xml and xml.startswith('<?xml version="1.0" encoding="UTF-8"?>\n<analysis:SubjectAnalysis ')
     session_xml = build_record_xml(_context("http://x"), contract, "DeepWMH_scan2_X", _report(), [], collect_files(tmp_path, contract), False)
     assert "<analysis:scans><analysis:scan>2</analysis:scan></analysis:scans>" in session_xml   # control: session scope keeps it
+
+
+def test_seg_wrapup_subject_record_names_its_scope_subject_and_sessions(xnat, tmp_path, monkeypatch, caplog):
+    """Codex on PR #15 (round two): seg-wrapup and the failure record reached build_record_xml
+    without the session list, so their subject records lacked the scope/subject/sessions that
+    docs/SUBJECT-SCOPE.md promises. publish_if_possible now lists them for any caller that did not."""
+    from types import SimpleNamespace
+    from segwrapup.publish import publish_if_possible, subject_provenance
+    host, handler = xnat
+    (tmp_path / "volumes.json").write_text('{"a":1}')
+    for k, v in {"XNW_CARD_ID": "c", "XNW_ANALYSIS_TYPE": "t", "XNW_CONTAINER_IMAGE": "i:1"}.items():
+        monkeypatch.setenv(k, v)
+    args = SimpleNamespace(no_publish=False, record_label="lbl_X", model="m", scan="")
+    outcome = publish_if_possible(args, tmp_path, {"model": "m", "model_version": "1"}, [], False, context=_subject_context(host))
+    assert outcome["id"] == "XNAT_E99999"
+    xml = [c for c in handler.calls if c["method"] == "PUT" and "/subjects/XNAT_S09007/experiments/lbl_X?" in c["path"]][0]["body"].decode()
+    inputs = json.loads(html_unescape(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
+    assert inputs["scope"] == "subject" and inputs["subject"] == "XNAT_S09007"
+    assert inputs["sessions"] == [{"ID": "XNAT_E2", "label": "292_postop"}, {"ID": "XNAT_E1", "label": "292_preop"}]   # records filtered out, sorted by label
+    assert inputs["masks"] == [] and inputs["source_dicom"] is False      # seg-wrapup's own keys are kept
+    listings = [c["path"] for c in handler.calls if c["path"].endswith("/experiments?format=json&columns=ID,label,xsiType")]
+    assert listings == ["/data/projects/PROJ_1/subjects/XNAT_S09007/experiments?format=json&columns=ID,label,xsiType"]
+    # a session record carries none of this
+    assert subject_provenance(_context(host)) == {}
+    # the listing failing does not cost the record: sessions is [] with a warning, not a missing key
+    handler.fail_get_paths = {"/data/projects/PROJ_1/subjects/XNAT_S09007/experiments?format=json"}
+    with caplog.at_level(logging.WARNING):
+        assert subject_provenance(_subject_context(host)) == {"scope": "subject", "subject": "XNAT_S09007", "sessions": []}
+    assert "could not list the sessions of subject XNAT_S09007" in caplog.text
+
+
+def test_build_record_xml_stamps_scope_and_subject_on_a_subject_record_even_offline(tmp_path):
+    (tmp_path / "volumes.json").write_text("{}")
+    contract = RecordContract.from_env({"XNW_CONTRACT": json.dumps(CONTRACT)})
+    xml = build_record_xml(_subject_context("http://x"), contract, "fmriprep_292_X", _report(), [], collect_files(tmp_path, contract), False)
+    inputs = json.loads(html_unescape(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
+    assert inputs["scope"] == "subject" and inputs["subject"] == "XNAT_S09007" and "sessions" not in inputs
+    # a caller's own inputs win over the stamp and over provenance
+    xml = build_record_xml(_subject_context("http://x"), contract, "fmriprep_292_X", _report(), [], collect_files(tmp_path, contract), False,
+                           facts={"inputs": {"scope": "subject", "subject": "XNAT_S09007", "sessions": [{"ID": "XNAT_E5", "label": "own"}]}},
+                           provenance={"scope": "subject", "subject": "XNAT_S09007", "sessions": []})
+    inputs = json.loads(html_unescape(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
+    assert inputs["sessions"] == [{"ID": "XNAT_E5", "label": "own"}]
