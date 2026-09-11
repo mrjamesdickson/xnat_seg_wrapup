@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.3 (2026-09-11)
+
+The consumers' subject scope, the fetch image label, and the card copy (plan D26 consumers, D27).
+
+- **Either-scope prerequisites at subject scope.** A subject-scoped run with a session-scoped record prerequisite takes the subject's own record when one satisfies it (a subject-level fMRIPrep is one dataset spanning every session, laid out at `prereq/<name>/`, what xcp-d at subject scope reads), and only otherwise needs it on every session of the subject (per-session layout, unchanged). The unmet message names both (`; nor do the subject's N record(s)`). This is what the consumer cards (xcp-d, fmripost-aroma, giga-connectome, bidsmreye, qsirecon) need before their `-subject` wrappers.
+- **`record-fetch-subject` in the image label.** `Dockerfile.fetch` advertises both setup commands, generated from `commands/record-fetch.json` and `commands/record-fetch-subject.json`; label tests now cover the fetch and proc images as well as seg-wrapup (the proc JSON's description had drifted from its label; the label's wording is kept).
+- **The card copy on every record (D27).** `segwrapup.card`: the card's metadata, placed by the adopt tool in the command's `command-metadata.card` (plain JSON, jsonb; an env var was rejected, the Container Service stores env values in a 255-character column), is read back from the Container Service (`/xapi/commands/<id>`, the parent container's `command-id`; record-fetch finds the main container of its own workflow, `locate_main_container`) and written as `card/metadata.json` beside `card/card.json` (command and wrapper ids, wrapup and version, scope, when; `error` when the command carries no block or cannot be read). `card/**/*` joins both wrapups' `PROVENANCE` defaults; record-fetch's failure record attaches it too; never fatal. `fetch_parent_logs` now reports the parent's `command_id` and `wrapper_id`; seg-wrapup with `--no-publish` touches XNAT for nothing.
+- 207 tests (8 new; 1 assertion extended: the failure record's uploads now include `card/card.json` and `card/metadata.json`; none removed).
+
+Cards: re-pin to 0.6.3 and let the adopt tool write `command-metadata.card` (workshop side, next). Subject wrappers for the consumers follow.
+
 ## 0.6.2 (2026-09-10)
 
 Subject scope, and the results_json cap. Plan D23/D26: every BIDS App card runs at session and at subject scope; a subject-context wrapper (xnat2bids-setup 2.0 assembling every session of the subject) needs records and a prerequisite gate of its own.
