@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.3 (unreleased, local snapshot 2026-09-10)
+## 0.6.3 (2026-09-11)
 
 The consumers' subject scope, the fetch image label, and the card copy (plan D26 consumers, D27).
 
