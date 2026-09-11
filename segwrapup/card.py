@@ -11,7 +11,9 @@ its command back from the Container Service and writes the block onto the record
 
 The command is found through the parent container: proc-wrapup and seg-wrapup already locate
 it (``execution.find_parent_container``) and it carries ``command-id``; record-fetch, a setup,
-finds the main container of its own workflow. When the command cannot be read the record gets
+finds its command by the block itself (``XNW_CARD_ID`` / ``XNW_CARD_REVISION``), because a setup
+runs before the main container exists and each of setup, main and wrapup carries its own
+workflow id. When the command cannot be read the record gets
 ``card.json`` alone with the reason in ``error``: the record and the dataset matter more than
 the certificate, so this never fails a run.
 """
@@ -25,7 +27,7 @@ import urllib.error
 from pathlib import Path
 
 from . import __version__
-from .execution import HELPER_SUBTYPES, _get_json
+from .execution import _get_json
 from .register import XnatContext
 
 logger = logging.getLogger("segwrapup.card")
@@ -59,22 +61,33 @@ def fetch_command_card(context: XnatContext, command_id, timeout: float = 60.0) 
     return card, ""
 
 
-def locate_main_container(context: XnatContext, workflow_id: str | None, timeout: float = 60.0) -> dict | None:
-    """The main (non-helper) container of ``workflow_id``: how a setup command finds the run it
-    prepares. Every container of a launch shares the workflow id (main, setup, wrapup)."""
-    if not workflow_id:
-        return None
+def find_card_command(context: XnatContext, card_id: str, revision: str, timeout: float = 60.0) -> tuple[dict | None, str]:
+    """The card block of the registered command whose ``command-metadata.card`` names ``card_id``
+    at ``revision`` (``XNW_CARD_ID`` / ``XNW_CARD_REVISION``, which the setup and the wrapup
+    inherit from the card's command). How record-fetch finds its card: a setup runs before the
+    main container exists, and setup, main and wrapup each carry their own workflow id (demo02
+    273722/273723/273724), so neither the container list nor a shared workflow leads to the
+    command; the block itself does. Returns (block, reason)."""
+    if not card_id:
+        return None, "no XNW_CARD_ID in the environment"
     try:
-        containers = _get_json(context, f"{context.host}/xapi/containers", timeout)
+        commands = _get_json(context, f"{context.host}/xapi/commands", timeout)
     except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, ValueError) as error:
-        logger.warning("could not list containers to find the main run of workflow %s: %s", workflow_id, error)
-        return None
-    mains = [c for c in containers if isinstance(c, dict) and str(c.get("workflow-id")) == str(workflow_id)
-             and c.get("subtype") not in HELPER_SUBTYPES] if isinstance(containers, list) else []
-    if len(mains) != 1:
-        logger.info("workflow %s has %d main container(s); the card copy needs exactly one", workflow_id, len(mains))
-        return None
-    return mains[0]
+        logger.warning("could not list commands to find card %s %s: %s", card_id, revision, error)
+        return None, f"could not list commands: {error}"
+    hits = []
+    for command in commands if isinstance(commands, list) else []:
+        metadata = command.get("command-metadata") if isinstance(command, dict) else None
+        block = metadata.get(METADATA_KEY) if isinstance(metadata, dict) else None
+        if isinstance(block, dict) and block.get("id") == card_id and str(block.get("version")) == str(revision):
+            hits.append((command.get("id"), block))
+    if not hits:
+        logger.info("no registered command carries command-metadata.%s for %s %s; the record gets card.json only", METADATA_KEY, card_id, revision)
+        return None, f"no registered command carries the card {card_id} {revision}"
+    if len({json.dumps(b, sort_keys=True) for _, b in hits}) > 1:
+        logger.warning("%d registered commands carry different card blocks for %s %s; the card copy needs one", len(hits), card_id, revision)
+        return None, f"{len(hits)} registered commands carry different blocks for {card_id} {revision}"
+    return hits[0][1], ""
 
 
 def write_card_copy(output_dir: Path, wrapup: str, card: dict | None, error: str = "", command_id=None, wrapper_id=None,
@@ -110,3 +123,12 @@ def card_for_run(context: XnatContext | None, parent: dict | None, timeout: floa
     if not parent:
         return None, "main container not found"
     return fetch_command_card(context, parent.get("command-id"), timeout)
+
+
+def card_for_env(context: XnatContext | None, environ: dict | None = None, timeout: float = 60.0) -> tuple[dict | None, str]:
+    """The card block by the environment's card id and revision (record-fetch's route)."""
+    import os
+    env = os.environ if environ is None else environ
+    if context is None:
+        return None, "no XNAT context"
+    return find_card_command(context, (env.get("XNW_CARD_ID") or "").strip(), (env.get("XNW_CARD_REVISION") or "").strip(), timeout)

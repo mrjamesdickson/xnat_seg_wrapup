@@ -78,8 +78,9 @@ class _Xnat(BaseHTTPRequestHandler):
         if p == "/xapi/containers":                                       # the setup finds the main of its own workflow (plan D27)
             return self._json([{"id": 1, "workflow-id": "9001", "subtype": "docker", "command-id": 77, "wrapper-id": 88},
                                {"id": 2, "workflow-id": "9001", "subtype": "docker-setup", "command-id": 5}])
-        if p == "/xapi/commands/77":
-            return self._json({"id": 77, "name": "fake-recon", "command-metadata": {"card": {"id": "fake-recon", "version": "0.3.0", "license": "MIT"}}})
+        if p == "/xapi/commands":
+            return self._json([{"id": 77, "name": "fake-recon", "command-metadata": {"card": {"id": "fake-recon", "version": "0.1.0", "license": "MIT"}}},
+                               {"id": 5, "name": "record-fetch", "version": "0.6.3"}])
         if p.startswith("/data/projects/P/experiments?"):
             raise AssertionError("the project-wide listing must not be used; records are listed per owner: " + p)
         if p.startswith(("/data/experiments/XNAT_E1/assessors?xsiType=analysis:sessionAnalysisData", "/data/experiments/XNAT_E2/assessors?xsiType=analysis:sessionAnalysisData")):
@@ -349,9 +350,10 @@ def test_unmet_prerequisite_is_recorded_as_a_failed_record_with_the_reason(xnat,
     assert m["analysis_record"]["id"] == "XNAT_E77" and m["analysis_record"]["label"].startswith("fake-recon_S1_")
     # the certificate, even for a run that never started (D27): the card of the main command of the setup's workflow
     assert m["analysis_record"]["uploaded"] == {"PROVENANCE": ["prereq.json", "card/card.json", "card/metadata.json"]}
-    assert json.loads((out / "card" / "metadata.json").read_text()) == {"id": "fake-recon", "version": "0.3.0", "license": "MIT"}
+    assert json.loads((out / "card" / "metadata.json").read_text()) == {"id": "fake-recon", "version": "0.1.0", "license": "MIT"}
     card_json = json.loads((out / "card" / "card.json").read_text())
-    assert card_json["stage"] == "setup" and card_json["command_id"] == 77 and card_json["wrapup"] == "record-fetch"
+    assert card_json["stage"] == "setup" and card_json["wrapup"] == "record-fetch" and card_json["card_id"] == "fake-recon"
+    assert not any(c[0] == "GET" and c[1] == "/xapi/containers" for c in handler.calls), "the setup finds its card by the block, not by the container list"
     create = next(c for c in handler.calls if c[0] == "PUT" and "/out/" not in c[1])
     xml = create[3].decode()
     assert create[1].startswith("/data/experiments/XNAT_E1/assessors/fake-recon_S1_") and create[1].endswith("_record?inbody=true")

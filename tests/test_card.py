@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from segwrapup import __version__
-from segwrapup.card import card_for_run, fetch_command_card, locate_main_container, write_card_copy
+from segwrapup.card import card_for_env, card_for_run, fetch_command_card, find_card_command, write_card_copy
 from segwrapup.proc import PROC_DEFAULT_RESOURCES
 from segwrapup.publish import DEFAULT_RESOURCES, RecordContract, collect_files
 from segwrapup.register import XnatContext
@@ -20,7 +20,10 @@ CARD = {"id": "mriqc", "version": "1.4.0", "name": "MRIQC - MRI Quality Control"
         "url": "https://github.com/mrjamesdickson/container-workshop/tree/main/wrappers/mriqc"}
 COMMANDS = {"77": {"id": 77, "name": "mriqc", "version": "1.4.0", "command-metadata": {"card": CARD}},
             "78": {"id": 78, "name": "bare", "version": "0.1.0"},
-            "79": {"id": 79, "name": "odd", "command-metadata": {"card": "not an object"}}}
+            "79": {"id": 79, "name": "odd", "command-metadata": {"card": "not an object"}},
+            "80": {"id": 80, "name": "mriqc-d26", "version": "1.4.0", "command-metadata": {"card": CARD}},          # the same card registered twice (a proof copy): one block
+            "81": {"id": 81, "name": "fmriprep", "version": "0.3.0", "command-metadata": {"card": {"id": "fmriprep", "version": "0.3.0"}}},
+            "82": {"id": 82, "name": "fmriprep-old", "version": "0.3.0", "command-metadata": {"card": {"id": "fmriprep", "version": "0.3.0", "license": "x"}}}}
 CONTAINERS = [{"id": 1, "workflow-id": "9001", "subtype": "docker", "command-id": 77, "wrapper-id": 88},
               {"id": 2, "workflow-id": "9001", "subtype": "docker-setup", "command-id": 5},
               {"id": 3, "workflow-id": "9002", "subtype": "docker", "command-id": 78},
@@ -39,6 +42,8 @@ class _CS(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/xapi/containers":
             body = json.dumps(CONTAINERS).encode()
+        elif self.path == "/xapi/commands":
+            body = json.dumps(list(COMMANDS.values())).encode()
         elif self.path.startswith("/xapi/commands/") and self.path.rsplit("/", 1)[-1] in COMMANDS:
             body = json.dumps(COMMANDS[self.path.rsplit("/", 1)[-1]]).encode()
         else:
@@ -65,15 +70,18 @@ def test_the_command_card_is_read_back_from_the_container_service(cs, caplog):
     assert fetch_command_card(cs, None) == (None, "no command id")
 
 
-def test_a_setup_finds_the_main_container_of_its_own_workflow(cs, caplog):
-    """record-fetch runs before the main; every container of a launch shares the workflow id, so
-    the main is the non-helper one with the setup's own workflow id."""
-    assert locate_main_container(cs, "9001")["command-id"] == 77
-    assert locate_main_container(cs, None) is None
+def test_a_setup_finds_its_card_by_the_block_itself(cs, caplog):
+    """record-fetch runs before the main container exists, and setup, main and wrapup each carry
+    their own workflow id (demo02 273722/273723/273724), so the setup finds the command whose
+    command-metadata.card names XNW_CARD_ID at XNW_CARD_REVISION."""
+    assert find_card_command(cs, "mriqc", "1.4.0") == (CARD, "")          # registered twice with one block: fine
+    assert card_for_env(cs, {"XNW_CARD_ID": "mriqc", "XNW_CARD_REVISION": "1.4.0"}) == (CARD, "")
+    assert card_for_env(None, {"XNW_CARD_ID": "mriqc", "XNW_CARD_REVISION": "1.4.0"}) == (None, "no XNAT context")
+    assert card_for_env(cs, {}) == (None, "no XNW_CARD_ID in the environment")
     with caplog.at_level(logging.INFO):
-        assert locate_main_container(cs, "9003") is None        # two mains: ambiguous, no guess
-        assert locate_main_container(cs, "nope") is None
-    assert "workflow 9003 has 2 main container(s)" in caplog.text
+        assert find_card_command(cs, "mriqc", "9.9.9") == (None, "no registered command carries the card mriqc 9.9.9")
+        assert find_card_command(cs, "fmriprep", "0.3.0") == (None, "2 registered commands carry different blocks for fmriprep 0.3.0")
+    assert "carry different card blocks for fmriprep 0.3.0" in caplog.text
     assert card_for_run(cs, {"command-id": 77}) == (CARD, "")
     assert card_for_run(None, {"command-id": 77}) == (None, "no XNAT context")
     assert card_for_run(cs, None) == (None, "main container not found")

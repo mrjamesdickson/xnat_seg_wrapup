@@ -41,8 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import __version__
-from .card import CARD_DIRNAME, card_for_run, locate_main_container, write_card_copy
-from .execution import own_workflow_id
+from .card import CARD_DIRNAME, card_for_env, write_card_copy
 from .publish import FIXED_ROLES, RecordContract, build_record_xml, publish_record, subject_provenance
 from .register import XnatContext, auth_headers, close_session, collection_label, fetch_target_label, list_subject_sessions
 
@@ -644,10 +643,8 @@ def publish_failure_record(context: XnatContext, resolutions: list["Resolution"]
                        f"Nothing was computed; recorded at setup by record-fetch {__version__}."),
              "inputs": {"scan": context.scan, "stage": "setup", "prerequisites": [r.as_dict() for r in resolutions],
                         **subject_provenance(context)}}
-    main = locate_main_container(context, own_workflow_id())
-    card_block, card_error = card_for_run(context, main)
-    card = write_card_copy(output_dir, "record-fetch", card_block, card_error, command_id=(main or {}).get("command-id"),
-                           wrapper_id=(main or {}).get("wrapper-id"), scope=context.scope, extra={"stage": "setup"})
+    card_block, card_error = card_for_env(context)
+    card = write_card_copy(output_dir, "record-fetch", card_block, card_error, scope=context.scope, extra={"stage": "setup"})
     files = {"PROVENANCE": [output_dir / MANIFEST, *sorted(p for p in (output_dir / CARD_DIRNAME).rglob("*") if p.is_file())]}
     facts["inputs"]["card"] = card
     try:
