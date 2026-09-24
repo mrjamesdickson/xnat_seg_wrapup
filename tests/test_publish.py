@@ -51,6 +51,18 @@ class _Handler(BaseHTTPRequestHandler):
         _Handler.calls.append({"path": self.path, "method": "GET", "auth": self.headers.get("Authorization"), "cookie": self.headers.get("Cookie")})
         if any(self.path.startswith(p) for p in _Handler.fail_get_paths):
             self.send_response(500); self.end_headers(); self.wfile.write(b"boom"); return
+        if self.path.startswith("/data/experiments/XNAT_D1?format=json"):
+            # the dataset (analysisDatasetData project asset) a dataset-scoped run cites
+            body = json.dumps({"items": [{"data_fields": {"label": "cohort-v1", "included_count": "26",
+                                                          "xsiType": "analysis:analysisDatasetData"}}]}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+            return
+        if self.path.startswith("/data/projects/") and "/experiments/" in self.path and "/subjects/" not in self.path and self.path.endswith("?format=json"):
+            # a dataset-scope label probe: /data/projects/P/experiments/<label>
+            label = self.path.split("/experiments/")[-1].split("?")[0]
+            self.send_response(_Handler.get_status or (200 if label in _Handler.existing_labels else 404))
+            self.end_headers()
+            return
         if "/subjects/" in self.path and "/experiments/" in self.path and self.path.endswith("?format=json"):
             # a subject-scope label probe: /data/projects/P/subjects/S/experiments/<label>
             label = self.path.split("/experiments/")[-1].split("?")[0]
@@ -87,7 +99,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"boom")
             return
-        is_create = ("/assessors/" in self.path and "/out/" not in self.path) or ("/subjects/" in self.path and "/experiments/" in self.path)
+        is_create = (("/assessors/" in self.path and "/out/" not in self.path) or ("/subjects/" in self.path and "/experiments/" in self.path)
+                     or (self.path.startswith("/data/projects/") and "/experiments/" in self.path and "/resources/" not in self.path))
         if is_create:
             created_label = self.path.split("/assessors/" if "/assessors/" in self.path else "/experiments/")[1].split("?")[0]
             if _Handler.conflict_labels is None or created_label in _Handler.conflict_labels:
@@ -970,3 +983,123 @@ def test_build_record_xml_stamps_scope_and_subject_on_a_subject_record_even_offl
                            provenance={"scope": "subject", "subject": "XNAT_S09007", "sessions": []})
     inputs = json.loads(html_unescape(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
     assert inputs["sessions"] == [{"ID": "XNAT_E5", "label": "own"}]
+
+
+# ── dataset scope (0.7.0) ──────────────────────────────────────────────────────
+
+def _dataset_context(host, scan=""):
+    return XnatContext(host=host, user="alias", password="secret", project="PROJ_1", session="", dataset="XNAT_D1", scan=scan)
+
+
+def test_record_xml_at_dataset_scope_is_a_group_project_asset_citing_the_dataset(tmp_path):
+    """A dataset-scoped run leaves an analysis:groupAnalysisData: a project asset of the project
+    (no subject, no session, no scans), citing the frozen dataset in input_dataset_id and, when
+    known, the cohort's member count in subject_count (docs/DATASET-SCOPE.md)."""
+    from segwrapup.publish import DATASET_XSI_TYPE, xsi_type_for
+    (tmp_path / "volumes.json").write_text("{}")
+    contract = RecordContract.from_env({"XNW_CONTRACT": json.dumps(CONTRACT)})
+    context = _dataset_context("http://x", scan="2")
+    assert context.scope == "dataset" and context.target == "XNAT_D1" and xsi_type_for(context) == DATASET_XSI_TYPE
+    xml = build_record_xml(context, contract, "fitlins_cohort_X", _report(), [], collect_files(tmp_path, contract), False,
+                           provenance={"scope": "dataset", "dataset": "XNAT_D1", "dataset_label": "cohort-v1", "project": "PROJ_1", "included_count": 26})
+    assert xml.startswith('<?xml version="1.0" encoding="UTF-8"?>\n<analysis:GroupAnalysis ')
+    assert 'project="PROJ_1" label="fitlins_cohort_X"' in xml and xml.rstrip().endswith("</analysis:GroupAnalysis>")
+    assert "subject_ID" not in xml and "imageSession_ID" not in xml and "<analysis:scans>" not in xml   # a scan id in the environment is not a fact of a dataset record
+    assert "<analysis:input_dataset_id>XNAT_D1</analysis:input_dataset_id>" in xml
+    assert "<analysis:subject_count>26</analysis:subject_count>" in xml
+    assert "<analysis:pipeline_name>DeepWMH<" in xml and "<analysis:run_status>SUCCEEDED<" in xml     # the same fields as a session record
+    inputs = json.loads(html_unescape(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
+    assert inputs["scope"] == "dataset" and inputs["dataset"] == "XNAT_D1" and inputs["dataset_label"] == "cohort-v1" and inputs["included_count"] == 26
+    # no count known: no subject_count element, the record still cites the dataset
+    xml = build_record_xml(context, contract, "fitlins_cohort_X", _report(), [], collect_files(tmp_path, contract), False)
+    assert "<analysis:input_dataset_id>XNAT_D1<" in xml and "subject_count" not in xml
+    inputs = json.loads(html_unescape(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
+    assert inputs["scope"] == "dataset" and inputs["dataset"] == "XNAT_D1" and "dataset_label" not in inputs
+    # control: a session record carries neither element
+    session_xml = build_record_xml(_context("http://x"), contract, "DeepWMH_scan2_X", _report(), [], collect_files(tmp_path, contract), False)
+    assert "input_dataset_id" not in session_xml and "subject_count" not in session_xml
+
+
+def test_record_urls_at_dataset_scope_go_under_the_project_by_label_and_experiments_by_id():
+    from segwrapup.publish import record_urls
+    context = _dataset_context("http://x")
+    assert record_urls(context, "fitlins_cohort_X") == ("http://x/data/projects/PROJ_1/experiments/fitlins_cohort_X",
+                                                        "http://x/data/projects/PROJ_1/experiments/fitlins_cohort_X/resources")
+    assert record_urls(context, "XNAT_E7", by_id=True) == ("http://x/data/experiments/XNAT_E7", "http://x/data/experiments/XNAT_E7/resources")
+    assert record_urls(context, "XNAT_preproc_X")[0] == "http://x/data/projects/PROJ_1/experiments/XNAT_preproc_X"   # a label is a label
+
+
+def test_publish_at_dataset_scope_creates_under_the_project_and_uploads_to_experiment_resources(xnat, tmp_path):
+    from segwrapup.publish import DATASET_XSI_TYPE
+    host, handler = xnat
+    (tmp_path / "report.html").write_text("<html/>")
+    (tmp_path / "sub-01").mkdir()
+    (tmp_path / "sub-01" / "contrast-a_stat-z_statmap.nii.gz").write_bytes(b"z")
+    files = collect_files(tmp_path, RecordContract())
+    outcome = publish_record(_dataset_context(host), "fitlins_cohort_X", "<xml/>", files, output_dir=tmp_path)
+    assert outcome["id"] == "XNAT_E99999" and outcome["xsi_type"] == DATASET_XSI_TYPE
+    calls = [c for c in handler.calls if c["path"] != "/data/JSESSION"]
+    paths = [c["path"] for c in calls]
+    assert paths[0] == "/data/projects/PROJ_1/experiments/fitlins_cohort_X?format=json" and calls[0]["method"] == "GET"
+    assert paths[1] == "/data/projects/PROJ_1/experiments/fitlins_cohort_X?inbody=true" and calls[1]["method"] == "PUT"
+    assert "/data/experiments/XNAT_E99999/resources/REPORT/files/report.html?inbody=true&format=HTML" in paths
+    assert "/data/experiments/XNAT_E99999/resources/DERIVED/files/sub-01/contrast-a_stat-z_statmap.nii.gz?inbody=true&format=NIFTI" in paths
+    assert not [p for p in paths if "/out/" in p or "/assessors/" in p or "/subjects/" in p]
+    # an existing label is refused before any PUT, and a failed upload rolls the asset back by id
+    handler.calls.clear(); handler.existing_labels = {"taken_X"}
+    with pytest.raises(RuntimeError, match="already exists on XNAT_D1"):
+        publish_record(_dataset_context(host), "taken_X", "<xml/>", files, output_dir=tmp_path)
+    assert [c["method"] for c in handler.calls if c["path"] != "/data/JSESSION"] == ["GET"]
+    handler.existing_labels = set(); handler.fail_paths = {"/data/experiments/XNAT_E99999/resources/DERIVED/files/sub-01"}
+    with pytest.raises(RuntimeError, match="record XNAT_E99999 deleted"):
+        publish_record(_dataset_context(host), "fresh_X", "<xml/>", files, output_dir=tmp_path)
+    assert [c["path"] for c in handler.calls if c["method"] == "DELETE" and c["path"] != "/data/JSESSION"] == ["/data/experiments/XNAT_E99999?removeFiles=true"]
+
+
+def test_create_409_at_dataset_scope_relabels_the_group_document(xnat, tmp_path):
+    from segwrapup import publish
+    host, handler = xnat
+    handler.conflict_labels = {"fitlins_cohort_X"}
+    out = tmp_path / "out"; out.mkdir(); (out / "report.html").write_text("<p>r</p>")
+    xml = '<analysis:GroupAnalysis xmlns:analysis="x" project="PROJ_1" label="fitlins_cohort_X">\n</analysis:GroupAnalysis>'
+    result = publish.publish_record(_dataset_context(host), "fitlins_cohort_X", xml, {"REPORT": [out / "report.html"]}, output_dir=out)
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/")]
+    assert len(creates) == 2
+    retry_label = creates[1]["path"].split("/experiments/")[1].split("?")[0]
+    assert retry_label.startswith("fitlins_cohort_X_") and len(retry_label) == len("fitlins_cohort_X_") + 4
+    body = creates[1]["body"].decode()
+    assert f'label="{retry_label}"' in body and 'label="fitlins_cohort_X"' not in body and body.startswith("<analysis:GroupAnalysis")
+    assert result["label"] == retry_label and result["id"] == "XNAT_E99999"
+
+
+def test_dataset_provenance_reads_the_asset_and_publish_if_possible_stamps_it(xnat, tmp_path, monkeypatch, caplog):
+    """seg-wrapup and the failure record reach build_record_xml without describing the dataset;
+    publish_if_possible reads the asset for them (as it lists a subject's sessions), and a
+    caller that already did (proc-wrapup) is not asked twice."""
+    from types import SimpleNamespace
+    from segwrapup.publish import dataset_provenance, publish_if_possible, scope_provenance
+    host, handler = xnat
+    assert dataset_provenance(_dataset_context(host)) == {"scope": "dataset", "dataset": "XNAT_D1", "dataset_label": "cohort-v1",
+                                                         "project": "PROJ_1", "included_count": 26}
+    assert dataset_provenance(_context(host)) == {}
+    assert scope_provenance(_dataset_context(host), {"dataset_label": "own"}) is None
+    assert scope_provenance(_context(host), {}) is None
+    (tmp_path / "volumes.json").write_text('{"a":1}')
+    for k, v in {"XNW_CARD_ID": "c", "XNW_ANALYSIS_TYPE": "group_glm", "XNW_CONTAINER_IMAGE": "i:1"}.items():
+        monkeypatch.setenv(k, v)
+    args = SimpleNamespace(no_publish=False, record_label="lbl_X", model="m", scan="")
+    handler.calls.clear()
+    outcome = publish_if_possible(args, tmp_path, {"model": "m", "model_version": "1"}, [], False, context=_dataset_context(host))
+    assert outcome["id"] == "XNAT_E99999"
+    xml = [c for c in handler.calls if c["method"] == "PUT" and c["path"] == "/data/projects/PROJ_1/experiments/lbl_X?inbody=true"][0]["body"].decode()
+    assert xml.startswith('<?xml version="1.0" encoding="UTF-8"?>\n<analysis:GroupAnalysis ') and "<analysis:subject_count>26<" in xml
+    inputs = json.loads(html_unescape(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
+    assert inputs["scope"] == "dataset" and inputs["dataset"] == "XNAT_D1" and inputs["dataset_label"] == "cohort-v1" and inputs["included_count"] == 26
+    assert inputs["masks"] == [] and inputs["source_dicom"] is False      # seg-wrapup's own keys are kept
+    assert [c["path"] for c in handler.calls if c["path"].startswith("/data/experiments/XNAT_D1")] == ["/data/experiments/XNAT_D1?format=json"]
+    # the asset not answering costs nothing but the label and count
+    handler.fail_get_paths = {"/data/experiments/XNAT_D1"}
+    with caplog.at_level(logging.WARNING):
+        assert dataset_provenance(_dataset_context(host)) == {"scope": "dataset", "dataset": "XNAT_D1", "dataset_label": "",
+                                                             "project": "PROJ_1", "included_count": None}
+    assert "could not read dataset XNAT_D1" in caplog.text

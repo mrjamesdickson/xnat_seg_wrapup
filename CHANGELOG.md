@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.7.0 (2026-09-24)
+
+Dataset scope: group-level results save like the session and subject ones (James, 2026-09-24:
+"make the group level results save like the generic subject and session level analysis results").
+
+- **Dataset records.** A run whose environment names `PROC_DATASET_ID` (or `SEG_DATASET_ID`; the
+  `analysis:analysisDatasetData` a dataset-context wrapper launches on, however its tree was
+  made: materialised by the group-level plugin or uploaded) and neither a
+  session nor a subject is dataset-scoped: proc-wrapup and seg-wrapup publish an
+  `analysis:groupAnalysisData` project asset of the project (`PUT
+  /data/projects/P/experiments/<label>?inbody=true`, files as experiment resources, read and
+  deleted by id), with the same fields as a session record minus `scans`, plus
+  `input_dataset_id` and `subject_count` (the cohort's `included_count`, read from the asset);
+  `inputs_json` carries `scope`, `dataset`, `dataset_label`, `project`, `included_count`; the
+  label carries the dataset's label. A session wins over a subject, a subject over a dataset.
+  `XnatContext.dataset`, `register.fetch_dataset_facts`, `publish.DATASET_XSI_TYPE`,
+  `publish.dataset_provenance` / `scope_provenance`, `_relabel` for the third root.
+- **record-fetch refuses prerequisites at dataset scope** (exit 2, the reason in the log): a
+  dataset run's input is the dataset's tree, assumed complete when it was made. Resolving
+  records against a dataset is a later extension.
+- **seg-wrapup skips ROI registration at dataset scope** (the ROI collection API is per session),
+  as at subject scope.
+- Images and commands 0.7.0 (`seg-wrapup`, `proc-wrapup`, `record-fetch`, `record-fetch-subject`);
+  record-fetch is otherwise unchanged. 217 tests (9 new: context precedence and dataset facts,
+  group XML and URLs, create under the project with rollback and 409 relabel, provenance
+  stamping, proc-wrapup end to end, record-fetch refusal, seg-wrapup ROI skip; 1 assertion
+  extended for the new context message; none removed).
+
+Cards: a dataset wrapper sets `PROC_DATASET_ID` from the dataset input's id and leaves the
+session and subject ids unset; the handler is `as-a-child-of` the dataset with
+`PROC_POINTER_ONLY=1`; no record-fetch. Session and subject wrappers re-pin only.
+
 ## 0.6.3 (2026-09-11)
 
 The consumers' subject scope, the fetch image label, and the card copy (plan D26 consumers, D27).

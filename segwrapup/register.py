@@ -42,6 +42,10 @@ class XnatContext:
     #: The subject the run belongs to at subject scope (a subject-context launch whose BIDS
     #: tree spans every session of the subject); records are then subject assessors.
     subject: str = ""
+    #: The frozen dataset (an ``analysis:analysisDatasetData`` project asset) the run belongs to
+    #: at dataset scope (a dataset-context launch on a ready tree, however it was made); records
+    #: are then ``analysis:groupAnalysisData`` project assets of the project (0.7.0).
+    dataset: str = ""
     #: JSESSIONID from ``open_session``; empty means Basic auth per request.
     jsession: str = ""
     #: True once a login was attempted, so a failed login is not retried on every request.
@@ -49,21 +53,29 @@ class XnatContext:
 
     @property
     def scope(self) -> str:
-        """``session`` or ``subject``: what the run's records hang from."""
-        return "subject" if self.subject and not self.session else "session"
+        """``session``, ``subject`` or ``dataset``: what the run's records hang from. A session
+        wins over a subject, a subject over a dataset, so a wrapper that exposes more than one
+        id keeps the narrowest scope."""
+        if self.session:
+            return "session"
+        if self.subject:
+            return "subject"
+        return "dataset" if self.dataset else "session"
 
     @property
     def target(self) -> str:
-        """The XNAT id the run belongs to: the session, or the subject at subject scope."""
-        return self.session or self.subject
+        """The XNAT id the run belongs to: the session, the subject at subject scope, or the
+        dataset (project asset) at dataset scope."""
+        return self.session or self.subject or self.dataset
 
     @classmethod
     def from_env(cls, environ: dict | None = None) -> "XnatContext | None":
         """Build the context from the container environment, or None with a log line saying what is missing.
 
-        A run is session-scoped (``SEG_SESSION_ID`` / ``PROC_SESSION_ID``) or subject-scoped
-        (``SEG_SUBJECT_ID`` / ``PROC_SUBJECT_ID``, no session id): a subject-context wrapper
-        sets the subject variable and leaves the session one unset."""
+        A run is session-scoped (``SEG_SESSION_ID`` / ``PROC_SESSION_ID``), subject-scoped
+        (``SEG_SUBJECT_ID`` / ``PROC_SUBJECT_ID``, no session id) or dataset-scoped
+        (``PROC_DATASET_ID`` / ``SEG_DATASET_ID``, neither of the others): a subject- or
+        dataset-context wrapper sets its own variable and leaves the narrower ones unset."""
         env = os.environ if environ is None else environ
         required = {
             "XNAT_HOST": env.get("XNAT_HOST", ""),
@@ -73,9 +85,10 @@ class XnatContext:
         }
         session = (env.get("SEG_SESSION_ID", "") or env.get("PROC_SESSION_ID", "")).strip()
         subject = (env.get("SEG_SUBJECT_ID", "") or env.get("PROC_SUBJECT_ID", "")).strip()
+        dataset = (env.get("SEG_DATASET_ID", "") or env.get("PROC_DATASET_ID", "")).strip()
         missing = [name for name, value in required.items() if not value.strip()]
-        if not session and not subject:
-            missing.append("SEG_SESSION_ID (or SEG_SUBJECT_ID for a subject-scoped run)")
+        if not session and not subject and not dataset:
+            missing.append("SEG_SESSION_ID (or SEG_SUBJECT_ID for a subject-scoped run, PROC_DATASET_ID for a dataset-scoped run)")
         if missing:
             logger.info("ROI registration skipped (and publishing); XNAT context missing %s", ", ".join(missing))
             return None
@@ -87,6 +100,7 @@ class XnatContext:
             session=session,
             scan=(env.get("SEG_SCAN_ID", "") or env.get("PROC_SCAN_ID", "")).strip(),
             subject=subject,
+            dataset=dataset,
         )
 
 
@@ -166,10 +180,50 @@ def collection_label(model_name: str, scan: str, when: datetime | None = None, s
 
 
 def fetch_target_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:
-    """The label of what the run belongs to: the session's, or the subject's at subject scope."""
+    """The label of what the run belongs to: the session's, the subject's at subject scope, the
+    dataset's at dataset scope."""
     if context.scope == "subject":
         return fetch_subject_label(context, timeout_seconds)
+    if context.scope == "dataset":
+        return fetch_dataset_label(context, timeout_seconds)
     return fetch_session_label(context, timeout_seconds)
+
+
+def fetch_dataset_facts(context: XnatContext, timeout_seconds: float = 60.0) -> dict:
+    """What the record says about the cohort it ran on: the dataset's ``label`` and its
+    ``included_count`` (the ``analysis:analysisDatasetData`` member count; the group-level plugin
+    sets it when it freezes a cohort, an uploaded dataset may not carry one), read from ``/data/experiments/<asset id>``. Empty with a
+    warning when XNAT does not answer or the id is not a dataset: the record is still published,
+    it names the id and no count."""
+    if not context.dataset:
+        return {}
+    url = f"{context.host}/data/experiments/{urllib.parse.quote(context.dataset, safe='')}?format=json"
+    request = urllib.request.Request(url, headers=auth_headers(context))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode())
+        item = payload["items"][0]
+        fields = item["data_fields"]
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError) as error:
+        logger.warning("could not read dataset %s (%s); the record names the id and no member count", context.dataset, error)
+        return {}
+    facts = {"label": str(fields.get("label") or "").strip()}
+    count = fields.get("included_count")
+    if count not in (None, ""):
+        try:
+            facts["included_count"] = int(count)
+        except (TypeError, ValueError):
+            logger.warning("dataset %s carries a non-numeric included_count %r; not recorded", context.dataset, count)
+    # XNAT puts the type in the item's ``meta``, not among the data fields.
+    xsi = str((item.get("meta") or {}).get("xsi:type") or "")
+    if xsi and xsi != "analysis:analysisDatasetData":
+        logger.warning("dataset %s is a %s, not an analysis:analysisDatasetData; the record still cites it", context.dataset, xsi)
+    return facts
+
+
+def fetch_dataset_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:
+    """The dataset's label for ``context.dataset``; the id when XNAT does not answer."""
+    return fetch_dataset_facts(context, timeout_seconds).get("label") or context.dataset
 
 
 def fetch_subject_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:

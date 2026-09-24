@@ -99,7 +99,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.6.3"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.7.0"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -212,8 +212,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.6.3 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.6.3
+docker build -t xnatworks/seg-wrapup:0.7.0 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.7.0
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
@@ -292,7 +292,7 @@ session, where the reviewer looks. A FAILED record never satisfies a prerequisit
 A subject-scoped wrapper (plan D26: `<app>-subject` beside `<app>-session`) mounts the project
 archive through a derived Project input, because a Subject has no directory of its own. Its
 records mount is a second Project input carrying `via-setup-command
-xnatworks/record-fetch:0.6.3:record-fetch-subject`, which is `record-fetch --no-passthrough`
+xnatworks/record-fetch:0.7.0:record-fetch-subject`, which is `record-fetch --no-passthrough`
 (`commands/record-fetch-subject.json`, the same image): the prerequisites are resolved on every
 session of the subject and written to `prereq/<name>/<session label>/`, and nothing is passed
 through, since passing the archive through would copy it. Register it beside `record-fetch`
@@ -353,4 +353,19 @@ image lineage, entrypoint `proc-wrapup`, image `xnatworks/proc-wrapup:<version>`
 
 Environment: `PROC_PIPELINE_NAME` / `PROC_PIPELINE_VERSION` (fallback `SEG_MODEL_*`, then
 `XNW_CARD_ID`/`XNW_CARD_REVISION`), `PROC_PROJECT` / `PROC_SESSION_ID` / `PROC_SCAN_ID` (or the
-`SEG_*` names), `PROC_NO_PUBLISH`, `PROC_RECORD_LABEL`.
+`SEG_*` names; `PROC_SUBJECT_ID` alone for a subject-scoped run, `PROC_DATASET_ID` alone for a
+dataset-scoped run), `PROC_NO_PUBLISH`, `PROC_RECORD_LABEL`, `PROC_POINTER_ONLY`.
+
+### Dataset scope (0.7.0)
+
+A run whose environment names `PROC_DATASET_ID` (an `analysis:analysisDatasetData` project
+asset carrying a ready tree, the `#INPUT_DATASET_ID#` of a dataset-context wrapper) and
+neither a session nor a subject is dataset-scoped: the record is an
+`analysis:groupAnalysisData` project asset of the project, created by label under
+`/data/projects/P/experiments/`, with the same fields and the same four resources as a session
+record, `input_dataset_id` citing the dataset, `subject_count` the cohort's `included_count`,
+and `inputs_json` carrying `scope`, `dataset`, `dataset_label`, `project`, `included_count`.
+No `scans`, no subject, no session. record-fetch refuses prerequisites at this scope: the
+dataset's tree is the run's input, assumed complete, whether the group-level plugin
+materialised it or someone uploaded it; neither the run nor the record needs that plugin.
+Details and the reasons: `docs/DATASET-SCOPE.md`.

@@ -232,7 +232,7 @@ def test_from_env_subject_scope_needs_a_subject_when_there_is_no_session(caplog)
     base = {"XNAT_HOST": "http://x/", "XNAT_USER": "u", "XNAT_PASS": "p", "PROC_PROJECT": "P1"}
     with caplog.at_level("INFO"):
         assert register.XnatContext.from_env(base) is None
-    assert "SEG_SESSION_ID (or SEG_SUBJECT_ID for a subject-scoped run)" in caplog.text
+    assert "SEG_SESSION_ID (or SEG_SUBJECT_ID for a subject-scoped run, PROC_DATASET_ID for a dataset-scoped run)" in caplog.text
     context = register.XnatContext.from_env({**base, "PROC_SUBJECT_ID": "XNAT_S1"})
     assert context.scope == "subject" and context.subject == "XNAT_S1" and context.session == "" and context.target == "XNAT_S1"
     both = register.XnatContext.from_env({**base, "PROC_SUBJECT_ID": "XNAT_S1", "PROC_SESSION_ID": "XNAT_E1"})
@@ -269,3 +269,69 @@ def test_fetch_target_label_reads_the_subject_at_subject_scope_and_falls_back_to
     with caplog.at_level("WARNING"):
         assert fetch_target_label(dead) == "XNAT_S09007"
     assert "could not read the label of subject XNAT_S09007" in caplog.text
+
+
+# ── dataset scope (0.7.0) ──────────────────────────────────────────────────────
+
+def test_from_env_dataset_scope_needs_only_a_dataset_and_yields_to_a_subject_or_session():
+    """A dataset-context wrapper sets PROC_DATASET_ID and nothing narrower; a run that also
+    names a subject or a session keeps the narrower scope (docs/DATASET-SCOPE.md)."""
+    from segwrapup import register
+    base = {"XNAT_HOST": "http://x/", "XNAT_USER": "u", "XNAT_PASS": "p", "PROC_PROJECT": "P1"}
+    context = register.XnatContext.from_env({**base, "PROC_DATASET_ID": "XNAT_D1"})
+    assert context.scope == "dataset" and context.dataset == "XNAT_D1" and context.target == "XNAT_D1"
+    assert context.session == "" and context.subject == ""
+    assert register.XnatContext.from_env({**base, "SEG_DATASET_ID": " XNAT_D2 "}).dataset == "XNAT_D2"    # the SEG_ alias, stripped
+    with_subject = register.XnatContext.from_env({**base, "PROC_DATASET_ID": "XNAT_D1", "PROC_SUBJECT_ID": "XNAT_S1"})
+    assert with_subject.scope == "subject" and with_subject.target == "XNAT_S1"
+    with_session = register.XnatContext.from_env({**base, "PROC_DATASET_ID": "XNAT_D1", "PROC_SESSION_ID": "XNAT_E1"})
+    assert with_session.scope == "session" and with_session.target == "XNAT_E1"
+    assert register.XnatContext(host="http://x", user="u", password="p", project="P1", session="").scope == "session"   # nothing named: the old default
+
+
+def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_id(caplog):
+    import json, threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from segwrapup.register import XnatContext, fetch_dataset_facts, fetch_dataset_label, fetch_target_label
+    seen = []
+    # XNAT's ?format=json shape (demo02 XNAT_E25423, 2026-09-24): the type is in ``meta``, the
+    # fields in ``data_fields``; ``included_count`` arrives as a number.
+    answers = {"XNAT_D1": ("analysis:analysisDatasetData", {"label": "cohort-v1", "included_count": 26}),
+               "XNAT_D2": ("xnat:mrSessionData", {"label": "not-a-cohort"}),
+               "XNAT_D3": ("analysis:analysisDatasetData", {"label": "odd", "included_count": "many"})}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.path)
+            asset = self.path.split("/experiments/")[-1].split("?")[0]
+            if asset not in answers:
+                self.send_response(500); self.end_headers(); return
+            xsi, fields = answers[asset]
+            body = json.dumps({"items": [{"meta": {"xsi:type": xsi, "isHistory": False}, "data_fields": fields}]}).encode()
+            self.send_response(200); self.end_headers(); self.wfile.write(body)
+
+        def do_POST(self):
+            self.send_response(500); self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        host = f"http://127.0.0.1:{server.server_port}"
+        def ctx(dataset):
+            return XnatContext(host=host, user="u", password="p", project="P1", session="", dataset=dataset)
+        assert fetch_dataset_facts(ctx("XNAT_D1")) == {"label": "cohort-v1", "included_count": 26}
+        assert fetch_target_label(ctx("XNAT_D1")) == "cohort-v1"
+        assert seen[-1] == "/data/experiments/XNAT_D1?format=json"
+        with caplog.at_level("WARNING"):
+            assert fetch_dataset_facts(ctx("XNAT_D2")) == {"label": "not-a-cohort"}
+            assert fetch_dataset_facts(ctx("XNAT_D3")) == {"label": "odd"}
+            assert fetch_dataset_label(ctx("XNAT_D9")) == "XNAT_D9"
+        assert "is a xnat:mrSessionData, not an analysis:analysisDatasetData" in caplog.text
+        assert "non-numeric included_count" in caplog.text
+        assert "could not read dataset XNAT_D9" in caplog.text
+        assert fetch_dataset_facts(XnatContext(host=host, user="u", password="p", project="P1", session="XNAT_E1")) == {}
+    finally:
+        server.shutdown()
