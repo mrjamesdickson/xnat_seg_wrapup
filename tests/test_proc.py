@@ -86,6 +86,9 @@ class _CS(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"id": 77, "name": "pyradiomics", "version": "0.3.1", "command-metadata": {"card": CARD_BLOCK}}).encode(), "application/json")
         elif self.path == "/data/experiments/XNAT_E00018?format=json":
             self._send(200, json.dumps({"items": [{"data_fields": {"label": "SESS01"}}]}).encode(), "application/json")
+        elif self.path == "/data/experiments/XNAT_D0001?format=json":        # the frozen dataset a dataset-scoped run cites
+            self._send(200, json.dumps({"items": [{"data_fields": {"label": "flanker-2sub", "included_count": 2,
+                                                                    "xsiType": "analysis:analysisDatasetData"}}]}).encode(), "application/json")
         elif self.path == "/data/projects/PROJ_1/subjects/XNAT_S09007?format=json":
             self._send(200, json.dumps({"items": [{"data_fields": {"label": "292"}}]}).encode(), "application/json")
         elif self.path.startswith("/data/projects/PROJ_1/subjects/XNAT_S09007/experiments?format=json"):
@@ -111,7 +114,8 @@ class _CS(BaseHTTPRequestHandler):
     def do_PUT(self):
         length = int(self.headers.get("Content-Length", "0"))
         self._record(self.rfile.read(length))
-        create = ("/assessors/" in self.path and "/out/" not in self.path) or ("/subjects/" in self.path and "/resources/" not in self.path)
+        create = (("/assessors/" in self.path and "/out/" not in self.path) or ("/subjects/" in self.path and "/resources/" not in self.path)
+                  or (self.path.startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in self.path))
         self._send(201 if create else 200, b"XNAT_E77777" if create else b"")
 
     def log_message(self, *args):
@@ -225,6 +229,10 @@ def test_proc_wrapup_keeps_everything_captures_logs_reports_and_publishes(cs, tm
                      f"<analysis:wrapup_version>proc-wrapup {__version__}<",
                      "<analysis:duration_seconds>120<", "<analysis:card_id>pyradiomics<", "<analysis:scans><analysis:scan>3<"):
         assert fragment in xml, fragment
+    # the notes say where the tool's output is on the record (DERIVED, at its root), not the local
+    # staging directory: "kept verbatim under raw/" was stale since DERIVED moved to the root
+    notes = xml.split("<analysis:notes>")[1].split("</analysis:notes>")[0]
+    assert "DERIVED" in notes and "raw/" not in notes, notes
     uploads = [c["path"].split("/out/resources/")[1].split("?")[0] for c in handler.calls if "/out/resources/" in c["path"]]
     assert "DERIVED/files/features.csv" in uploads and "REPORT/files/report.html" in uploads
     assert "PROVENANCE/files/wrapup.json" in uploads and "PROVENANCE/files/status.json" in uploads
@@ -559,3 +567,36 @@ def test_a_subject_scoped_run_publishes_a_subject_record_naming_the_sessions_it_
     assert manifest["scope"] == "subject" and [s["label"] for s in manifest["sessions"]] == ["292_postop", "292_preop"]
     assert manifest["analysis_record"]["xsi_type"] == "analysis:subjectAnalysisData"
     assert "292_postop, 292_preop" in (out / "report.html").read_text()
+
+
+def test_a_dataset_scoped_run_publishes_a_group_record_citing_the_dataset(cs, tmp_path, monkeypatch):
+    """A dataset-context wrapper sets PROC_DATASET_ID and neither a session nor a subject
+    (0.7.0): the record is an analysis:groupAnalysisData project asset of the project, created
+    by label under the project, its files experiment resources; input_dataset_id cites the
+    frozen dataset, subject_count is the cohort's included_count, and inputs_json names the
+    dataset's label so a reader knows the cohort without opening the tool's output."""
+    host, handler = cs
+    inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
+    out = tmp_path / "out"
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "fitlins", "PROC_PIPELINE_VERSION": "0.11.0", "PROC_DATASET_ID": "XNAT_D0001"})
+    monkeypatch.delenv("PROC_SESSION_ID"); monkeypatch.delenv("PROC_SCAN_ID")
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/")]
+    assert len(creates) == 1 and creates[0]["path"].startswith("/data/projects/PROJ_1/experiments/fitlins_flanker-2sub_")
+    assert creates[0]["path"].endswith("_record?inbody=true")
+    xml = creates[0]["body"].decode()
+    assert xml.startswith('<?xml version="1.0" encoding="UTF-8"?>\n<analysis:GroupAnalysis ')
+    assert "subject_ID" not in xml and "imageSession_ID" not in xml and "<analysis:scans>" not in xml
+    assert "<analysis:input_dataset_id>XNAT_D0001</analysis:input_dataset_id>" in xml and "<analysis:subject_count>2</analysis:subject_count>" in xml
+    inputs = json.loads(html.unescape(xml.split("<analysis:inputs_json>")[1].split("</analysis:inputs_json>")[0]))
+    assert inputs["scope"] == "dataset" and inputs["dataset"] == "XNAT_D0001" and inputs["dataset_label"] == "flanker-2sub"
+    assert inputs["included_count"] == 2 and inputs["project"] == "PROJ_1" and inputs["sessions"] == []
+    uploads = [c["path"] for c in handler.calls if c["method"] == "PUT" and "/resources/" in c["path"]]
+    assert uploads and all(u.startswith("/data/experiments/XNAT_E77777/resources/") for u in uploads)
+    assert not [c for c in handler.calls if "/assessors/" in c["path"] or "/out/" in c["path"] or "/subjects/" in c["path"]]
+    # the asset was read once (proc-wrapup's own facts; publish_if_possible did not ask again)
+    assert [c["path"] for c in handler.calls if c["path"].startswith("/data/experiments/XNAT_D0001")] == ["/data/experiments/XNAT_D0001?format=json"]
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["scope"] == "dataset" and manifest["dataset"] == {"id": "XNAT_D0001", "label": "flanker-2sub", "included_count": 2}
+    assert manifest["analysis_record"]["xsi_type"] == "analysis:groupAnalysisData" and manifest["card"]["run_scope"] == "dataset"
+    assert "flanker-2sub (XNAT_D0001), 2 included" in (out / "report.html").read_text()

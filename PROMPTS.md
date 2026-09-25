@@ -28,3 +28,11 @@
   exclusion by name, enumerate the wrapup's own names, no dot-prefix rule inside the tool tree.
   TDD, bump to 0.6.1, one PR, Codex loop. Result: `fix/derived-keeps-dotfiles`,
   `RESERVED_ROOT_NAMES` in `segwrapup/execution.py`.
+
+## 2026-09-24 — xnat_seg_wrapup (0.7.0, dataset scope)
+
+James: "finish the upgrade to 0.7.0 and the rest to support generic group level analysis". Dataset scope
+(`PROC_DATASET_ID`, `analysis:groupAnalysisData` project-asset records citing the dataset), made
+independent of how the dataset's tree was made (group-level plugin or upload). Branch
+`feature/dataset-scope`; images built as local tags on demo02 and proven by the FitLins card (XNAT_E25925);
+not pushed.

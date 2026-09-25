@@ -9,7 +9,10 @@ seg-wrapup measures segmentations, and viewer products come from a converter car
 Environment (all optional beyond the XNAT context the Container Service injects):
 ``PROC_PIPELINE_NAME`` / ``PROC_PIPELINE_VERSION`` (falls back to ``SEG_MODEL_NAME`` /
 ``SEG_MODEL_VERSION``, then to ``XNW_CARD_ID``), ``PROC_PROJECT`` / ``PROC_SESSION_ID`` /
-``PROC_SCAN_ID`` (or the ``SEG_*`` names), the ``XNW_*`` results contract.
+``PROC_SCAN_ID`` (or the ``SEG_*`` names; ``PROC_SUBJECT_ID`` alone for a subject-scoped run,
+``PROC_DATASET_ID`` alone for a dataset-scoped run, whose record is an
+``analysis:groupAnalysisData`` project asset citing the frozen dataset), the ``XNW_*`` results
+contract.
 """
 from __future__ import annotations
 
@@ -32,7 +35,7 @@ from .execution import (RAW_DIRNAME, STATUS_FILENAME, chain_from_workflow, copy_
 from .prereq import MANIFEST as PREREQ_MANIFEST
 from .publish import RecordContract, publish_if_possible
 from .prereq import list_subject_sessions
-from .register import XnatContext, close_session, collection_label, fetch_target_label
+from .register import XnatContext, close_session, collection_label, fetch_dataset_facts, fetch_target_label
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +145,7 @@ def run(args: argparse.Namespace) -> int:
     execution = None
     chain = None
     sessions: list[dict] = []
+    dataset_facts: dict = {}
     prerequisites = read_prerequisites(input_dir)
     try:
         if context is not None:
@@ -153,6 +157,10 @@ def run(args: argparse.Namespace) -> int:
                     sessions = list_subject_sessions(context, context.subject)
                 except (urllib.error.URLError, OSError, ValueError) as error:
                     logger.warning("could not list the sessions of subject %s (%s); the record will not name them", context.subject, error)
+            elif context.scope == "dataset":
+                # A dataset-scoped run (a dataset-context wrapper, the tool read the frozen
+                # cohort's materialised tree): the record names the dataset and its member count.
+                dataset_facts = fetch_dataset_facts(context)
             # The orchestration fields sit on the parent's (main) workflow; the wrapup's own
             # workflow carries none (demo02 wrk_workflowdata, 2026-09-07).
             chain = chain_from_workflow(context, (execution or {}).get("workflow_id")) or chain_from_workflow(context, own_workflow_id())
@@ -181,6 +189,9 @@ def run(args: argparse.Namespace) -> int:
             "prerequisites": ", ".join(f"{q['name']}={q.get('record', {}).get('ID') or q.get('resource', '')}" for q in prerequisites),
             "scope": context.scope if context else "session",
             "sessions": ", ".join(s["label"] for s in sessions),
+            "dataset": (f"{dataset_facts.get('label') or context.dataset} ({context.dataset})"
+                        + (f", {dataset_facts['included_count']} included" if dataset_facts.get("included_count") is not None else "")
+                        if context and context.scope == "dataset" else ""),
         }
         facts = {"summary": summary, "files": files, "log_tails": log_tails, "generated": started.strftime("%Y-%m-%d %H:%M:%S UTC"),
                  "tool_reports": [name for name in derived_names if name.lower().endswith((".html", ".htm"))]}
@@ -188,25 +199,32 @@ def run(args: argparse.Namespace) -> int:
         manifest = {"wrapup": "proc-wrapup", "version": __version__, "generated": facts["generated"], "pipeline": args.pipeline,
                     "pipeline_version": args.pipeline_version, "run_status": run_status, "status": status, "execution": execution,
                     "chain": chain, "prerequisites": prerequisites, "derived_root": RAW_DIRNAME, "raw_files": copied,
-                    "scope": context.scope if context else "session", "sessions": sessions, "card": card}
+                    "scope": context.scope if context else "session", "sessions": sessions, "card": card,
+                    "dataset": ({"id": context.dataset, **dataset_facts} if context and context.scope == "dataset" else None)}
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
 
         report = {"model": args.pipeline, "model_version": args.pipeline_version, "scan": args.scan}
         record_facts = {"wrapup": "proc-wrapup", "run_status": run_status, "auto_qc": "FAIL" if run_status == "FAILED" else "NOT_EVALUATED",
                         "container_id": (execution or {}).get("container_id"), "duration_seconds": (execution or {}).get("duration_seconds"),
                         "config": (execution or {}).get("facts"),
-                        "notes": f"Published by proc-wrapup {__version__}; tool output kept verbatim under {RAW_DIRNAME}/; nothing interpreted",
+                        "notes": f"Published by proc-wrapup {__version__}; the tool's output kept verbatim as DERIVED; nothing interpreted",
                         "inputs": {"scan": args.scan, "status_json": status is not None, "raw_files": len(copied),
                                    "scope": context.scope if context else "session",
                                    "subject": context.subject if context else "",
                                    "sessions": sessions,
+                                   **({"dataset": context.dataset, "dataset_label": dataset_facts.get("label", ""),
+                                       "project": context.project, "included_count": dataset_facts.get("included_count")}
+                                      if context and context.scope == "dataset" else {}),
                                    "chain": chain,
                                    "prerequisites": [{"name": q["name"], "record": (q.get("record") or {}).get("ID"),
                                                       "resource": q.get("resource"), "role": q.get("role")} for q in prerequisites],
                                    "upstream_record": next(((q.get("record") or {}).get("ID") for q in prerequisites if q.get("record")), None)}}
         if not (args.record_label or "").strip():
-            args.record_label = collection_label(args.pipeline, args.scan,
-                                                 session_label=fetch_target_label(context) if context else "") + "_record"
+            # The owner's label: the session's or subject's from XNAT; at dataset scope the one
+            # already read with the facts above (no second request; the id when it did not answer).
+            owner_label = ((dataset_facts.get("label") or context.dataset) if context and context.scope == "dataset"
+                           else fetch_target_label(context) if context else "")
+            args.record_label = collection_label(args.pipeline, args.scan, session_label=owner_label) + "_record"
         outcome = publish_if_possible(args, output_dir, report, [], False, context=context, facts=record_facts,
                                       default_resources=PROC_DEFAULT_RESOURCES, derived_root=RAW_DIRNAME, manifest=manifest)
         # Local paths of what went up (and of the empty files that could not): for the pointer

@@ -698,6 +698,14 @@ def run(args: argparse.Namespace) -> int:
     if context is None:
         logger.error("prerequisites declared but the XNAT context is incomplete (XNAT_HOST/USER/PASS, PROC_PROJECT, PROC_SESSION_ID or PROC_SUBJECT_ID)")
         return 2
+    if context.scope == "dataset":
+        # A dataset-scoped run reads the dataset's tree as it is; which sessions carry which
+        # derivatives was settled when the dataset was made (frozen and materialised by the
+        # group-level plugin, or uploaded). Resolving records against a dataset is a later
+        # extension, not a silent no-op.
+        logger.error("prerequisites are not supported at dataset scope (record-fetch %s): the run's inputs are the frozen "
+                     "dataset %s; declare none on a dataset wrapper", __version__, context.dataset)
+        return 2
     try:
         try:
             resolutions = resolve(context, prereqs)

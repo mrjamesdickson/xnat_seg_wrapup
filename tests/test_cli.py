@@ -287,3 +287,22 @@ def test_record_fetch_subject_command_is_record_fetch_without_passthrough():
         if key not in ("name", "description", "command-line"):
             assert subject[key] == base[key], key
     assert "no-passthrough" in subject["description"] or "--no-passthrough" in subject["description"]
+
+
+def test_register_if_possible_skips_roi_registration_at_dataset_scope(tmp_path, caplog, monkeypatch):
+    """The ROI collection API is per session; a dataset-scoped run (0.7.0) has none, as a
+    subject-scoped one has none."""
+    import logging
+    from types import SimpleNamespace
+    from segwrapup import register
+    seg = tmp_path / "seg.dcm"; seg.write_bytes(b"x")
+
+    def must_not_be_called(*args, **kwargs):
+        raise AssertionError("register_roi_collection must not run at dataset scope")
+    monkeypatch.setattr(register, "register_roi_collection", must_not_be_called)
+    context = register.XnatContext.from_env({"XNAT_HOST": "http://x", "XNAT_USER": "u", "XNAT_PASS": "p", "PROC_PROJECT": "P", "PROC_DATASET_ID": "XNAT_D1"})
+    assert context is not None and context.scope == "dataset"
+    args = SimpleNamespace(no_register=False, roi_label="", model="m", scan="")
+    with caplog.at_level(logging.INFO):
+        assert cli.register_if_possible(args, seg, context) is None
+    assert "ROI registration skipped: dataset-scoped run (XNAT_D1)" in caplog.text

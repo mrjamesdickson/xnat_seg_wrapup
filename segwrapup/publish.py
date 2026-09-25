@@ -1,4 +1,6 @@
-"""Publish a generic analysis record for the run: ``analysis:sessionAnalysisData``.
+"""Publish a generic analysis record for the run: ``analysis:sessionAnalysisData`` (a subject
+assessor ``analysis:subjectAnalysisData`` at subject scope, a project asset
+``analysis:groupAnalysisData`` at dataset scope).
 
 The record is the searchable, reviewable XNAT object a catalog card leaves behind. It holds
 **type, status, QC and provenance** as fields, and it carries **the entire output of the run**
@@ -42,20 +44,29 @@ from xml.sax.saxutils import escape
 
 from . import __version__
 from .execution import is_reserved
-from .register import LABEL_MAX, XnatContext, auth_headers, collection_label, fetch_target_label, list_subject_sessions
+from .register import (LABEL_MAX, XnatContext, auth_headers, collection_label, fetch_dataset_facts, fetch_target_label,
+                       list_subject_sessions)
 
 logger = logging.getLogger(__name__)
 
 XSI_TYPE = "analysis:sessionAnalysisData"
 SUBJECT_XSI_TYPE = "analysis:subjectAnalysisData"
+#: The group record (0.7.0): a project asset of the project, citing the frozen dataset it ran on
+#: in ``input_dataset_id``; the same run fields as the other two, the same four resources.
+DATASET_XSI_TYPE = "analysis:groupAnalysisData"
 #: The schema caps every ``*_json`` element at 65,536 characters (analysis.xsd); a record that
 #: overruns is refused outright (fmriprep full run and hippunfold on demo02, 2026-09-09).
 RESULTS_JSON_MAX = 65536
 
 
 def xsi_type_for(context: XnatContext) -> str:
-    """The record type for the run's scope: a session assessor, or a subject assessor."""
-    return SUBJECT_XSI_TYPE if context.scope == "subject" else XSI_TYPE
+    """The record type for the run's scope: a session assessor, a subject assessor, or a project
+    asset at dataset scope."""
+    if context.scope == "subject":
+        return SUBJECT_XSI_TYPE
+    if context.scope == "dataset":
+        return DATASET_XSI_TYPE
+    return XSI_TYPE
 
 
 def record_urls(context: XnatContext, name: str, by_id: bool = False) -> tuple[str, str]:
@@ -65,10 +76,19 @@ def record_urls(context: XnatContext, name: str, by_id: bool = False) -> tuple[s
     Session scope: the record is an image assessor of the session and its role resources live
     under ``out``. Subject scope: the record is a subject assessor, an experiment of its own,
     reached by label under the subject and by id under ``/data/experiments``, and its role
-    resources are plain experiment resources (no ``out``). Whether ``name`` is an id is stated
-    by the caller, not inferred from its prefix: a label may legitimately start with the site's
-    accession prefix, and the prefix itself is a site setting."""
+    resources are plain experiment resources (no ``out``). Dataset scope: the record is a project
+    asset, an experiment of the project with no subject, reached by label under the project
+    (``/data/projects/P/experiments/<label>``) and by id under ``/data/experiments``; role
+    resources as at subject scope. Whether ``name`` is an id is stated by the caller, not
+    inferred from its prefix: a label may legitimately start with the site's accession prefix,
+    and the prefix itself is a site setting."""
     quoted = urllib.parse.quote(name, safe="")
+    if context.scope == "dataset":
+        if by_id:
+            url = f"{context.host}/data/experiments/{quoted}"
+        else:
+            url = f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/experiments/{quoted}"
+        return url, f"{url}/resources"
     if context.scope == "subject":
         if by_id:
             url = f"{context.host}/data/experiments/{quoted}"
@@ -101,6 +121,30 @@ def subject_provenance(context: XnatContext, timeout_seconds: float = 60.0) -> d
         logger.warning("could not list the sessions of subject %s (%s); the record will not name them", context.subject, error)
         sessions = []
     return {"scope": "subject", "subject": context.subject, "sessions": sessions}
+
+
+def dataset_provenance(context: XnatContext, timeout_seconds: float = 60.0) -> dict:
+    """The ``inputs_json`` keys every dataset record carries (``docs/DATASET-SCOPE.md``): ``scope``,
+    ``dataset`` (the asset id), ``dataset_label``, ``project`` and the cohort's ``included_count``
+    when the asset answers (``None`` otherwise, with the warning ``fetch_dataset_facts`` logs).
+    Empty at any other scope."""
+    if context.scope != "dataset":
+        return {}
+    facts = fetch_dataset_facts(context, timeout_seconds)
+    return {"scope": "dataset", "dataset": context.dataset, "dataset_label": facts.get("label", ""),
+            "project": context.project, "included_count": facts.get("included_count")}
+
+
+def scope_provenance(context: XnatContext, caller_inputs: dict) -> dict | None:
+    """What ``build_record_xml`` stamps for a caller that did not describe the run's owner
+    itself: the subject's sessions (seg-wrapup, the failure record), the dataset's label and
+    count. ``None`` when the caller's ``inputs`` already carry them (proc-wrapup) or the scope
+    has nothing to add."""
+    if context.scope == "subject" and "sessions" not in caller_inputs:
+        return subject_provenance(context)
+    if context.scope == "dataset" and "dataset_label" not in caller_inputs:
+        return dataset_provenance(context)
+    return None
 
 
 def bounded_results_json(summary: dict) -> str:
@@ -414,6 +458,10 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
         # ``provenance`` (publish_if_possible / the failure record) or from the caller's inputs
         # (proc-wrapup), whichever the caller supplied. The caller's own keys win.
         inputs = {"scope": "subject", "subject": context.subject, **(provenance or {}), **inputs}
+    if context.scope == "dataset":
+        # Every dataset record names its scope and the asset it ran on; label and member count
+        # come from ``provenance`` (publish_if_possible) or from the caller's inputs (proc-wrapup).
+        inputs = {"scope": "dataset", "dataset": context.dataset, **(provenance or {}), **inputs}
     summary = {"model": report.get("model"), "model_version": report.get("model_version"),
                "structures": structures,
                "total_volume_ml": round(sum(r.get("total_volume_ml", 0) for r in results), 2),
@@ -438,6 +486,10 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
         _element("supersedes_id", contract.supersedes_id),
         _element("output_resource_label", contract.output_resource_label),
         _element("output_file_count", output_count),
+        # Dataset scope: the schema's own citation of the cohort, and its member count when known;
+        # neither element exists on the session or subject types.
+        _element("input_dataset_id", context.dataset if context.scope == "dataset" else None),
+        _element("subject_count", inputs.get("included_count") if context.scope == "dataset" else None),
         _element("review_state", "PENDING_REVIEW"),
         _element("auto_qc_status", auto_qc),
         # A scan is a session fact: a subject record has no scans element even if the
@@ -449,6 +501,15 @@ def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
         _element("notes", facts.get("notes") or f"Published by {wrapup_name} {__version__} from the {report.get('model')} run"),
         _element("results_json", bounded_results_json(summary)),
     ])
+    if context.scope == "dataset":
+        # A project asset: owned by the project, citing the dataset; no subject, session or scans.
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<analysis:GroupAnalysis xmlns:analysis="{ANALYSIS_NS}" xmlns:xnat="{XNAT_NS}" '
+            f'project="{escape(context.project)}" label="{escape(label)}">\n'
+            f"  <xnat:date>{now.strftime('%Y-%m-%d')}</xnat:date>\n"
+            f"{body}</analysis:GroupAnalysis>\n"
+        )
     if context.scope == "subject":
         # A subject assessor: owned by the subject, spanning its sessions; no scans element.
         return (
@@ -501,8 +562,8 @@ def _request(context: XnatContext, method: str, url: str, timeout: float) -> int
 
 def _relabel(xml: str, label: str) -> str:
     """The record document carries its label as an attribute; a retried create must match the URL.
-    Both record roots are relabelled: a subject record retried under the old label would collide again."""
-    return re.sub(r'(<analysis:(?:Session|Subject)Analysis[^>]*?\slabel=")[^"]*(")',
+    Every record root is relabelled: a subject or group record retried under the old label would collide again."""
+    return re.sub(r'(<analysis:(?:Session|Subject|Group)Analysis[^>]*?\slabel=")[^"]*(")',
                   lambda m: m.group(1) + escape(label) + m.group(2), xml, count=1)
 
 
@@ -633,7 +694,7 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
         # A subject record from a caller that did not list the sessions itself (seg-wrapup) gets
         # them here; proc-wrapup already put them in facts["inputs"], so no second listing.
         caller_inputs = (facts or {}).get("inputs") or {}
-        provenance = subject_provenance(context) if "sessions" not in caller_inputs else None
+        provenance = scope_provenance(context, caller_inputs)
         xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present,
                                output_dir=output_dir, unmeasured_masks=unmeasured_masks, facts=facts, views=views,
                                provenance=provenance)
