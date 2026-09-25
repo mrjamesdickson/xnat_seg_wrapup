@@ -20,6 +20,9 @@ Dataset scope: group-level results save like the session and subject ones (James
 - **record-fetch refuses prerequisites at dataset scope** (exit 2, the reason in the log): a
   dataset run's input is the dataset's tree, assumed complete when it was made. Resolving
   records against a dataset is a later extension.
+- **The record's notes say where the output is.** "Published by proc-wrapup …; the tool's output kept
+  verbatim as DERIVED": the old text named the local staging directory (`raw/`), stale since `DERIVED`
+  moved to the resource root (seen on the first dataset record, demo02 2026-09-24).
 - **seg-wrapup skips ROI registration at dataset scope** (the ROI collection API is per session),
   as at subject scope.
 - Images and commands 0.7.0 (`seg-wrapup`, `proc-wrapup`, `record-fetch`, `record-fetch-subject`);

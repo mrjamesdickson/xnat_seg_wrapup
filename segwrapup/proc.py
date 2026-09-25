@@ -207,7 +207,7 @@ def run(args: argparse.Namespace) -> int:
         record_facts = {"wrapup": "proc-wrapup", "run_status": run_status, "auto_qc": "FAIL" if run_status == "FAILED" else "NOT_EVALUATED",
                         "container_id": (execution or {}).get("container_id"), "duration_seconds": (execution or {}).get("duration_seconds"),
                         "config": (execution or {}).get("facts"),
-                        "notes": f"Published by proc-wrapup {__version__}; tool output kept verbatim under {RAW_DIRNAME}/; nothing interpreted",
+                        "notes": f"Published by proc-wrapup {__version__}; the tool's output kept verbatim as DERIVED; nothing interpreted",
                         "inputs": {"scan": args.scan, "status_json": status is not None, "raw_files": len(copied),
                                    "scope": context.scope if context else "session",
                                    "subject": context.subject if context else "",

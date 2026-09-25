@@ -229,6 +229,10 @@ def test_proc_wrapup_keeps_everything_captures_logs_reports_and_publishes(cs, tm
                      f"<analysis:wrapup_version>proc-wrapup {__version__}<",
                      "<analysis:duration_seconds>120<", "<analysis:card_id>pyradiomics<", "<analysis:scans><analysis:scan>3<"):
         assert fragment in xml, fragment
+    # the notes say where the tool's output is on the record (DERIVED, at its root), not the local
+    # staging directory: "kept verbatim under raw/" was stale since DERIVED moved to the root
+    notes = xml.split("<analysis:notes>")[1].split("</analysis:notes>")[0]
+    assert "DERIVED" in notes and "raw/" not in notes, notes
     uploads = [c["path"].split("/out/resources/")[1].split("?")[0] for c in handler.calls if "/out/resources/" in c["path"]]
     assert "DERIVED/files/features.csv" in uploads and "REPORT/files/report.html" in uploads
     assert "PROVENANCE/files/wrapup.json" in uploads and "PROVENANCE/files/status.json" in uploads
