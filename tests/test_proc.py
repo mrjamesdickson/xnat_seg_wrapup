@@ -753,6 +753,21 @@ def test_nested_model_weights_keep_their_view_relative_names(cs, tmp_path, monke
     assert "<analysis:default_checkpoint>fold-0/best.pt</analysis:default_checkpoint>" in model_xml
 
 
+def test_a_generated_model_label_names_its_run_so_two_runs_in_one_second_do_not_collide():
+    """Two training cards finishing on the same dataset within a second produced the same
+    model_<dataset>_<stamp>; the second hit the create-only preflight (200) and lost its model
+    (Codex P2, PR #21 round 4). The run id is unique per run."""
+    from datetime import datetime, timezone
+    from segwrapup.model import model_label
+    when = datetime(2026, 9, 26, 22, 15, 38, tzinfo=timezone.utc)
+    a = model_label("nnunet-nnunet_msd_spleen_demo-20260803_121930", when, run_id="XNAT_E26048")
+    b = model_label("nnunet-nnunet_msd_spleen_demo-20260803_121930", when, run_id="XNAT_E26050")
+    assert a != b and a.endswith("_20260926T221538Z_E26048") and b.endswith("_20260926T221538Z_E26050")
+    assert len(a) <= 64 and a.startswith("model_nnunet-nnunet_msd_spleen_demo"), "hyphens are label-safe; the head is trimmed for the tail"
+    assert model_label("ds", when) == "model_ds_20260926T221538Z", "no run id: the old shape"
+    assert model_label("ds", when, run_id="") == "model_ds_20260926T221538Z"
+
+
 def test_default_checkpoint_must_be_an_uploaded_weight():
     """A stale card value would send consumers to a file the MODEL resource does not hold (Codex P2, PR #21)."""
     from segwrapup.model import default_checkpoint

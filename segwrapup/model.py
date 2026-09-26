@@ -49,9 +49,14 @@ PRODUCES_VALUES = ("", "model")
 _LABEL_SAFE = re.compile(r"[^A-Za-z0-9_-]+")
 
 
-def model_label(dataset_label: str, when: datetime | None = None) -> str:
+def model_label(dataset_label: str, when: datetime | None = None, run_id: str | None = None) -> str:
+    """``model_<dataset>_<stamp>_<run>``: the run's id (its part after ``XNAT_``) makes the label
+    unique per run, so two training cards finishing on the same dataset in the same second do
+    not collide on the create-only preflight (Codex P2, PR #21 round 4); the stamp keeps the
+    labels sortable by hand."""
     stamp = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
-    tail = f"_{stamp}"
+    run = _LABEL_SAFE.sub("_", (run_id or "").split("_", 1)[-1]).strip("_")
+    tail = f"_{stamp}" + (f"_{run}" if run else "")
     head = "model_" + _LABEL_SAFE.sub("_", dataset_label or "dataset").strip("_")
     return head[: LABEL_MAX - len(tail)] + tail
 
@@ -238,7 +243,7 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
         return {"error": f"no {MODEL_ROLE} view files on DERIVED"}
     root = output_dir / derived_root if derived_root else output_dir
     card = read_model_card(root, (views or {}).get(MODEL_ROLE, []))
-    label = model_label(dataset_facts.get("label") or context.dataset)
+    label = model_label(dataset_facts.get("label") or context.dataset, run_id=run_id)
     # view-relative names, not basenames: fold-0/best.pt and fold-1/best.pt are two files, and
     # default_checkpoint must name a path that exists on the MODEL resource (Codex P1, PR #21)
     weights = [n.replace(os.sep, "/") for n in names]

@@ -376,7 +376,7 @@ A dataset-scoped card whose results block says `"produces": "model"` (`XNW_PRODU
 the command) trains something. Its weights sit in `DERIVED` like any other output, named by
 the card's `MODEL` view (`XNW_RESOURCE_MODEL="*.pt,model-card.json"`). After the run record is
 published, proc-wrapup registers those files as an `analysis:trainedModelData` project asset
-in `DRAFT` (`model_<dataset label>_<stamp>`): the weights on its `MODEL` resource, the tool's
+in `DRAFT` (`model_<dataset label>_<stamp>_<run id>`, the run's `E…` part, so two runs on one dataset in the same second get distinct labels): the weights on its `MODEL` resource, the tool's
 `model-card.json` on `MODEL_CARD` when it wrote one, a small `provenance.json` on
 `PROVENANCE`; `source_dataset_id` names the frozen dataset and `engine_metadata_json.source_run_id`
 the run (not `source_training_id`: in the analysis schema plugin up to 0.2.0 that field is a foreign
