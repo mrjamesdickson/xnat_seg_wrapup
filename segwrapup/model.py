@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -89,8 +90,10 @@ def num_classes(labels: dict) -> int | None:
     """The network's output classes from the declared label indices: the highest index plus one,
     which counts background whether the card lists it (``{"background": 0, "spleen": 1}`` is 2
     classes, not 3) or not (``{"spleen": 1}`` is 2 too) and survives sparse indices (Codex P2,
-    PR #21 round 5). None when no index is numeric."""
-    indices = [int(v) for v in (labels or {}).values() if isinstance(v, (int, float)) and not isinstance(v, bool) and int(v) >= 0]
+    PR #21 round 5). None when no index is a finite non-negative integer: ``1e309`` decodes as
+    infinity and ``int()`` of it would raise after the run record was published (round 7)."""
+    indices = [int(v) for v in (labels or {}).values()
+               if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and float(v).is_integer() and v >= 0]
     return max(indices) + 1 if indices else None
 
 

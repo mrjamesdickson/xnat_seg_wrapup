@@ -774,6 +774,9 @@ def test_num_classes_comes_from_the_label_indices_not_the_number_of_names():
     assert num_classes({"background": 0, "spleen": 1}) == 2 and num_classes({"spleen": 1}) == 2 and num_classes({"foreground": 1}) == 2
     assert num_classes({"spleen": 1, "liver": 2}) == 3 and num_classes({"a": 1, "c": 3}) == 4, "sparse indices count by the highest"
     assert num_classes({}) is None and num_classes({"spleen": "one"}) is None and num_classes({"x": True}) is None
+    # a JSON number out of range decodes as infinity; NaN and fractions are not indices either (Codex P2, round 7)
+    assert num_classes({"lesion": float("inf"), "spleen": 1}) == 2 and num_classes({"lesion": float("nan")}) is None
+    assert num_classes({"half": 1.5, "two": 2.0}) == 3 and num_classes({"neg": -1}) is None
 
 
 def test_default_checkpoint_must_be_an_uploaded_weight():
