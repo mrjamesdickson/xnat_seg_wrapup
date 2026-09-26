@@ -5,6 +5,7 @@ test_publish.py) and answers the container list and log endpoints.
 """
 import html
 import json
+import re
 import os
 import logging
 import threading
@@ -85,6 +86,9 @@ class _CS(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_CS.containers).encode(), "application/json")
         elif self.path == "/xapi/commands/77":                       # the registered command carries the card (plan D27)
             self._send(200, json.dumps({"id": 77, "name": "pyradiomics", "version": "0.3.1", "command-metadata": {"card": CARD_BLOCK}}).encode(), "application/json")
+        elif self.path == "/data/experiments/XNAT_E77777?format=json":        # the run record, re-read before results_json.trained_model is written
+            self._send(200, json.dumps({"items": [{"data_fields": {"ID": "XNAT_E77777", "label": "run_label_x", "project": "PROJ_1",
+                                                                    "results_json": json.dumps({"views": {"MODEL": ["segmentation_spleen.pt"]}, "model": "monailabel-train"})}}]}).encode(), "application/json")
         elif self.path == "/data/experiments/XNAT_E00018?format=json":
             self._send(200, json.dumps({"items": [{"data_fields": {"label": "SESS01"}}]}).encode(), "application/json")
         elif self.path == "/data/experiments/XNAT_D0001?format=json":        # the frozen dataset a dataset-scoped run cites
@@ -626,13 +630,18 @@ def _training_env(monkeypatch, host, extra=None):
     monkeypatch.delenv("PROC_SESSION_ID"); monkeypatch.delenv("PROC_SCAN_ID")
 
 
+def manifest_label(out):
+    return json.loads((out / "wrapup.json").read_text())["trained_model"]["label"]
+
+
 def test_a_training_card_registers_a_draft_model_and_links_the_run(cs, tmp_path, monkeypatch):
     """produces=model: after the group record, the MODEL view's weights become an
     analysis:trainedModelData project asset in DRAFT (weights on MODEL, the tool's model card on
     MODEL_CARD, provenance on PROVENANCE), source_dataset_id points back (source_training_id is a foreign
     key to groupTrainingData in schema plugin 0.2.0 and would 500, as it did live on demo02 2026-09-26; the
     run id rides in engine_metadata_json.source_run_id), and
-    the run record gets produced_model_id, so the link pair of DATASET-SCOPE-CARDS-DESIGN §7.2
+    the run record gets results_json.trained_model (produced_model_id belongs to groupTrainingData
+    only in schema plugin 0.2.0; the query-parameter update created stray records live), so the link pair of DATASET-SCOPE-CARDS-DESIGN §7.2
     exists without the retired group-analysis-wrapup."""
     host, handler = cs
     inp, out = _training_output(tmp_path), tmp_path / "out"
@@ -657,7 +666,12 @@ def test_a_training_card_registers_a_draft_model_and_links_the_run(cs, tmp_path,
                        "/data/experiments/XNAT_E88888/resources/MODEL_CARD/files/model-card.json",
                        "/data/experiments/XNAT_E88888/resources/PROVENANCE/files/provenance.json"]
     links = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/experiments/XNAT_E77777?")]
-    assert len(links) == 1 and "produced_model_id=XNAT_E88888" in links[0]["path"] and "xsiType=analysis%3AgroupAnalysisData" in links[0]["path"]
+    assert len(links) == 1 and links[0]["path"] == "/data/experiments/XNAT_E77777?xsiType=analysis%3AgroupAnalysisData"
+    link_xml = links[0]["body"].decode()
+    assert 'ID="XNAT_E77777" project="PROJ_1" label="run_label_x"' in link_xml and "produced_model_id" not in link_xml
+    merged = json.loads(html.unescape(re.search(r"<analysis:results_json>(.*?)</analysis:results_json>", link_xml, re.S).group(1)))
+    assert merged["trained_model"] == {"id": "XNAT_E88888", "label": manifest_label(out), "xsi_type": "analysis:trainedModelData", "status": "DRAFT"}
+    assert merged["views"] == {"MODEL": ["segmentation_spleen.pt"]} and merged["model"] == "monailabel-train", "what the publish wrote is kept"
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["analysis_record"]["produces"] == "model" and sorted(manifest["analysis_record"]["views"]["MODEL"]) == ["model-card.json", "segmentation_spleen.pt"]
     assert manifest["trained_model"] == {"xsi_type": "analysis:trainedModelData", "id": "XNAT_E88888", "label": manifest["trained_model"]["label"],
@@ -677,7 +691,7 @@ def test_produces_model_without_weights_keeps_the_run_record_and_says_so(cs, tmp
     assert len(creates) == 1 and "/experiments/model_" not in creates[0], "no model asset without weights; the run record stands"
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["analysis_record"]["id"] == "XNAT_E77777" and manifest["trained_model"] == {"error": "no MODEL view files on DERIVED"}
-    assert not [c for c in handler.calls if "produced_model_id" in c["path"]]
+    assert not [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/experiments/XNAT_E77777?")]
 
 
 def test_produces_model_on_a_failed_run_registers_nothing(cs, tmp_path, monkeypatch):
@@ -688,7 +702,7 @@ def test_produces_model_on_a_failed_run_registers_nothing(cs, tmp_path, monkeypa
     assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["run_status"] == "FAILED" and manifest["trained_model"] == {"skipped": "run FAILED"}
-    assert not [c for c in handler.calls if "/experiments/model_" in c["path"] or "produced_model_id" in c["path"]]
+    assert not [c for c in handler.calls if "/experiments/model_" in c["path"] or (c["method"] == "PUT" and c["path"].startswith("/data/experiments/XNAT_E77777?"))]
 
 
 def test_a_model_registration_that_fails_leaves_the_run_record_and_records_the_error(cs, tmp_path, monkeypatch):

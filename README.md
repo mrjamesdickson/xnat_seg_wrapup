@@ -383,8 +383,10 @@ the run (not `source_training_id`: in the analysis schema plugin up to 0.2.0 tha
 key to `analysis:groupTrainingData`, and a group record there makes XNAT answer 500),
 `model_framework`/`model_name`/`default_checkpoint`/`task_type`/`label_names`/`num_classes`/
 `best_validation_dice` come from the model card when present. The run record then gets
-`produced_model_id` (a bodiless `PUT /data/experiments/<run>?analysis:GroupAnalysis/produced_model_id=<model>`),
-so the two point at each other. `wrapup.json` carries the outcome under `trained_model`.
+`results_json.trained_model` (`{id, label, xsi_type, status}`) by a partial XML PUT keyed on its ID,
+so the two point at each other. Not `produced_model_id`: in the analysis schema plugin up to 0.2.0 that
+field exists only on `analysis:groupTrainingData`, and XNAT's query-parameter update of a project
+asset creates a second record instead of updating (seen live, 2026-09-26). `wrapup.json` carries the outcome under `trained_model`.
 
 What it does not do: register anything from a run that did not succeed, from a session- or
 subject-scoped run, or when the `MODEL` view names no file (each is recorded under

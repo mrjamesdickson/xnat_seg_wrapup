@@ -8,7 +8,9 @@ trains something; its weights sit in ``DERIVED`` like any other output, named by
 the frozen dataset (the run itself is named in ``engine_metadata_json.source_run_id`` and in
 ``provenance.json``; see ``build_model_xml`` for why not ``source_training_id``), uploads the weights to its ``MODEL``
 resource (the model card, when the tool wrote one, to ``MODEL_CARD``; a small provenance file to
-``PROVENANCE``), and writes ``produced_model_id`` back on the run record. Promotion out of
+``PROVENANCE``), and notes the model on the run record as ``results_json.trained_model``
+(``produced_model_id`` exists only on ``analysis:groupTrainingData`` in schema plugin 0.2.0, not on
+the group record; see ``note_model_on_run``). Promotion out of
 DRAFT is a person's act elsewhere (the grouplevel plugin's models page); nothing here decides
 whether a model is any good.
 
@@ -26,7 +28,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from .publish import ANALYSIS_NS, DATASET_XSI_TYPE, XNAT_NS, RecordFile, _element, _put, publish_record
+import http.client
+import urllib.error
+import urllib.request
+
+from .publish import ANALYSIS_NS, DATASET_XSI_TYPE, XNAT_NS, RecordFile, _element, _put, bounded_results_json, publish_record
+from .register import auth_headers
 from .register import LABEL_MAX, XnatContext
 
 logger = logging.getLogger("segwrapup.model")
@@ -94,9 +101,9 @@ def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, c
         # to analysis:groupTrainingData (the type the JAR commands wrote, on the drop list), and the run
         # here is an analysis:groupAnalysisData, so XNAT answers 500 (FK violation, demo02 2026-09-26:
         # "analysis_trainedmodeldata_source_training_id_fkey"). The run id rides in engine_metadata_json
-        # and provenance.json instead, and the run points at the model through produced_model_id (a
-        # foreign key to trainedModelData, which holds). Re-pointing source_training_id at the group
-        # record is a schema change for the analysis plugin, not for this wrapup.
+        # and provenance.json instead, and the run names the model in results_json.trained_model.
+        # Re-pointing source_training_id at the group record is a schema change for the analysis
+        # plugin, not for this wrapup.
         _element("engine_metadata_json", json.dumps({**{k: card.get(k) for k in ("app", "max_epochs", "train_cases", "val_cases",
                                                                                  "val_split", "base_model", "train_stats", "card_id",
                                                                                  "card_revision", "container_digest") if k in card},
@@ -120,13 +127,57 @@ def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, c
     )
 
 
-def link_run_to_model(context: XnatContext, run_id: str, model_id: str, timeout_seconds: float = 60.0) -> None:
-    """``produced_model_id`` on the run record: XNAT updates one field through the xpath query
-    parameter on a bodiless PUT to the experiment."""
-    field = urllib.parse.quote("analysis:GroupAnalysis/produced_model_id", safe="")
-    url = (f"{context.host}/data/experiments/{urllib.parse.quote(run_id, safe='')}"
-           f"?xsiType={urllib.parse.quote(DATASET_XSI_TYPE, safe='')}&{field}={urllib.parse.quote(model_id, safe='')}")
-    _put(context, url, b"", "text/plain", timeout_seconds)
+def _record_fields(context: XnatContext, run_id: str, timeout: float) -> dict:
+    url = f"{context.host}/data/experiments/{urllib.parse.quote(run_id, safe='')}?format=json"
+    request = urllib.request.Request(url, headers=auth_headers(context))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode(errors="replace"))
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"GET {url.split('?')[0]} failed: HTTP {error.code}") from error
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError) as error:
+        raise RuntimeError(f"GET {url.split('?')[0]} failed: {error}") from error
+    try:
+        return payload["items"][0]["data_fields"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise RuntimeError(f"GET {url.split('?')[0]}: no data_fields in the answer") from error
+
+
+def note_model_on_run(context: XnatContext, run_id: str, model_id: str, model_label: str, timeout_seconds: float = 60.0) -> None:
+    """Write ``results_json.trained_model`` on the run record by a partial XML PUT keyed on the
+    record's ID.
+
+    Why not ``produced_model_id``: in xnat-analysis-schema-plugin 0.2.0 that element belongs to
+    ``analysis:groupTrainingData`` (an extension of the group record, on the drop list), not to
+    ``analysis:groupAnalysisData``, so the group record has no such field. And why not the
+    query-parameter form (``PUT /data/experiments/<id>?xsiType=...&analysis:groupAnalysisData/x=y``):
+    live on demo02 (2026-09-26) XNAT answered 422 "must include the project attribute" on the
+    experiment path and, on the project path or with a project field, CREATED a second record
+    labelled with the run's id instead of updating it. A partial XML document carrying the ID,
+    project and label merges into the existing record (XNAT_E26034 updated in place, no stray).
+    ``results_json`` is re-read first so nothing the publish wrote is lost."""
+    fields = _record_fields(context, run_id, timeout_seconds)
+    try:
+        current = json.loads(fields.get("results_json") or "{}")
+        if not isinstance(current, dict):
+            current = {"results": current}
+    except ValueError:
+        logger.warning("run %s results_json is not JSON; trained_model is written beside its raw text", run_id)
+        current = {"results_raw": fields.get("results_json")}
+    current["trained_model"] = {"id": model_id, "label": model_label, "xsi_type": MODEL_XSI_TYPE, "status": "DRAFT"}
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<analysis:GroupAnalysis xmlns:analysis="{ANALYSIS_NS}" xmlns:xnat="{XNAT_NS}" '
+        f'ID="{escape(run_id)}" project="{escape(context.project)}" label="{escape(str(fields.get("label") or ""))}">\n'
+        f"  <analysis:results_json>{escape(bounded_results_json(current))}</analysis:results_json>\n"
+        "</analysis:GroupAnalysis>\n"
+    )
+    url = f"{context.host}/data/experiments/{urllib.parse.quote(run_id, safe='')}?xsiType={urllib.parse.quote(DATASET_XSI_TYPE, safe='')}"
+    status, text = _put(context, url, xml.encode(), "application/xml", timeout_seconds)
+    answered = text.strip()
+    if answered and answered != run_id:
+        # XNAT answers the id of the record it wrote; anything else means it made a new one
+        raise RuntimeError(f"PUT {url.split('?')[0]} answered {answered!r}, not {run_id}: a record was created instead of updated")
 
 
 def register_trained_model(context: XnatContext, output_dir: Path, derived_root: str | None, run_outcome: dict,
@@ -172,11 +223,11 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     result = {"xsi_type": MODEL_XSI_TYPE, "id": outcome["id"], "label": outcome["label"], "status": "DRAFT",
               "weights": weights, "model_card": bool(card), "source_run_id": run_id, "linked": False}
     try:
-        link_run_to_model(context, run_id, outcome["id"], timeout_seconds=min(timeout_seconds, 60.0))
+        note_model_on_run(context, run_id, outcome["id"], outcome["label"], timeout_seconds=min(timeout_seconds, 60.0))
         result["linked"] = True
     except RuntimeError as error:
         # The model still names the run in engine_metadata_json/provenance.json; only the forward link is missing.
-        logger.error("model %s registered but run %s could not be updated with produced_model_id: %s", outcome["id"], run_id, error)
+        logger.error("model %s registered but run %s could not be noted in its results_json: %s", outcome["id"], run_id, error)
         result["link_error"] = str(error)
     logger.info("trained model %s registered as %s (DRAFT) from run %s%s", label, outcome["id"], run_id,
                 "" if result["linked"] else "; run not linked")

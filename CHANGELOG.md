@@ -13,7 +13,9 @@ container-workshop `DATASET-SCOPE-CARDS-DESIGN.md` §7.2/§8, without the retire
   `source_training_id`, a foreign key to `groupTrainingData` in schema plugin 0.2.0: live 500 on
   demo02, 2026-09-26), and the
   card's framework/name/checkpoint/labels/best dice when a model card is present), then writes
-  `produced_model_id` on the run record. Nothing is registered from a failed run, outside
+  `results_json.trained_model` on the run record (not `produced_model_id`, which schema plugin 0.2.0
+  gives only `groupTrainingData`; and by a partial XML PUT, since the query-parameter form creates a
+  stray record on a project asset, demo02 2026-09-26). Nothing is registered from a failed run, outside
   dataset scope, or without weights; the run record is never rolled back for the model's sake;
   every outcome is in `wrapup.json` under `trained_model`. `segwrapup/model.py`;
   `RecordContract.produces`; `publish_record(..., xsi_type=)`.
