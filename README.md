@@ -378,7 +378,9 @@ the card's `MODEL` view (`XNW_RESOURCE_MODEL="*.pt,model-card.json"`). After the
 published, proc-wrapup registers those files as an `analysis:trainedModelData` project asset
 in `DRAFT` (`model_<dataset label>_<stamp>`): the weights on its `MODEL` resource, the tool's
 `model-card.json` on `MODEL_CARD` when it wrote one, a small `provenance.json` on
-`PROVENANCE`; `source_training_id` names the run, `source_dataset_id` the frozen dataset,
+`PROVENANCE`; `source_dataset_id` names the frozen dataset and `engine_metadata_json.source_run_id`
+the run (not `source_training_id`: in the analysis schema plugin up to 0.2.0 that field is a foreign
+key to `analysis:groupTrainingData`, and a group record there makes XNAT answer 500),
 `model_framework`/`model_name`/`default_checkpoint`/`task_type`/`label_names`/`num_classes`/
 `best_validation_dice` come from the model card when present. The run record then gets
 `produced_model_id` (a bodiless `PUT /data/experiments/<run>?analysis:GroupAnalysis/produced_model_id=<model>`),

@@ -629,7 +629,9 @@ def _training_env(monkeypatch, host, extra=None):
 def test_a_training_card_registers_a_draft_model_and_links_the_run(cs, tmp_path, monkeypatch):
     """produces=model: after the group record, the MODEL view's weights become an
     analysis:trainedModelData project asset in DRAFT (weights on MODEL, the tool's model card on
-    MODEL_CARD, provenance on PROVENANCE), source_training_id/source_dataset_id point back, and
+    MODEL_CARD, provenance on PROVENANCE), source_dataset_id points back (source_training_id is a foreign
+    key to groupTrainingData in schema plugin 0.2.0 and would 500, as it did live on demo02 2026-09-26; the
+    run id rides in engine_metadata_json.source_run_id), and
     the run record gets produced_model_id, so the link pair of DATASET-SCOPE-CARDS-DESIGN §7.2
     exists without the retired group-analysis-wrapup."""
     host, handler = cs
@@ -640,13 +642,16 @@ def test_a_training_card_registers_a_draft_model_and_links_the_run(cs, tmp_path,
     assert [c["path"].split("/")[5].split("_")[0] for c in creates] == ["monailabel-train", "model"], "the run record first, then the model"
     model_xml = creates[1]["body"].decode()
     assert model_xml.startswith('<?xml version="1.0" encoding="UTF-8"?>\n<analysis:TrainedModel ') and 'project="PROJ_1" label="model_flanker-2sub_' in model_xml
-    for fragment in ("<analysis:model_status>DRAFT</analysis:model_status>", "<analysis:source_training_id>XNAT_E77777</analysis:source_training_id>",
-                     "<analysis:source_dataset_id>XNAT_D0001</analysis:source_dataset_id>", "<analysis:model_framework>monailabel</analysis:model_framework>",
+    for fragment in ("<analysis:model_status>DRAFT</analysis:model_status>",                      "<analysis:source_dataset_id>XNAT_D0001</analysis:source_dataset_id>", "<analysis:model_framework>monailabel</analysis:model_framework>",
                      "<analysis:default_checkpoint>segmentation_spleen.pt</analysis:default_checkpoint>", "<analysis:model_name>segmentation_spleen</analysis:model_name>",
                      "<analysis:label_names>spleen:1</analysis:label_names>", "<analysis:num_classes>2</analysis:num_classes>",
                      "<analysis:best_validation_dice>0.91</analysis:best_validation_dice>", "<analysis:model_resource_label>MODEL</analysis:model_resource_label>",
                      "<analysis:created_by>alias</analysis:created_by>"):
         assert fragment in model_xml, fragment
+    assert "source_training_id" not in model_xml, "a foreign key to analysis:groupTrainingData; the run is a groupAnalysisData"
+    import re, html
+    meta = json.loads(html.unescape(re.search(r"<analysis:engine_metadata_json>(.*?)</analysis:engine_metadata_json>", model_xml, re.S).group(1)))
+    assert meta["source_run_id"] == "XNAT_E77777" and meta["source_run_type"] == "analysis:groupAnalysisData"
     uploads = [c["path"].split("?")[0] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/experiments/XNAT_E88888/resources/")]
     assert uploads == ["/data/experiments/XNAT_E88888/resources/MODEL/files/segmentation_spleen.pt",
                        "/data/experiments/XNAT_E88888/resources/MODEL_CARD/files/model-card.json",
@@ -657,7 +662,7 @@ def test_a_training_card_registers_a_draft_model_and_links_the_run(cs, tmp_path,
     assert manifest["analysis_record"]["produces"] == "model" and sorted(manifest["analysis_record"]["views"]["MODEL"]) == ["model-card.json", "segmentation_spleen.pt"]
     assert manifest["trained_model"] == {"xsi_type": "analysis:trainedModelData", "id": "XNAT_E88888", "label": manifest["trained_model"]["label"],
                                          "status": "DRAFT", "weights": ["segmentation_spleen.pt"], "model_card": True,
-                                         "source_training_id": "XNAT_E77777", "linked": True}
+                                         "source_run_id": "XNAT_E77777", "linked": True}
     # the weights are still on the run record's DERIVED, untouched: the model asset is a second home, not a move
     assert "/data/experiments/XNAT_E77777/resources/DERIVED/files/segmentation_spleen.pt" in [c["path"].split("?")[0] for c in handler.calls]
 

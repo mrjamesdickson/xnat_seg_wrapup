@@ -4,8 +4,9 @@ Model registration for training cards (proc-wrapup 0.7.1).
 A dataset-scoped card whose results block says ``produces: model`` (``XNW_PRODUCES=model``)
 trains something; its weights sit in ``DERIVED`` like any other output, named by the card's
 ``MODEL`` view. After the run record is published, this module registers the weights as an
-``analysis:trainedModelData`` project asset in ``DRAFT``, with ``source_training_id`` pointing
-at the run and ``source_dataset_id`` at the frozen dataset, uploads the weights to its ``MODEL``
+``analysis:trainedModelData`` project asset in ``DRAFT``, with ``source_dataset_id`` pointing at
+the frozen dataset (the run itself is named in ``engine_metadata_json.source_run_id`` and in
+``provenance.json``; see ``build_model_xml`` for why not ``source_training_id``), uploads the weights to its ``MODEL``
 resource (the model card, when the tool wrote one, to ``MODEL_CARD``; a small provenance file to
 ``PROVENANCE``), and writes ``produced_model_id`` back on the run record. Promotion out of
 DRAFT is a person's act elsewhere (the grouplevel plugin's models page); nothing here decides
@@ -84,15 +85,22 @@ def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, c
         _element("model_version", card.get("card_revision") or contract.get("card_revision")),
         _element("model_family", framework),
         _element("model_status", "DRAFT"),
-        _element("source_training_id", run_id),
         _element("source_dataset_id", context.dataset),
         _element("created_by", context.user),
         _element("created_time", now.strftime("%Y-%m-%dT%H:%M:%S")),
         _element("engine", framework),
         _element("container_image", card.get("container_image") or contract.get("container_image")),
-        _element("engine_metadata_json", json.dumps({k: card.get(k) for k in ("app", "max_epochs", "train_cases", "val_cases",
-                                                                              "val_split", "base_model", "train_stats", "card_id",
-                                                                              "card_revision", "container_digest") if k in card})),
+        # source_training_id is NOT written: in xnat-analysis-schema-plugin <= 0.2.0 it is a foreign key
+        # to analysis:groupTrainingData (the type the JAR commands wrote, on the drop list), and the run
+        # here is an analysis:groupAnalysisData, so XNAT answers 500 (FK violation, demo02 2026-09-26:
+        # "analysis_trainedmodeldata_source_training_id_fkey"). The run id rides in engine_metadata_json
+        # and provenance.json instead, and the run points at the model through produced_model_id (a
+        # foreign key to trainedModelData, which holds). Re-pointing source_training_id at the group
+        # record is a schema change for the analysis plugin, not for this wrapup.
+        _element("engine_metadata_json", json.dumps({**{k: card.get(k) for k in ("app", "max_epochs", "train_cases", "val_cases",
+                                                                                 "val_split", "base_model", "train_stats", "card_id",
+                                                                                 "card_revision", "container_digest") if k in card},
+                                                     "source_run_id": run_id, "source_run_type": "analysis:groupAnalysisData"})),
         _element("label_names", ",".join(f"{name}:{index}" for name, index in labels.items()) if labels else None),
         _element("num_classes", len(labels) + 1 if labels else None),
         _element("best_validation_dice", _best_dice(card)),
@@ -146,7 +154,8 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     if card:
         card_path = next((root / n for n in (views or {}).get(MODEL_ROLE, []) if n.endswith(MODEL_CARD_FILENAME)), root / MODEL_CARD_FILENAME)
         files[MODEL_CARD_ROLE] = [RecordFile(card_path, MODEL_CARD_FILENAME)]
-    provenance = {"registered_by": "proc-wrapup", "source_training_id": run_id, "source_training_label": run_outcome.get("label"),
+    provenance = {"registered_by": "proc-wrapup", "source_run_id": run_id, "source_run_type": "analysis:groupAnalysisData",
+                  "source_run_label": run_outcome.get("label"),
                   "source_dataset_id": context.dataset, "dataset_label": dataset_facts.get("label"),
                   "card_id": contract.get("card_id"), "card_revision": contract.get("card_revision"),
                   "container_image": contract.get("container_image"), "container_digest": contract.get("container_digest"),
@@ -161,12 +170,12 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
         logger.error("trained model %s not registered; the run record %s stays: %s", label, run_id, error)
         return {"label": label, "error": str(error)}
     result = {"xsi_type": MODEL_XSI_TYPE, "id": outcome["id"], "label": outcome["label"], "status": "DRAFT",
-              "weights": weights, "model_card": bool(card), "source_training_id": run_id, "linked": False}
+              "weights": weights, "model_card": bool(card), "source_run_id": run_id, "linked": False}
     try:
         link_run_to_model(context, run_id, outcome["id"], timeout_seconds=min(timeout_seconds, 60.0))
         result["linked"] = True
     except RuntimeError as error:
-        # The model still points at the run through source_training_id; only the forward link is missing.
+        # The model still names the run in engine_metadata_json/provenance.json; only the forward link is missing.
         logger.error("model %s registered but run %s could not be updated with produced_model_id: %s", outcome["id"], run_id, error)
         result["link_error"] = str(error)
     logger.info("trained model %s registered as %s (DRAFT) from run %s%s", label, outcome["id"], run_id,
