@@ -157,7 +157,7 @@ def close_session(context: XnatContext, timeout_seconds: float = 60.0) -> None:
 LABEL_MAX = 64
 
 
-def collection_label(model_name: str, scan: str, when: datetime | None = None, session_label: str = "") -> str:
+def collection_label(model_name: str, scan: str, when: datetime | None = None, session_label: str = "", reserve: int = 0) -> str:
     """A label OHIF will accept and a human can read:
     ``<model>_<session label>_scan<id>_<UTC stamp>``.
 
@@ -165,18 +165,24 @@ def collection_label(model_name: str, scan: str, when: datetime | None = None, s
     part of it: a batch that finishes two runs of one pipeline in the same second (Merlin on
     RSNA0001/RSNA0002, 2026-09-06) otherwise builds the same label twice and the second create
     is refused with 409. When the whole thing exceeds ``LABEL_MAX`` the model name is trimmed,
-    never the session, scan or stamp that make it unique."""
+    never the session, scan or stamp that make it unique. ``reserve`` leaves room for a suffix the
+    caller appends (proc-wrapup's ``_record``): a 64-character label plus ``_record`` is 71 and XNAT
+    refuses the record (Codex P2, PR #21)."""
     stamp = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
-    tail = []
-    if session_label:
-        tail.append(_LABEL_SAFE.sub("_", session_label).strip("_"))
-    if scan:
-        tail.append(f"scan{_LABEL_SAFE.sub('_', scan)}")
-    tail.append(stamp)
-    suffix = "_".join(part for part in tail if part)
+    limit = max(LABEL_MAX - max(reserve, 0), 1)
+    scan_part = f"scan{_LABEL_SAFE.sub('_', scan)}" if scan else ""
+    owner = _LABEL_SAFE.sub("_", session_label).strip("_") if session_label else ""
     model = _LABEL_SAFE.sub("_", model_name).strip("_") or "SEG"
-    model = model[:max(LABEL_MAX - len(suffix) - 1, 1)].rstrip("_") or "SEG"
-    return f"{model}_{suffix}"[:LABEL_MAX]
+    # what must survive: the stamp and the scan (uniqueness); then the owner, then the model.
+    # A long dataset label used to push the stamp off the end (proc-wrapup dataset scope).
+    fixed = "_".join(part for part in (scan_part, stamp) if part)
+    room = limit - len(fixed) - 1                         # for "<model>_" at least
+    if owner:
+        owner = owner[:max(room - 2, 0)].rstrip("_")     # leave "M_" for the model
+    room = limit - len("_".join(part for part in (owner, fixed) if part)) - 1
+    model = model[:max(room, 1)].rstrip("_") or "M"
+    label = "_".join(part for part in (model, owner, fixed) if part)
+    return label[:limit] if len(fixed) >= limit else label
 
 
 def fetch_target_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:

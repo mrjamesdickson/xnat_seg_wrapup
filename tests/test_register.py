@@ -339,3 +339,18 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
         assert fetch_dataset_facts(XnatContext(host=host, user="u", password="p", project="P1", session="XNAT_E1")) == {}
     finally:
         server.shutdown()
+
+
+def test_collection_label_reserves_room_for_a_caller_suffix():
+    """proc-wrapup appends _record; without the reservation a long dataset label made a 71-character
+    record label that XNAT refuses (Codex P2, PR #21)."""
+    from datetime import datetime, timezone
+    from segwrapup.register import LABEL_MAX, collection_label
+    when = datetime(2026, 9, 26, 17, 41, 42, tzinfo=timezone.utc)
+    owner = "nnunet-nnunet_msd_spleen_demo-20260803_121930-with-a-very-long-cohort-name"
+    plain = collection_label("monailabel-train", "", when=when, session_label=owner)
+    assert len(plain) == LABEL_MAX
+    reserved = collection_label("monailabel-train", "", when=when, session_label=owner, reserve=len("_record"))
+    assert len(reserved + "_record") <= LABEL_MAX
+    assert reserved.endswith("20260926T174142Z"), "the stamp that makes it unique is kept; the model name gives way"
+

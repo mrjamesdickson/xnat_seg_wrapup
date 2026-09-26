@@ -225,7 +225,7 @@ def run(args: argparse.Namespace) -> int:
             # already read with the facts above (no second request; the id when it did not answer).
             owner_label = ((dataset_facts.get("label") or context.dataset) if context and context.scope == "dataset"
                            else fetch_target_label(context) if context else "")
-            args.record_label = collection_label(args.pipeline, args.scan, session_label=owner_label) + "_record"
+            args.record_label = collection_label(args.pipeline, args.scan, session_label=owner_label, reserve=len("_record")) + "_record"
         outcome = publish_if_possible(args, output_dir, report, [], False, context=context, facts=record_facts,
                                       default_resources=PROC_DEFAULT_RESOURCES, derived_root=RAW_DIRNAME, manifest=manifest)
         # Local paths of what went up (and of the empty files that could not): for the pointer
