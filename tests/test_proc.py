@@ -768,6 +768,14 @@ def test_a_generated_model_label_names_its_run_so_two_runs_in_one_second_do_not_
     assert model_label("ds", when, run_id="") == "model_ds_20260926T221538Z"
 
 
+def test_num_classes_comes_from_the_label_indices_not_the_number_of_names():
+    """{"background": 0, "spleen": 1} is a two-class network, not three (Codex P2, PR #21 round 5)."""
+    from segwrapup.model import num_classes
+    assert num_classes({"background": 0, "spleen": 1}) == 2 and num_classes({"spleen": 1}) == 2 and num_classes({"foreground": 1}) == 2
+    assert num_classes({"spleen": 1, "liver": 2}) == 3 and num_classes({"a": 1, "c": 3}) == 4, "sparse indices count by the highest"
+    assert num_classes({}) is None and num_classes({"spleen": "one"}) is None and num_classes({"x": True}) is None
+
+
 def test_default_checkpoint_must_be_an_uploaded_weight():
     """A stale card value would send consumers to a file the MODEL resource does not hold (Codex P2, PR #21)."""
     from segwrapup.model import default_checkpoint

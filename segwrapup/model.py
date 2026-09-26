@@ -85,6 +85,15 @@ def _best_dice(card: dict) -> float | None:
     return None
 
 
+def num_classes(labels: dict) -> int | None:
+    """The network's output classes from the declared label indices: the highest index plus one,
+    which counts background whether the card lists it (``{"background": 0, "spleen": 1}`` is 2
+    classes, not 3) or not (``{"spleen": 1}`` is 2 too) and survives sparse indices (Codex P2,
+    PR #21 round 5). None when no index is numeric."""
+    indices = [int(v) for v in (labels or {}).values() if isinstance(v, (int, float)) and not isinstance(v, bool) and int(v) >= 0]
+    return max(indices) + 1 if indices else None
+
+
 def default_checkpoint(declared, weights: list[str]) -> str | None:
     """The checkpoint a consumer loads first: the model card's value when it names one of the
     uploaded weights (exactly, or by basename), else the only weight, else nothing. A card value
@@ -138,7 +147,7 @@ def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, c
                                                                                  "card_revision", "container_digest") if k in card},
                                                      "source_run_id": run_id, "source_run_type": "analysis:groupAnalysisData"})),
         _element("label_names", ",".join(f"{name}:{index}" for name, index in labels.items()) if labels else None),
-        _element("num_classes", len(labels) + 1 if labels else None),
+        _element("num_classes", num_classes(labels)),
         _element("best_validation_dice", _best_dice(card)),
         _element("model_resource_label", MODEL_ROLE),
         _element("model_card_resource_label", MODEL_CARD_ROLE if card else None),
