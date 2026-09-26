@@ -80,7 +80,7 @@ def _best_dice(card: dict) -> float | None:
 
 
 def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, contract: dict,
-                    weights: list[str], dataset_facts: dict, when: datetime | None = None) -> str:
+                    weights: list[str], dataset_facts: dict, when: datetime | None = None, created_by: str | None = None) -> str:
     now = when or datetime.now(timezone.utc)
     labels = card.get("labels") if isinstance(card.get("labels"), dict) else {}
     framework = card.get("model_framework") or contract.get("analysis_type") or ""
@@ -93,7 +93,7 @@ def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, c
         _element("model_family", framework),
         _element("model_status", "DRAFT"),
         _element("source_dataset_id", context.dataset),
-        _element("created_by", context.user),
+        _element("created_by", created_by or context.user),
         _element("created_time", now.strftime("%Y-%m-%dT%H:%M:%S")),
         _element("engine", framework),
         _element("container_image", card.get("container_image") or contract.get("container_image")),
@@ -141,6 +141,21 @@ def _record_fields(context: XnatContext, run_id: str, timeout: float) -> dict:
         return payload["items"][0]["data_fields"]
     except (KeyError, IndexError, TypeError) as error:
         raise RuntimeError(f"GET {url.split('?')[0]}: no data_fields in the answer") from error
+
+
+def _username(context: XnatContext, timeout: float) -> str:
+    """The person the run belongs to. ``context.user`` is the alias token the Container Service
+    handed the container (live: ``created_by`` read ``e720932c-...`` on demo02, 2026-09-26);
+    ``GET /xapi/users/username`` answers the real login for that token."""
+    url = f"{context.host}/xapi/users/username"
+    request = urllib.request.Request(url, headers=auth_headers(context))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            name = response.read().decode(errors="replace").strip().strip('"')
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError) as error:
+        logger.warning("could not resolve the launching user (%s); created_by keeps the alias", error)
+        return context.user
+    return name or context.user
 
 
 def note_model_on_run(context: XnatContext, run_id: str, model_id: str, model_label: str, timeout_seconds: float = 60.0) -> None:
@@ -214,7 +229,8 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     scratch = Path(tempfile.mkdtemp(prefix="proc-wrapup-model-"))
     (scratch / "provenance.json").write_text(json.dumps(provenance, indent=2))
     files[PROVENANCE_ROLE] = [RecordFile(scratch / "provenance.json", "provenance.json")]
-    xml = build_model_xml(context, label, run_id, card, contract, weights, dataset_facts)
+    xml = build_model_xml(context, label, run_id, card, contract, weights, dataset_facts,
+                          created_by=_username(context, min(timeout_seconds, 30.0)))
     try:
         outcome = publish_record(context, label, xml, files, timeout_seconds=timeout_seconds, xsi_type=MODEL_XSI_TYPE)
     except RuntimeError as error:

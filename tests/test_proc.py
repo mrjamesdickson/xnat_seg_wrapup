@@ -86,6 +86,8 @@ class _CS(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_CS.containers).encode(), "application/json")
         elif self.path == "/xapi/commands/77":                       # the registered command carries the card (plan D27)
             self._send(200, json.dumps({"id": 77, "name": "pyradiomics", "version": "0.3.1", "command-metadata": {"card": CARD_BLOCK}}).encode(), "application/json")
+        elif self.path == "/xapi/users/username":                        # the alias token resolves to the real login
+            self._send(200, b"jdickson")
         elif self.path == "/data/experiments/XNAT_E77777?format=json":        # the run record, re-read before results_json.trained_model is written
             self._send(200, json.dumps({"items": [{"data_fields": {"ID": "XNAT_E77777", "label": "run_label_x", "project": "PROJ_1",
                                                                     "results_json": json.dumps({"views": {"MODEL": ["segmentation_spleen.pt"]}, "model": "monailabel-train"})}}]}).encode(), "application/json")
@@ -655,7 +657,7 @@ def test_a_training_card_registers_a_draft_model_and_links_the_run(cs, tmp_path,
                      "<analysis:default_checkpoint>segmentation_spleen.pt</analysis:default_checkpoint>", "<analysis:model_name>segmentation_spleen</analysis:model_name>",
                      "<analysis:label_names>spleen:1</analysis:label_names>", "<analysis:num_classes>2</analysis:num_classes>",
                      "<analysis:best_validation_dice>0.91</analysis:best_validation_dice>", "<analysis:model_resource_label>MODEL</analysis:model_resource_label>",
-                     "<analysis:created_by>alias</analysis:created_by>"):
+                     "<analysis:created_by>jdickson</analysis:created_by>"):
         assert fragment in model_xml, fragment
     assert "source_training_id" not in model_xml, "a foreign key to analysis:groupTrainingData; the run is a groupAnalysisData"
     import re, html
