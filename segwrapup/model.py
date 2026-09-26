@@ -84,7 +84,12 @@ def default_checkpoint(declared, weights: list[str]) -> str | None:
     """The checkpoint a consumer loads first: the model card's value when it names one of the
     uploaded weights (exactly, or by basename), else the only weight, else nothing. A card value
     that is not among the weights (a stale `best.ckpt` beside an uploaded `best.pt`) would send
-    every consumer to a file the MODEL resource does not hold (Codex P2, PR #21)."""
+    every consumer to a file the MODEL resource does not hold (Codex P2, PR #21). A value that
+    is not a string (a number, an object) is treated as undeclared, not raised: the card is the
+    engine's, and registration is best effort after the run record is published."""
+    if declared is not None and not isinstance(declared, str):
+        logger.warning("model card default_checkpoint is a %s, not a string; treating it as undeclared", type(declared).__name__)
+        declared = None
     declared = (declared or "").strip()
     if declared:
         if declared in weights:

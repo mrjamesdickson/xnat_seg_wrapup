@@ -762,4 +762,7 @@ def test_default_checkpoint_must_be_an_uploaded_weight():
     assert default_checkpoint("best.ckpt", ["best.pt"]) == "best.pt", "the only weight wins over a stale name"
     assert default_checkpoint("best.ckpt", ["fold-0/best.pt", "fold-1/best.pt"]) is None, "ambiguous: registered without one"
     assert default_checkpoint(None, ["a.pt", "b.pt"]) is None and default_checkpoint("", ["only.pt"]) == "only.pt"
+    # a non-string card value is undeclared, not an AttributeError that fails the wrapup after the run was published (Codex P2, round 4)
+    assert default_checkpoint(123, ["only.pt"]) == "only.pt" and default_checkpoint({"path": "x"}, ["a.pt", "b.pt"]) is None
+    assert default_checkpoint(["best.pt"], ["best.pt"]) == "best.pt", "a list is not a string either; the only weight wins"
 
