@@ -80,6 +80,24 @@ def _best_dice(card: dict) -> float | None:
     return None
 
 
+def default_checkpoint(declared, weights: list[str]) -> str | None:
+    """The checkpoint a consumer loads first: the model card's value when it names one of the
+    uploaded weights (exactly, or by basename), else the only weight, else nothing. A card value
+    that is not among the weights (a stale `best.ckpt` beside an uploaded `best.pt`) would send
+    every consumer to a file the MODEL resource does not hold (Codex P2, PR #21)."""
+    declared = (declared or "").strip()
+    if declared:
+        if declared in weights:
+            return declared
+        by_name = [w for w in weights if w.rsplit("/", 1)[-1] == declared.rsplit("/", 1)[-1]]
+        if len(by_name) == 1:
+            logger.warning("model card default_checkpoint %r is not an uploaded path; using %r", declared, by_name[0])
+            return by_name[0]
+        logger.error("model card default_checkpoint %r is not among the uploaded weights %s; %s", declared, weights,
+                     "falling back to the only weight" if len(weights) == 1 else "the model is registered without one")
+    return weights[0] if len(weights) == 1 else None
+
+
 def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, contract: dict,
                     weights: list[str], dataset_facts: dict, when: datetime | None = None, created_by: str | None = None) -> str:
     now = when or datetime.now(timezone.utc)
@@ -115,7 +133,7 @@ def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, c
         _element("model_resource_label", MODEL_ROLE),
         _element("model_card_resource_label", MODEL_CARD_ROLE if card else None),
         _element("provenance_resource_label", PROVENANCE_ROLE),
-        _element("default_checkpoint", card.get("default_checkpoint") or (weights[0] if len(weights) == 1 else None)),
+        _element("default_checkpoint", default_checkpoint(card.get("default_checkpoint"), weights)),
         _element("task_type", card.get("task_type")),
         _element("model_framework", framework),
     ] if x)

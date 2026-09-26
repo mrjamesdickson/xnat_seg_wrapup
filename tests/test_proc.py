@@ -752,3 +752,14 @@ def test_nested_model_weights_keep_their_view_relative_names(cs, tmp_path, monke
     model_xml = next(c["body"].decode() for c in handler.calls if c["method"] == "PUT" and "/experiments/model_" in c["path"])
     assert "<analysis:default_checkpoint>fold-0/best.pt</analysis:default_checkpoint>" in model_xml
 
+
+def test_default_checkpoint_must_be_an_uploaded_weight():
+    """A stale card value would send consumers to a file the MODEL resource does not hold (Codex P2, PR #21)."""
+    from segwrapup.model import default_checkpoint
+    assert default_checkpoint("best.pt", ["best.pt"]) == "best.pt"
+    assert default_checkpoint("fold-0/best.pt", ["fold-0/best.pt", "fold-1/best.pt"]) == "fold-0/best.pt"
+    assert default_checkpoint("best.pt", ["fold-0/best.pt"]) == "fold-0/best.pt", "by basename when that is unambiguous"
+    assert default_checkpoint("best.ckpt", ["best.pt"]) == "best.pt", "the only weight wins over a stale name"
+    assert default_checkpoint("best.ckpt", ["fold-0/best.pt", "fold-1/best.pt"]) is None, "ambiguous: registered without one"
+    assert default_checkpoint(None, ["a.pt", "b.pt"]) is None and default_checkpoint("", ["only.pt"]) == "only.pt"
+
