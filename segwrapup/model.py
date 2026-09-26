@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import tempfile
 import urllib.parse
@@ -215,8 +216,10 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     root = output_dir / derived_root if derived_root else output_dir
     card = read_model_card(root, (views or {}).get(MODEL_ROLE, []))
     label = model_label(dataset_facts.get("label") or context.dataset)
-    weights = [Path(n).name for n in names]
-    files: dict[str, list[RecordFile]] = {MODEL_ROLE: [RecordFile(root / n, Path(n).name) for n in names]}
+    # view-relative names, not basenames: fold-0/best.pt and fold-1/best.pt are two files, and
+    # default_checkpoint must name a path that exists on the MODEL resource (Codex P1, PR #21)
+    weights = [n.replace(os.sep, "/") for n in names]
+    files: dict[str, list[RecordFile]] = {MODEL_ROLE: [RecordFile(root / n, w) for n, w in zip(names, weights)]}
     if card:
         card_path = next((root / n for n in (views or {}).get(MODEL_ROLE, []) if n.endswith(MODEL_CARD_FILENAME)), root / MODEL_CARD_FILENAME)
         files[MODEL_CARD_ROLE] = [RecordFile(card_path, MODEL_CARD_FILENAME)]

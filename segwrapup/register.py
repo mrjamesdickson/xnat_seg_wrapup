@@ -204,7 +204,8 @@ def fetch_dataset_facts(context: XnatContext, timeout_seconds: float = 60.0) -> 
             payload = json.loads(response.read().decode())
         item = payload["items"][0]
         fields = item["data_fields"]
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError) as error:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError) as error:
+        # HTTPException: a truncated body (IncompleteRead) is not an OSError (Codex P2, PR #21)
         logger.warning("could not read dataset %s (%s); the record names the id and no member count", context.dataset, error)
         return {}
     facts = {"label": str(fields.get("label") or "").strip()}

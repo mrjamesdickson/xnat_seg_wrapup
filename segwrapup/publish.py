@@ -575,7 +575,9 @@ def _request(context: XnatContext, method: str, url: str, timeout: float) -> int
 def _relabel(xml: str, label: str) -> str:
     """The record document carries its label as an attribute; a retried create must match the URL.
     Every record root is relabelled: a subject or group record retried under the old label would collide again."""
-    return re.sub(r'(<analysis:(?:Session|Subject|Group)Analysis[^>]*?\slabel=")[^"]*(")',
+    # any record root (SessionAnalysis, SubjectAnalysis, GroupAnalysis, TrainedModel): the first
+    # element carrying a label attribute (Codex P2, PR #21: a model retry kept the occupied label)
+    return re.sub(r'(<analysis:[A-Za-z]+[^>]*?\slabel=")[^"]*(")',
                   lambda m: m.group(1) + escape(label) + m.group(2), xml, count=1)
 
 

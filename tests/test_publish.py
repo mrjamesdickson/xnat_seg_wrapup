@@ -1118,3 +1118,13 @@ def test_contract_produces_model_is_parsed_from_env_and_json_and_anything_else_i
     with pytest.raises(ValueError, match="produces"):
         publish.RecordContract.from_env({"XNW_CONTRACT": json.dumps({"card_id": "x", "produces": "weights"})})
 
+
+def test_relabel_reaches_a_trained_model_root_too():
+    """A 409 retry rewrites the label in the document as well as the URL; before PR #21 round 1
+    only *Analysis roots matched, so a TrainedModel retry kept the occupied label in its body."""
+    from segwrapup.publish import _relabel
+    xml = '<analysis:TrainedModel xmlns:analysis="x" project="P" label="model_a_1"><analysis:model_status>DRAFT</analysis:model_status></analysis:TrainedModel>'
+    out = _relabel(xml, "model_a_1_x9")
+    assert 'label="model_a_1_x9"' in out and 'label="model_a_1"' not in out
+    assert _relabel('<analysis:GroupAnalysis label="g"><analysis:notes>label="keep"</analysis:notes></analysis:GroupAnalysis>', "g2").startswith('<analysis:GroupAnalysis label="g2">')
+

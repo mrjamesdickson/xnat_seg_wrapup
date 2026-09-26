@@ -729,3 +729,26 @@ def test_a_session_scoped_run_never_registers_a_model(cs, tmp_path, monkeypatch)
     assert manifest["trained_model"]["error"].startswith("produces=model is only defined at dataset scope")
     assert not [c for c in handler.calls if "/experiments/model_" in c["path"]]
 
+
+def test_nested_model_weights_keep_their_view_relative_names(cs, tmp_path, monkeypatch):
+    """fold-0/best.pt and fold-1/best.pt are two checkpoints; uploading both as MODEL/files/best.pt
+    would let the second overwrite the first, and default_checkpoint would name a path that is not
+    on the resource (Codex P1, PR #21)."""
+    host, handler = cs
+    inp = _training_output(tmp_path)
+    (inp / "segmentation_spleen.pt").unlink()
+    for fold in ("fold-0", "fold-1"):
+        (inp / fold).mkdir()
+        (inp / fold / "best.pt").write_bytes(b"w" + fold.encode())
+    card = json.loads((inp / "model-card.json").read_text()); card["default_checkpoint"] = "fold-0/best.pt"
+    (inp / "model-card.json").write_text(json.dumps(card))
+    _training_env(monkeypatch, host, {"XNW_RESOURCE_MODEL": "**/*.pt,model-card.json"})
+    assert proc.main(["--input", str(inp), "--output", str(tmp_path / "out")]) == 0
+    uploads = sorted(c["path"].split("?")[0] for c in handler.calls if c["method"] == "PUT" and "/experiments/XNAT_E88888/resources/MODEL/" in c["path"])
+    assert uploads == ["/data/experiments/XNAT_E88888/resources/MODEL/files/fold-0/best.pt",
+                       "/data/experiments/XNAT_E88888/resources/MODEL/files/fold-1/best.pt"]
+    manifest = json.loads((tmp_path / "out" / "wrapup.json").read_text())
+    assert manifest["trained_model"]["weights"] == ["fold-0/best.pt", "fold-1/best.pt"]
+    model_xml = next(c["body"].decode() for c in handler.calls if c["method"] == "PUT" and "/experiments/model_" in c["path"])
+    assert "<analysis:default_checkpoint>fold-0/best.pt</analysis:default_checkpoint>" in model_xml
+
