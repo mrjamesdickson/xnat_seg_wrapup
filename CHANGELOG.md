@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.1 (2026-09-26)
+
+Training cards register their model (the link pair of
+container-workshop `DATASET-SCOPE-CARDS-DESIGN.md` §7.2/§8, without the retired group-analysis-wrapup).
+
+- **`produces: model`.** A results block may say `"produces": "model"` (`XNW_PRODUCES=model`;
+  any other value is a contract error). At dataset scope, after the run record, proc-wrapup
+  registers the files of the card's `MODEL` view as an `analysis:trainedModelData` project
+  asset in `DRAFT` (weights on `MODEL`, the tool's `model-card.json` on `MODEL_CARD`,
+  `provenance.json` on `PROVENANCE`; `source_training_id`, `source_dataset_id`, and the
+  card's framework/name/checkpoint/labels/best dice when a model card is present), then writes
+  `produced_model_id` on the run record. Nothing is registered from a failed run, outside
+  dataset scope, or without weights; the run record is never rolled back for the model's sake;
+  every outcome is in `wrapup.json` under `trained_model`. `segwrapup/model.py`;
+  `RecordContract.produces`; `publish_record(..., xsi_type=)`.
+- Image tags 0.7.1 (seg-wrapup, proc-wrapup, record-fetch).
+
 ## 0.7.0 (2026-09-24)
 
 Dataset scope: group-level results save like the session and subject ones (James, 2026-09-24:

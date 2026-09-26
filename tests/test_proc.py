@@ -5,6 +5,7 @@ test_publish.py) and answers the container list and log endpoints.
 """
 import html
 import json
+import os
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -116,7 +117,8 @@ class _CS(BaseHTTPRequestHandler):
         self._record(self.rfile.read(length))
         create = (("/assessors/" in self.path and "/out/" not in self.path) or ("/subjects/" in self.path and "/resources/" not in self.path)
                   or (self.path.startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in self.path))
-        self._send(201 if create else 200, b"XNAT_E77777" if create else b"")
+        model_create = create and "/experiments/model_" in self.path
+        self._send(201 if create else 200, b"XNAT_E88888" if model_create else b"XNAT_E77777" if create else b"")
 
     def log_message(self, *args):
         pass
@@ -600,3 +602,109 @@ def test_a_dataset_scoped_run_publishes_a_group_record_citing_the_dataset(cs, tm
     assert manifest["scope"] == "dataset" and manifest["dataset"] == {"id": "XNAT_D0001", "label": "flanker-2sub", "included_count": 2}
     assert manifest["analysis_record"]["xsi_type"] == "analysis:groupAnalysisData" and manifest["card"]["run_scope"] == "dataset"
     assert "flanker-2sub (XNAT_D0001), 2 included" in (out / "report.html").read_text()
+
+
+# ── training cards: produces=model (0.7.1) ────────────────────────────────────
+
+def _training_output(tmp_path, with_card=True):
+    inp = tmp_path / "in"
+    inp.mkdir(parents=True)
+    (inp / "segmentation_spleen.pt").write_bytes(b"WEIGHTS")
+    (inp / "train_stats.json").write_text(json.dumps({"best_metric": 0.91}))
+    if with_card:
+        (inp / "model-card.json").write_text(json.dumps({"model_framework": "monailabel", "model": "segmentation_spleen",
+                                                        "default_checkpoint": "segmentation_spleen.pt", "task_type": "segmentation",
+                                                        "labels": {"spleen": 1}, "train_cases": 3, "train_stats": {"best_metric": 0.91}}))
+    (inp / "status.json").write_text(json.dumps({"exit_code": 0, "workflow_id": "4990"}))
+    return inp
+
+
+def _training_env(monkeypatch, host, extra=None):
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "monailabel-train", "PROC_PIPELINE_VERSION": "0.1.0", "PROC_DATASET_ID": "XNAT_D0001",
+                                "XNW_PRODUCES": "model", "XNW_RESOURCE_MODEL": "*.pt,model-card.json", "XNW_RESOURCE_METRICS": "train_stats.json",
+                                **(extra or {})})
+    monkeypatch.delenv("PROC_SESSION_ID"); monkeypatch.delenv("PROC_SCAN_ID")
+
+
+def test_a_training_card_registers_a_draft_model_and_links_the_run(cs, tmp_path, monkeypatch):
+    """produces=model: after the group record, the MODEL view's weights become an
+    analysis:trainedModelData project asset in DRAFT (weights on MODEL, the tool's model card on
+    MODEL_CARD, provenance on PROVENANCE), source_training_id/source_dataset_id point back, and
+    the run record gets produced_model_id, so the link pair of DATASET-SCOPE-CARDS-DESIGN §7.2
+    exists without the retired group-analysis-wrapup."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert [c["path"].split("/")[5].split("_")[0] for c in creates] == ["monailabel-train", "model"], "the run record first, then the model"
+    model_xml = creates[1]["body"].decode()
+    assert model_xml.startswith('<?xml version="1.0" encoding="UTF-8"?>\n<analysis:TrainedModel ') and 'project="PROJ_1" label="model_flanker-2sub_' in model_xml
+    for fragment in ("<analysis:model_status>DRAFT</analysis:model_status>", "<analysis:source_training_id>XNAT_E77777</analysis:source_training_id>",
+                     "<analysis:source_dataset_id>XNAT_D0001</analysis:source_dataset_id>", "<analysis:model_framework>monailabel</analysis:model_framework>",
+                     "<analysis:default_checkpoint>segmentation_spleen.pt</analysis:default_checkpoint>", "<analysis:model_name>segmentation_spleen</analysis:model_name>",
+                     "<analysis:label_names>spleen:1</analysis:label_names>", "<analysis:num_classes>2</analysis:num_classes>",
+                     "<analysis:best_validation_dice>0.91</analysis:best_validation_dice>", "<analysis:model_resource_label>MODEL</analysis:model_resource_label>",
+                     "<analysis:created_by>alias</analysis:created_by>"):
+        assert fragment in model_xml, fragment
+    uploads = [c["path"].split("?")[0] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/experiments/XNAT_E88888/resources/")]
+    assert uploads == ["/data/experiments/XNAT_E88888/resources/MODEL/files/segmentation_spleen.pt",
+                       "/data/experiments/XNAT_E88888/resources/MODEL_CARD/files/model-card.json",
+                       "/data/experiments/XNAT_E88888/resources/PROVENANCE/files/provenance.json"]
+    links = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/experiments/XNAT_E77777?")]
+    assert len(links) == 1 and "produced_model_id=XNAT_E88888" in links[0]["path"] and "xsiType=analysis%3AgroupAnalysisData" in links[0]["path"]
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["produces"] == "model" and sorted(manifest["analysis_record"]["views"]["MODEL"]) == ["model-card.json", "segmentation_spleen.pt"]
+    assert manifest["trained_model"] == {"xsi_type": "analysis:trainedModelData", "id": "XNAT_E88888", "label": manifest["trained_model"]["label"],
+                                         "status": "DRAFT", "weights": ["segmentation_spleen.pt"], "model_card": True,
+                                         "source_training_id": "XNAT_E77777", "linked": True}
+    # the weights are still on the run record's DERIVED, untouched: the model asset is a second home, not a move
+    assert "/data/experiments/XNAT_E77777/resources/DERIVED/files/segmentation_spleen.pt" in [c["path"].split("?")[0] for c in handler.calls]
+
+
+def test_produces_model_without_weights_keeps_the_run_record_and_says_so(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _training_output(tmp_path, with_card=False), tmp_path / "out"
+    os.remove(inp / "segmentation_spleen.pt")
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c["path"] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert len(creates) == 1 and "/experiments/model_" not in creates[0], "no model asset without weights; the run record stands"
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777" and manifest["trained_model"] == {"error": "no MODEL view files on DERIVED"}
+    assert not [c for c in handler.calls if "produced_model_id" in c["path"]]
+
+
+def test_produces_model_on_a_failed_run_registers_nothing(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "status.json").write_text(json.dumps({"exit_code": 1, "workflow_id": "4990"}))
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["run_status"] == "FAILED" and manifest["trained_model"] == {"skipped": "run FAILED"}
+    assert not [c for c in handler.calls if "/experiments/model_" in c["path"] or "produced_model_id" in c["path"]]
+
+
+def test_a_model_registration_that_fails_leaves_the_run_record_and_records_the_error(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    _training_env(monkeypatch, host)
+    from segwrapup import model as model_module
+    monkeypatch.setattr(model_module, "publish_record", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("PUT failed: HTTP 500 boom")))
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777"
+    assert manifest["trained_model"]["error"] == "PUT failed: HTTP 500 boom" and manifest["trained_model"]["label"].startswith("model_flanker-2sub_")
+    assert not [c for c in handler.calls if c["method"] == "DELETE" and "/data/experiments/" in c["path"]], "the run record is never rolled back for the model's sake"
+
+
+def test_a_session_scoped_run_never_registers_a_model(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    set_env(monkeypatch, host, {"XNW_PRODUCES": "model", "XNW_RESOURCE_MODEL": "*.pt"})
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["trained_model"]["error"].startswith("produces=model is only defined at dataset scope")
+    assert not [c for c in handler.calls if "/experiments/model_" in c["path"]]
+

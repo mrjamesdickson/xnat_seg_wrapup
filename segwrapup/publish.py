@@ -219,6 +219,9 @@ class RecordContract:
     container_digest: str = ""
     output_resource_label: str = ""
     supersedes_id: str = ""
+    #: ``model`` for a training card (0.7.1): after the run record, the weights named by the
+    #: card's ``MODEL`` view are registered as an ``analysis:trainedModelData`` (segwrapup.model).
+    produces: str = ""
     resources: dict[str, list[str]] = field(default_factory=lambda: dict(DEFAULT_RESOURCES))
     #: ``XNW_RESOURCE_<ROLE>`` overrides for a fixed role the card sent and the wrapup ignored
     #: (``"REPORT=report.html,raw/sub-*.html"``), so ``wrapup.json`` says what was dropped.
@@ -232,6 +235,7 @@ class RecordContract:
         "XNW_CONTRACT_VERSION": "contract_version", "XNW_ANALYSIS_TYPE": "analysis_type",
         "XNW_CONTAINER_IMAGE": "container_image", "XNW_CONTAINER_DIGEST": "container_digest",
         "XNW_OUTPUT_RESOURCE_LABEL": "output_resource_label", "XNW_SUPERSEDES_ID": "supersedes_id",
+        "XNW_PRODUCES": "produces",
     }
 
     @classmethod
@@ -256,6 +260,7 @@ class RecordContract:
                 if key.startswith("XNW_RESOURCE_") and value.strip():   # XNW_RESOURCE_METRICS="a.json,b.csv"
                     _declare(resources, ignored, _valid_role(key[len("XNW_RESOURCE_"):]),
                              [p.strip() for p in value.split(",") if p.strip()])
+            _check_produces(discrete.get("produces", ""))
             return cls(resources=resources, ignored_overrides=tuple(ignored), **{k: v for k, v in discrete.items()})
         try:
             data = json.loads(raw)
@@ -271,8 +276,10 @@ class RecordContract:
                 if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
                     raise ValueError(f"XNW_CONTRACT resources.{role} must be a list of file patterns")
                 _declare(resources, ignored, _valid_role(str(role)), list(patterns))
+        _check_produces(str(data.get("produces", "") or ""))
         return cls(
             ignored_overrides=tuple(ignored),
+            produces=str(data.get("produces", "") or ""),
             card_id=str(data.get("card_id", "")),
             card_revision=str(data.get("card_revision", "")),
             contract_version=str(data.get("contract_version", "0.1")),
@@ -283,6 +290,11 @@ class RecordContract:
             supersedes_id=str(data.get("supersedes_id", "")),
             resources=resources,
         )
+
+
+def _check_produces(value: str) -> None:
+    if value not in ("", "model"):
+        raise ValueError(f"produces={value!r} is not something a card can produce (only 'model')")
 
 
 def _reserved(path: Path, root: Path) -> bool:
@@ -568,7 +580,7 @@ def _relabel(xml: str, label: str) -> str:
 
 
 def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, list],
-                   timeout_seconds: float = 300.0, output_dir: Path | None = None) -> dict:
+                   timeout_seconds: float = 300.0, output_dir: Path | None = None, xsi_type: str | None = None) -> dict:
     """Create the record, then upload each role's files to its ``out`` resource. Raises RuntimeError.
 
     Create-only, enforced twice: a label that already exists on the session is refused before
@@ -580,7 +592,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     uploaded and the empty files skipped, for a wrapup that reduces its output afterwards.
     """
     files = _record_files(files, output_dir)
-    xsi_type = xsi_type_for(context)
+    xsi_type = xsi_type or xsi_type_for(context)   # a caller may publish another project asset (a trained model) at dataset scope
     label_url, _ = record_urls(context, label)
     probe = _request(context, "GET", f"{label_url}?format=json", timeout_seconds)
     if probe == 200:
@@ -704,6 +716,10 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
                                                           | {upload_name(f.path, output_dir) for f in empties})
         outcome["views"] = views
         outcome["ignored_overrides"] = list(contract.ignored_overrides)
+        outcome["produces"] = contract.produces
+        outcome["contract"] = {"card_id": contract.card_id, "card_revision": contract.card_revision,
+                               "container_image": contract.container_image, "container_digest": contract.container_digest,
+                               "analysis_type": contract.analysis_type}
         return outcome
     except (RuntimeError, ValueError, NotImplementedError, OSError) as error:
         logger.error("analysis record %s not published; files and ROI collection still delivered: %s: %s",

@@ -99,7 +99,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.7.0"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.7.1"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -212,8 +212,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.7.0 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.7.0
+docker build -t xnatworks/seg-wrapup:0.7.1 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.7.1
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
@@ -369,3 +369,26 @@ No `scans`, no subject, no session. record-fetch refuses prerequisites at this s
 dataset's tree is the run's input, assumed complete, whether the group-level plugin
 materialised it or someone uploaded it; neither the run nor the record needs that plugin.
 Details and the reasons: `docs/DATASET-SCOPE.md`.
+
+### Training cards: `produces: model` (0.7.1)
+
+A dataset-scoped card whose results block says `"produces": "model"` (`XNW_PRODUCES=model` on
+the command) trains something. Its weights sit in `DERIVED` like any other output, named by
+the card's `MODEL` view (`XNW_RESOURCE_MODEL="*.pt,model-card.json"`). After the run record is
+published, proc-wrapup registers those files as an `analysis:trainedModelData` project asset
+in `DRAFT` (`model_<dataset label>_<stamp>`): the weights on its `MODEL` resource, the tool's
+`model-card.json` on `MODEL_CARD` when it wrote one, a small `provenance.json` on
+`PROVENANCE`; `source_training_id` names the run, `source_dataset_id` the frozen dataset,
+`model_framework`/`model_name`/`default_checkpoint`/`task_type`/`label_names`/`num_classes`/
+`best_validation_dice` come from the model card when present. The run record then gets
+`produced_model_id` (a bodiless `PUT /data/experiments/<run>?analysis:GroupAnalysis/produced_model_id=<model>`),
+so the two point at each other. `wrapup.json` carries the outcome under `trained_model`.
+
+What it does not do: register anything from a run that did not succeed, from a session- or
+subject-scoped run, or when the `MODEL` view names no file (each is recorded under
+`trained_model` and the run record stands regardless); decide whether the model is any good
+(promotion out of `DRAFT` is a person's act in the grouplevel plugin's models page); or roll
+back the run record when the model registration fails. The copy of `wrapup.json` already on
+the run record predates the registration; the local manifest and the pointer carry it.
+`segwrapup/model.py`; the design that asked for it is
+`xnat_monailabel_plugin/docs/MONAI_TRAINING_FROM_DATASET_DESIGN.md`.

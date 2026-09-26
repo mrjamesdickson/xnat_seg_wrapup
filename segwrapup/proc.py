@@ -29,6 +29,7 @@ import urllib.parse
 from pathlib import Path
 
 from . import __version__
+from .model import register_trained_model
 from .card import card_for_run, write_card_copy
 from .execution import (RAW_DIRNAME, STATUS_FILENAME, chain_from_workflow, copy_raw_output, fetch_parent_logs,
                         own_workflow_id, read_status, run_status_from)
@@ -231,6 +232,13 @@ def run(args: argparse.Namespace) -> int:
         # reduction below, not for the manifest, which already lists the record's names.
         output_paths = (outcome or {}).pop("output_paths", None) or {}
         manifest["analysis_record"] = outcome
+        if (outcome or {}).get("id") and (outcome or {}).get("produces") == "model":
+            # A training card (0.7.1): the weights in DERIVED become a DRAFT trainedModelData
+            # linked both ways to the run. The copy of wrapup.json already on the run record
+            # predates this; the local manifest (and the pointer) carry it.
+            manifest["trained_model"] = register_trained_model(
+                context, output_dir, RAW_DIRNAME, outcome, run_status, outcome.get("views") or {},
+                {**(outcome.get("contract") or {}), "pipeline": args.pipeline}, dataset_facts)
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
         if args.pointer_only and (manifest.get("analysis_record") or {}).get("id"):
             # The record owns the bytes; the output handler gets a one-file pointer resource.

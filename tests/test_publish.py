@@ -1103,3 +1103,18 @@ def test_dataset_provenance_reads_the_asset_and_publish_if_possible_stamps_it(xn
         assert dataset_provenance(_dataset_context(host)) == {"scope": "dataset", "dataset": "XNAT_D1", "dataset_label": "",
                                                              "project": "PROJ_1", "included_count": None}
     assert "could not read dataset XNAT_D1" in caplog.text
+
+
+def test_contract_produces_model_is_parsed_from_env_and_json_and_anything_else_is_refused(monkeypatch):
+    for key in ("XNW_CONTRACT", "XNW_PRODUCES"):
+        monkeypatch.delenv(key, raising=False)
+    from segwrapup import publish
+    env = {"XNW_CARD_ID": "monailabel-train", "XNW_PRODUCES": "model"}
+    assert publish.RecordContract.from_env(env).produces == "model"
+    assert publish.RecordContract.from_env({"XNW_CARD_ID": "x"}).produces == ""
+    assert publish.RecordContract.from_env({"XNW_CONTRACT": json.dumps({"card_id": "x", "produces": "model"})}).produces == "model"
+    with pytest.raises(ValueError, match="produces"):
+        publish.RecordContract.from_env({"XNW_CARD_ID": "x", "XNW_PRODUCES": "dataset"})
+    with pytest.raises(ValueError, match="produces"):
+        publish.RecordContract.from_env({"XNW_CONTRACT": json.dumps({"card_id": "x", "produces": "weights"})})
+
