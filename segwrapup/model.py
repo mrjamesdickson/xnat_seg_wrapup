@@ -470,12 +470,22 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     except RuntimeError as error:
         logger.error("no model registered: the run's accession id is unknown (%s)", error)
         return {"error": f"the run's accession id could not be resolved: {error}"}
-    names = [n for n in (views or {}).get(MODEL_ROLE, []) if not is_model_card(n)]
-    if not names:
+    root = output_dir / derived_root if derived_root else output_dir
+    listed = [n for n in (views or {}).get(MODEL_ROLE, []) if not is_model_card(n)]
+    if not listed:
         logger.error("produces=model but the %s view names no weights on DERIVED; declare results.resources.%s in the card",
                      MODEL_ROLE, MODEL_ROLE)
         return {"error": f"no {MODEL_ROLE} view files on DERIVED"}
-    root = output_dir / derived_root if derived_root else output_dir
+    # publish_record skips zero-byte files (XNAT refuses them), so an empty checkpoint is not a weight:
+    # advertised in `weights` or as default_checkpoint it would name a file the MODEL resource does not
+    # hold (Codex P2, PR #21 round 26; the card had the same rule since round 12)
+    empty = [n for n in listed if not (root / n).is_file() or (root / n).stat().st_size == 0]
+    for n in empty:
+        logger.warning("%s is empty or missing; not a checkpoint, left off the model", n)
+    names = [n for n in listed if n not in empty]
+    if not names:
+        logger.error("produces=model but every %s view file is empty (%s); no model is registered", MODEL_ROLE, empty)
+        return {"error": f"no usable checkpoint in the {MODEL_ROLE} view: {empty} are empty"}
     card = read_model_card(root, (views or {}).get(MODEL_ROLE, []))
     card_path = model_card_path(root, (views or {}).get(MODEL_ROLE, []))
     label = model_label(dataset_facts.get("label") or context.dataset, run_id=run_id)

@@ -963,6 +963,46 @@ def test_a_zero_byte_model_card_is_not_advertised(cs, tmp_path, monkeypatch):
     assert manifest["trained_model"]["model_card"] is False and manifest["trained_model"]["id"] == "XNAT_E88888"
 
 
+def test_a_zero_byte_checkpoint_is_not_a_weight(cs, tmp_path, monkeypatch):
+    """publish_record skips zero-byte files; a model whose `weights` or default_checkpoint named one
+    would point consumers at a file the MODEL resource does not hold (Codex P2, PR #21 round 26).
+    Empty checkpoints are left off; with none left, no model is registered and the run still is."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "interrupted.pt").write_bytes(b"")
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    model_xml = creates[1]["body"].decode()
+    assert "<analysis:default_checkpoint>segmentation_spleen.pt</analysis:default_checkpoint>" in model_xml
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["trained_model"]["weights"] == ["segmentation_spleen.pt"], "the empty file is not a weight"
+    uploads = sorted(c["path"].split("?")[0].rsplit("/", 1)[-1] for c in handler.calls if c["method"] == "PUT" and "/resources/MODEL/" in c["path"])
+    assert "interrupted.pt" not in uploads and "segmentation_spleen.pt" in uploads
+    # the declared default itself empty and another weight present: the empty file is not a candidate;
+    # the bare-basename rule then hands the only usable weight over, as for any stale basename
+    handler.calls.clear(); out2 = tmp_path / "out2"
+    (inp / "segmentation_spleen.pt").write_bytes(b""); (inp / "interrupted.pt").write_bytes(b"OTHER")
+    assert proc.main(["--input", str(inp), "--output", str(out2)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert "<analysis:default_checkpoint>interrupted.pt</analysis:default_checkpoint>" in creates[1]["body"].decode(), "never the empty file"
+    assert json.loads((out2 / "wrapup.json").read_text())["trained_model"]["weights"] == ["interrupted.pt"]
+    # every checkpoint empty: the run record is published, no model asset, the manifest says why
+    handler.calls.clear(); out3 = tmp_path / "out3"
+    (inp / "interrupted.pt").write_bytes(b"")
+    assert proc.main(["--input", str(inp), "--output", str(out3)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert len(creates) == 1, "the run record only; no model asset"
+    error = json.loads((out3 / "wrapup.json").read_text())["trained_model"]["error"]
+    assert "MODEL" in error and ("no usable checkpoint" in error or "no MODEL view files" in error), error
+    from segwrapup.model import register_trained_model
+    from segwrapup.register import XnatContext
+    context = XnatContext(host=host, user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    outcome = register_trained_model(context, inp, None, {"id": "XNAT_E77777", "id_is_accession": True}, "SUCCEEDED",
+                                     {"MODEL": ["segmentation_spleen.pt", "interrupted.pt"]}, {}, {}, 5.0)
+    assert "no usable checkpoint" in outcome["error"] and "interrupted.pt" in outcome["error"], outcome
+
+
 def test_run_data_fields_of_the_wrong_shape_are_a_link_error_not_an_abort(cs, tmp_path, monkeypatch):
     """A null or list data_fields on the run record must surface as link_error in the outcome
     (RuntimeError, which register_trained_model handles), not an AttributeError after run and model
