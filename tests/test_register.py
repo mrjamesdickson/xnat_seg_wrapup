@@ -317,6 +317,8 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
         def do_GET(self):
             seen.append(self.path)
             asset = self.path.split("/experiments/")[-1].split("?")[0]
+            if asset == "XNAT_D11":                                  # valid JSON nested past the parser's recursion limit (round 27)
+                self.send_response(200); self.end_headers(); self.wfile.write(b'{"items": [' + b"[" * 100000 + b"]" * 100000 + b"]}"); return
             if asset == "XNAT_D4":                                   # a body cut short: http.client.IncompleteRead
                 self.send_response(200); self.send_header("Content-Length", "4096"); self.end_headers()
                 self.wfile.write(b'{"items": [{"data_fi'); self.wfile.flush(); self.connection.close(); return
@@ -347,6 +349,7 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
             assert fetch_dataset_facts(ctx("XNAT_D3")) == {"label": "odd"}
             assert fetch_dataset_label(ctx("XNAT_D9")) == "XNAT_D9"
             assert fetch_dataset_facts(ctx("XNAT_D4")) == {}, "a truncated answer is best-effort too (Codex P2, PR #21)"
+            assert fetch_dataset_facts(ctx("XNAT_D11")) == {}, "nested past the recursion limit: best-effort, not an abort (round 27)"
             assert fetch_dataset_facts(ctx("XNAT_D5")) == {}, "data_fields null: best-effort, not AttributeError (Codex P2, round 10)"
             assert fetch_dataset_facts(ctx("XNAT_D6")) == {}
             assert fetch_dataset_facts(ctx("XNAT_D7")) == {"label": "listy", "included_count": 3}, "a meta of the wrong shape costs only the type check (round 11)"

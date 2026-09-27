@@ -226,8 +226,10 @@ def fetch_dataset_facts(context: XnatContext, timeout_seconds: float = 60.0) -> 
             logger.warning("dataset %s answered a meta of type %s, not an object; its type is not checked", context.dataset, type(meta).__name__)
             meta = {}
         xsi = str((meta or {}).get("xsi:type") or "")
-    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError) as error:
-        # HTTPException: a truncated body (IncompleteRead) is not an OSError (Codex P2, PR #21)
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError,
+            RecursionError) as error:
+        # HTTPException: a truncated body (IncompleteRead) is not an OSError (Codex P2, PR #21);
+        # RecursionError: valid JSON nested past the parser's limit, before the record is published (round 27)
         logger.warning("could not read dataset %s (%s); the record names the id and no member count", context.dataset, error)
         return {}
     facts = {"label": str(fields.get("label") or "").strip()}
