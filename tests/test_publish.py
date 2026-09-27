@@ -923,6 +923,18 @@ def test_results_json_stays_under_the_schema_cap_on_a_big_tree(tmp_path, caplog)
     assert "non_finite_values_replaced" in caplog.text
     assert json.loads(bounded_results_json({"total_volume_ml": 1.5})) == {"total_volume_ml": 1.5}, \
         "finite numbers are untouched and nothing is added"
+    # a structure too deep to walk cannot be checked for non-finite numbers, and carrying on would hand
+    # allow_nan=False a NaN it refuses with a ValueError — out of a link step whose contract is that it
+    # never raises, aborting the wrapup after the model was registered (Codex P2, PR #21 round 35)
+    deep = {"leaf": float("nan")}
+    for _ in range(3000):
+        deep = {"n": deep}
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        reduced = json.loads(bounded_results_json({"results_raw": deep, "views": {"METRICS": ["a.json"]},
+                                                   "trained_model": {"id": "XNAT_E4"}}))
+    assert reduced == {"trained_model": {"id": "XNAT_E4"}, "truncated": ["results_raw", "views"]}
+    assert "nested too deep" in caplog.text
 
 
 def test_create_409_at_subject_scope_relabels_the_subject_document(xnat, tmp_path):

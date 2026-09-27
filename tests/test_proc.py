@@ -902,6 +902,29 @@ def test_engine_metadata_is_bounded_to_the_schema_cap(caplog):
     assert json.loads(text) == {**link, "truncated": ["app", "train_stats"]}
 
 
+def test_an_empty_card_candidate_does_not_hide_a_usable_one(tmp_path, caplog):
+    """A broad MODEL view can name an empty `fold-0/model-card.json` before the usable card at the
+    output root. Taking the first candidate and checking its size alone registered the model with no
+    metadata and no MODEL_CARD resource at all (Codex P2, PR #21 round 35)."""
+    import logging
+    from segwrapup.model import model_card_path, read_model_card
+    root = tmp_path / "derived"; (root / "fold-0").mkdir(parents=True)
+    (root / "fold-0" / "model-card.json").write_bytes(b"")
+    (root / "model-card.json").write_text(json.dumps({"model": "spleen", "labels": {"spleen": 1}}))
+    names = ["fold-0/model-card.json", "fold-0/best.pt", "model-card.json"]
+    with caplog.at_level(logging.WARNING):
+        assert model_card_path(root, names) == root / "model-card.json"
+    assert read_model_card(root, names)["model"] == "spleen", "and its metadata is read"
+    assert "fold-0/model-card.json is empty; using model-card.json instead" in caplog.text
+    # every candidate empty: no card, as before, and the message names them
+    (root / "model-card.json").write_bytes(b"")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert model_card_path(root, names) is None and read_model_card(root, names) == {}
+    assert "is empty; the model registers without a card" in caplog.text
+    assert "fold-0/model-card.json" in caplog.text
+
+
 def test_an_empty_model_card_is_still_uploaded_and_named(cs, tmp_path, monkeypatch):
     """`{}` is a valid card with no metadata: the file the MODEL view selected goes on MODEL_CARD and
     the record names the resource; only the metadata-derived fields are absent (Codex P2, PR #21 round 11)."""
@@ -1113,6 +1136,30 @@ def test_the_run_link_is_keyed_on_the_accession_resolved_from_the_lookup(monkeyp
     with pytest.raises(RuntimeError, match="accession id could not be resolved"):
         model.note_model_on_run(context, "monailabel-train_ds_20260926T221538Z_record", "XNAT_E88888", "model_x")
     assert "put" not in seen
+
+
+def test_a_link_step_that_cannot_build_its_document_is_an_outcome_not_an_abort(tmp_path, monkeypatch):
+    """`register_trained_model` never raises by contract: the run record is published and the model may
+    be registered, so a failure in the forward link belongs in the outcome and in wrapup.json. The link
+    guard caught only RuntimeError and UnicodeEncodeError, so a ValueError out of the serialiser aborted
+    proc-wrapup after the model existed and before the manifest was written (Codex P2, PR #21 round 35)."""
+    from segwrapup import model
+    from segwrapup.register import XnatContext
+    context = XnatContext(host="http://x", user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    out = tmp_path / "out"; (out / "raw").mkdir(parents=True)
+    (out / "raw" / "segmentation_spleen.pt").write_bytes(b"W")
+    monkeypatch.setattr(model, "_username", lambda ctx, timeout: "jdickson")
+    monkeypatch.setattr(model, "publish_record", lambda *a, **kw: {"id": "XNAT_E88888", "label": "model_ds_x"})
+    for raised in (ValueError("Out of range float values are not JSON compliant"), RecursionError(), OSError("disk"),
+                   TypeError("not serialisable")):
+        def refuse(*a, **kw):
+            raise raised
+        monkeypatch.setattr(model, "note_model_on_run", refuse)
+        result = model.register_trained_model(context, out, "raw", {"id": "XNAT_E77777", "id_is_accession": True},
+                                              "SUCCEEDED", {"MODEL": ["segmentation_spleen.pt"]},
+                                              {"pipeline": "monailabel-train"}, {"label": "ds"})
+        assert result["id"] == "XNAT_E88888" and result["linked"] is False, result
+        assert type(raised).__name__ in result["link_error"] or str(raised) in result["link_error"], result
 
 
 def test_the_link_document_stays_under_the_cap_when_the_runs_results_cannot_be_parsed(monkeypatch):

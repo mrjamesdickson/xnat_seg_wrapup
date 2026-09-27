@@ -91,6 +91,15 @@ def is_model_card(name: str) -> bool:
     return Path(name).name == MODEL_CARD_FILENAME
 
 
+def _under(root: Path, path: Path) -> str:
+    """``path`` as it reads inside the output tree, so two candidates of the same basename can be told
+    apart in a log line (``fold-0/model-card.json`` from ``model-card.json``)."""
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return path.name
+
+
 def model_card_path(root: Path, names: list[str]) -> Path | None:
     """The tool's ``model-card.json`` when it is among the MODEL view files or at the DERIVED
     root, whatever it contains; None when there is no such file. Presence is tracked apart from
@@ -99,13 +108,25 @@ def model_card_path(root: Path, names: list[str]) -> Path | None:
     # the basename, exactly: backup-model-card.json in a broad MODEL view is a weight-side file, not
     # the card (Codex P2, PR #21 round 15)
     candidates = [root / n for n in names if is_model_card(n)] + [root / MODEL_CARD_FILENAME]
-    path = next((path for path in candidates if path.is_file()), None)
-    if path is not None and path.stat().st_size == 0:
-        # publish_record skips zero-byte files (XNAT refuses them), so advertising this one would send
-        # consumers to a MODEL_CARD resource with nothing on it (Codex P2, PR #21 round 12)
-        logger.warning("%s is empty; the model registers without a card", path.name)
-        return None
-    return path
+    empty = []
+    for path in candidates:
+        if not path.is_file():
+            continue
+        if path.stat().st_size == 0:
+            # publish_record skips zero-byte files (XNAT refuses them), so advertising this one would
+            # send consumers to a MODEL_CARD resource with nothing on it (Codex P2, PR #21 round 12).
+            # The search goes on: a broad MODEL view can name an empty fold-0/model-card.json before
+            # the usable card at the root, and taking the first candidate alone registered the model
+            # with no metadata and no card resource at all (round 35)
+            empty.append(path)
+            continue
+        if empty:
+            logger.warning("%s is empty; using %s instead", _under(root, empty[0]), _under(root, path))
+        return path
+    if empty:
+        logger.warning("%s is empty; the model registers without a card",
+                       ", ".join(_under(root, path) for path in empty))
+    return None
 
 
 def read_model_card(root: Path, names: list[str]) -> dict:
@@ -522,8 +543,12 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
         result["id"] = resolve_accession(context, outcome["id"], min(timeout_seconds, 60.0), is_accession=outcome.get("id_is_accession"))
         result["source_run_id"] = note_model_on_run(context, run_id, result["id"], outcome["label"], timeout_seconds=min(timeout_seconds, 60.0))
         result["linked"] = True
-    except (RuntimeError, UnicodeEncodeError) as error:
-        # The model still names the run in engine_metadata_json/provenance.json; only the forward link is missing.
+    except (RuntimeError, UnicodeEncodeError, ValueError, RecursionError, TypeError, OSError) as error:
+        # The model still names the run in engine_metadata_json/provenance.json; only the forward link is
+        # missing. The same set as the publish guard above, because this function's contract is that it
+        # never raises: a document that cannot be serialised (a deep results_json the bounding could not
+        # reduce) would otherwise abort proc-wrapup after the model was registered and before the
+        # manifest was written (Codex P2, PR #21 round 35).
         logger.error("model %s registered but run %s could not be noted in its results_json: %s", outcome["id"], run_id, error)
         result["link_error"] = str(error)
     logger.info("trained model %s registered as %s (DRAFT) from run %s%s", label, outcome["id"], run_id,

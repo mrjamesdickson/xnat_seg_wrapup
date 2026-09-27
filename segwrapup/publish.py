@@ -197,10 +197,21 @@ def bounded_results_json(summary: dict) -> str:
     try:
         summary, replaced = _finite_json(summary)
     except RecursionError:
-        # nested past this walk's limit; json.dumps below is at the same limit and raises, which the
-        # publish and link guards already report — the tokens cannot slip through silently
-        logger.warning("results_json is nested too deep to check for non-finite numbers")
-        replaced = 0
+        # Nested past this walk's limit, so the value cannot be checked at all. Carrying on would hand
+        # `json.dumps(allow_nan=False)` a NaN it refuses with a ValueError, out of the link step, whose
+        # contract is that it never raises: proc-wrapup would abort after registering the model and
+        # before writing its manifest (Codex P2, PR #21 round 35). Reduced instead to what must survive,
+        # with the rest named; the full summary is in PROVENANCE/wrapup.json.
+        kept = {key: summary[key] for key in RESULTS_KEPT_KEYS if key in summary}
+        left_off = sorted(key for key in summary if key not in kept)
+        logger.error("results_json is nested too deep to check for non-finite numbers; keeping %s and leaving %s off "
+                     "(the full summary is in PROVENANCE/wrapup.json)", sorted(kept), left_off)
+        try:
+            return json.dumps({**kept, "truncated": left_off}, allow_nan=False)
+        except (ValueError, RecursionError) as error:
+            # even what is kept cannot be written: say so and store the note alone rather than raise
+            logger.error("nothing of results_json could be serialised (%s); only the note is stored", error)
+            return json.dumps({"truncated": left_off})
     if replaced:
         summary = dict(summary, non_finite_values_replaced=replaced)
         logger.warning("results_json had %d non-finite number(s) (NaN or Infinity, which JSON has no tokens "
