@@ -900,6 +900,9 @@ def test_an_empty_model_card_is_still_uploaded_and_named(cs, tmp_path, monkeypat
     assert model_card_path(inp, ["model-card.json"]) == inp / "model-card.json"
     (inp / "model-card.json").write_text("not json")
     assert read_model_card(inp, ["model-card.json"]) == {} and model_card_path(inp, ["model-card.json"]) is not None, "unreadable: no metadata, but the file is there"
+    # syntactically valid but nested past the parser's recursion limit: no metadata, the file stays (round 24)
+    (inp / "model-card.json").write_text('{"train_stats": ' + "[" * 100000 + "]" * 100000 + "}")
+    assert read_model_card(inp, ["model-card.json"]) == {} and model_card_path(inp, ["model-card.json"]) is not None
     (inp / "model-card.json").write_bytes(b"")
     assert model_card_path(inp, ["model-card.json"]) is None, "zero bytes: XNAT would refuse the upload, so no card is advertised (round 12)"
     # only the exact basename is the card: a look-alike in a broad view is not (round 15)

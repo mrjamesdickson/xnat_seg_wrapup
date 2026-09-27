@@ -116,8 +116,11 @@ def read_model_card(root: Path, names: list[str]) -> dict:
     try:
         data = json.loads(path.read_text())
         return data if isinstance(data, dict) else {}
-    except (ValueError, OSError) as error:
-        logger.warning("%s is not readable JSON (%s); the model registers without its metadata", path.name, error)
+    except (ValueError, OSError, RecursionError) as error:
+        # RecursionError: a syntactically valid card nested tens of thousands deep; parsed here,
+        # before register_trained_model's guard, it would abort the wrapup after the run record
+        # was published and before the manifest is written (Codex P2, round 24)
+        logger.warning("%s is not readable JSON (%s); the model registers without its metadata", path.name, error or type(error).__name__)
         return {}
 
 
