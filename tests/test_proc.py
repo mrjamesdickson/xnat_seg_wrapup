@@ -1022,6 +1022,21 @@ def test_run_data_fields_of_the_wrong_shape_are_a_link_error_not_an_abort(cs, tm
         monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None, s=shape: Answer(json.dumps({"items": [{"data_fields": s}]}).encode()))
         with pytest.raises(RuntimeError, match="data_fields is .*, not an object"):
             _record_fields(context, "XNAT_E77777", 5.0)
+    # valid JSON nested past the recursion limit is a RuntimeError too, not a RecursionError past the guards (round 28)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(b'{"items": [' + b"[" * 100000 + b"]" * 100000 + b"]}"))
+    with pytest.raises(RuntimeError, match="failed: maximum recursion depth|failed: RecursionError"):
+        _record_fields(context, "XNAT_E77777", 5.0)
+    # the provenance scratch that cannot be made is an outcome, not an abort after the run record (round 28)
+    from segwrapup import model as model_module
+    from segwrapup.model import register_trained_model
+    inp = _training_output(tmp_path)
+    monkeypatch.setattr(urllib.request, "urlopen", real)
+    def no_space(*a, **kw):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(model_module.tempfile, "mkdtemp", no_space)
+    outcome = register_trained_model(context, inp, None, {"id": "XNAT_E77777", "id_is_accession": True}, "SUCCEEDED",
+                                     {"MODEL": ["segmentation_spleen.pt", "model-card.json"]}, {}, {}, 5.0)
+    assert "No space left on device" in outcome["error"] and outcome["label"], outcome
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(json.dumps({"items": [{"data_fields": {"results_json": "{}"}}]}).encode()))
     assert _record_fields(context, "XNAT_E77777", 5.0) == {"results_json": "{}"}
     monkeypatch.setattr(urllib.request, "urlopen", real)

@@ -345,8 +345,10 @@ def _record_fields(context: XnatContext, run_id: str, timeout: float, by_label: 
             payload = json.loads(response.read().decode(errors="replace"))
     except urllib.error.HTTPError as error:
         raise RuntimeError(f"GET {url.split('?')[0]} failed: HTTP {error.code}") from error
-    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError) as error:
-        raise RuntimeError(f"GET {url.split('?')[0]} failed: {error}") from error
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError, RecursionError) as error:
+        # RecursionError: valid JSON nested past the parser's limit is as malformed as the rest, and must
+        # be the RuntimeError the accession and link guards handle (Codex P2, round 28)
+        raise RuntimeError(f"GET {url.split('?')[0]} failed: {error or type(error).__name__}") from error
     try:
         fields = payload["items"][0]["data_fields"]
     except (KeyError, IndexError, TypeError) as error:
@@ -502,17 +504,18 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
                   "card_id": contract.get("card_id"), "card_revision": contract.get("card_revision"),
                   "container_image": contract.get("container_image"), "container_digest": contract.get("container_digest"),
                   "weights": weights, "registered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
-    scratch = Path(tempfile.mkdtemp(prefix="proc-wrapup-model-"))
-    (scratch / "provenance.json").write_text(json.dumps(provenance, indent=2))
-    files[PROVENANCE_ROLE] = [RecordFile(scratch / "provenance.json", "provenance.json")]
     try:
         # built inside the guard: a card the document cannot be made from (a lone surrogate that fails
         # at xml.encode(), metadata nested past the recursion limit) is an outcome, not an abort
-        # after the run record exists (Codex P2, rounds 15 and 20)
+        # after the run record exists (Codex P2, rounds 15 and 20); so is a scratch directory that
+        # cannot be made or written (a full or missing /tmp: OSError, round 28)
+        scratch = Path(tempfile.mkdtemp(prefix="proc-wrapup-model-"))
+        (scratch / "provenance.json").write_text(json.dumps(provenance, indent=2))
+        files[PROVENANCE_ROLE] = [RecordFile(scratch / "provenance.json", "provenance.json")]
         xml = build_model_xml(context, label, run_id, card, contract, weights, dataset_facts,
                               created_by=_username(context, min(timeout_seconds, 30.0)), model_card=card_path is not None)
         outcome = publish_record(context, label, xml, files, timeout_seconds=timeout_seconds, xsi_type=MODEL_XSI_TYPE)
-    except (RuntimeError, UnicodeEncodeError, RecursionError, ValueError, TypeError) as error:
+    except (RuntimeError, UnicodeEncodeError, RecursionError, ValueError, TypeError, OSError) as error:
         logger.error("trained model %s not registered; the run record %s stays: %s", label, run_id, error)
         return {"label": label, "error": str(error) if isinstance(error, RuntimeError) else f"{type(error).__name__}: {error}"}
     result = {"xsi_type": MODEL_XSI_TYPE, "id": outcome["id"], "label": outcome["label"], "status": "DRAFT",
