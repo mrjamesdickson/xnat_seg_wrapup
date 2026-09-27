@@ -851,6 +851,15 @@ def test_a_missing_path_qualified_default_checkpoint_is_not_remapped_to_another_
     assert default_checkpoint("fold-0\\best.pt", ["fold-0/best.pt", "fold-1/best.pt"]) == "fold-0/best.pt", "and names the POSIX path it was uploaded as (round 25)"
     assert default_checkpoint("fold-0\\best.pt", ["fold-0\\best.pt"]) == "fold-0\\best.pt", "an exact match is still honoured"
     assert default_checkpoint("models\\best.pt", ["best.pt"]) is None
+    # a card that spells a relative path out names an uploaded weight; read literally it missed and the
+    # model was registered with no default checkpoint for a consumer to select (Codex P2, round 32)
+    assert default_checkpoint("./best.pt", ["best.pt"]) == "best.pt"
+    assert default_checkpoint("fold-0/./best.pt", ["fold-0/best.pt", "fold-1/best.pt"]) == "fold-0/best.pt"
+    assert default_checkpoint(".\\fold-0\\best.pt", ["fold-0/best.pt"]) == "fold-0/best.pt", "and the Windows spelling of one"
+    assert default_checkpoint("fold-0/../fold-1/best.pt", ["fold-1/best.pt"]) == "fold-1/best.pt", "normalised, not followed"
+    # normalising cannot invent a match: nothing is uploaded above the resource root or absolute
+    assert default_checkpoint("../best.pt", ["best.pt"]) is None and default_checkpoint("/best.pt", ["best.pt"]) is None
+    assert default_checkpoint("./best.pt", ["fold-0/best.pt"]) is None, "still a path, not a basename to remap"
 
 
 

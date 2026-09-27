@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import posixpath
 import re
 import tempfile
 import urllib.parse
@@ -187,9 +188,16 @@ def default_checkpoint(declared, weights: list[str]) -> str | None:
     if declared:
         if declared in weights:
             return declared
-        if "\\" in declared and declared.replace("\\", "/") in weights:
-            # a portable card's `fold-0\best.pt` names the uploaded `fold-0/best.pt` (Codex P2, round 25)
-            return declared.replace("\\", "/")
+        # `fold-0\best.pt` from a portable card, and `./best.pt` or `fold/./best.pt` from a card that
+        # spells a relative path out, all name a weight that was uploaded; read literally they miss it
+        # and the model goes out with no default checkpoint at all, so no consumer can pick one
+        # automatically (Codex P2, PR #21 rounds 25 and 32). Normalising cannot invent a match: `../x`
+        # and `/x` normalise to themselves and no uploaded weight is ever named that way.
+        normalized = posixpath.normpath(declared.replace("\\", "/"))
+        if normalized in weights:
+            if normalized != declared:
+                logger.info("model card default_checkpoint %r names the uploaded weight %r", declared, normalized)
+            return normalized
         if "/" in declared or "\\" in declared:
             # a Windows-style `fold-0\best.pt` from a portable card is a path too: read as a bare
             # basename it would fall through to the only-weight fallback and another fold (Codex P2, round 23)
