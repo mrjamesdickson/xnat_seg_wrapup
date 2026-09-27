@@ -765,6 +765,11 @@ def test_a_generated_model_label_names_its_run_so_two_runs_in_one_second_do_not_
     assert a != b and a.endswith("_20260926T221538Z_E26048") and b.endswith("_20260926T221538Z_E26050")
     assert len(a) <= 64 and a.startswith("model_nnunet-nnunet_msd_spleen_demo"), "hyphens are label-safe; the head is trimmed for the tail"
     assert model_label("ds", when) == "model_ds_20260926T221538Z", "no run id: the old shape"
+    # the run id may be a 64-character fallback label (no id in XNAT's answer): the tail is bounded and stays unique (round 8)
+    long_run = "monailabel-train_flanker-2sub_20260926T221538Z_" + "x" * 20
+    bounded = model_label("nnunet-nnunet_msd_spleen_demo-20260803_121930", when, run_id=long_run)
+    assert len(bounded) <= 64 and bounded.startswith("model_nnunet") and "_20260926T221538Z_" in bounded
+    assert bounded != model_label("nnunet-nnunet_msd_spleen_demo-20260803_121930", when, run_id=long_run[:-1] + "y")
     assert model_label("ds", when, run_id="") == "model_ds_20260926T221538Z"
 
 
@@ -777,6 +782,8 @@ def test_num_classes_comes_from_the_label_indices_not_the_number_of_names():
     # a JSON number out of range decodes as infinity; NaN and fractions are not indices either (Codex P2, round 7)
     assert num_classes({"lesion": float("inf"), "spleen": 1}) == 2 and num_classes({"lesion": float("nan")}) is None
     assert num_classes({"half": 1.5, "two": 2.0}) == 3 and num_classes({"neg": -1}) is None
+    assert num_classes({"huge": 10 ** 400, "spleen": 1}) == 2, "a 400-digit integer is not an index and must not overflow"
+    assert num_classes({"top": 65535}) == 65536 and num_classes({"over": 65536}) is None
 
 
 def test_default_checkpoint_must_be_an_uploaded_weight():

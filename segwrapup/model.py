@@ -19,6 +19,7 @@ the prerequisite named in container-workshop/docs/DATASET-SCOPE-CARDS-DESIGN.md 
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -50,6 +51,9 @@ PRODUCES_VALUES = ("", "model")
 _LABEL_SAFE = re.compile(r"[^A-Za-z0-9_-]+")
 
 
+RUN_TOKEN_MAX = 20   # of the 64: the stamp takes 17, leaving at least 26 for the dataset head
+
+
 def model_label(dataset_label: str, when: datetime | None = None, run_id: str | None = None) -> str:
     """``model_<dataset>_<stamp>_<run>``: the run's id (its part after ``XNAT_``) makes the label
     unique per run, so two training cards finishing on the same dataset in the same second do
@@ -57,6 +61,10 @@ def model_label(dataset_label: str, when: datetime | None = None, run_id: str | 
     labels sortable by hand."""
     stamp = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
     run = _LABEL_SAFE.sub("_", (run_id or "").split("_", 1)[-1]).strip("_")
+    if len(run) > RUN_TOKEN_MAX:
+        # publish_record falls back to the run's label as its id when XNAT answers no id; a label can
+        # be 64 characters, and the tail must leave room for a head (Codex P2, PR #21 round 8)
+        run = run[:RUN_TOKEN_MAX - 9] + "_" + hashlib.sha1(run.encode()).hexdigest()[:8]
     tail = f"_{stamp}" + (f"_{run}" if run else "")
     head = "model_" + _LABEL_SAFE.sub("_", dataset_label or "dataset").strip("_")
     return head[: LABEL_MAX - len(tail)] + tail
@@ -92,9 +100,24 @@ def num_classes(labels: dict) -> int | None:
     classes, not 3) or not (``{"spleen": 1}`` is 2 too) and survives sparse indices (Codex P2,
     PR #21 round 5). None when no index is a finite non-negative integer: ``1e309`` decodes as
     infinity and ``int()`` of it would raise after the run record was published (round 7)."""
-    indices = [int(v) for v in (labels or {}).values()
-               if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and float(v).is_integer() and v >= 0]
+    indices = [int(v) for v in (labels or {}).values() if _is_label_index(v)]
     return max(indices) + 1 if indices else None
+
+
+MAX_LABEL_INDEX = 65535   # a segmentation stored as uint16 cannot hold more; a 400-digit "index" is not one
+
+
+def _is_label_index(value) -> bool:
+    """A finite, integral, non-negative index no larger than a mask can hold. Integers are checked
+    as integers: a 400-digit JSON integer decodes fine and math.isfinite(int) would raise
+    OverflowError converting it (Codex P2, PR #21 round 8)."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return 0 <= value <= MAX_LABEL_INDEX
+    if isinstance(value, float):
+        return math.isfinite(value) and value.is_integer() and 0 <= value <= MAX_LABEL_INDEX
+    return False
 
 
 def default_checkpoint(declared, weights: list[str]) -> str | None:
