@@ -697,9 +697,14 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
     if context is None:
         logger.error("analysis record not published; XNW_CONTRACT is set but the XNAT context is incomplete")
         return {"error": "XNAT context incomplete"}
-    label = (getattr(args, "record_label", "") or "").strip() or collection_label(
+    explicit_label = (getattr(args, "record_label", "") or "").strip()
+    label = explicit_label or collection_label(
         getattr(args, "model", None) or getattr(args, "pipeline", "run"), context.scan or args.scan,
         session_label=fetch_target_label(context))
+    # A label stamped here is a generated one whatever the caller said: the collision retry in
+    # publish_record applies to it as to proc-wrapup's (Codex P2, PR #21 round 10). Only a label
+    # the caller chose is never rewritten.
+    generated_label = generated_label or not explicit_label
     # Everything from file collection onwards is guarded: a bad contract glob (an absolute
     # pattern makes Path.glob raise NotImplementedError) must be recorded, not abort delivery
     # of the masks, report and ROI collection that are already on disk.

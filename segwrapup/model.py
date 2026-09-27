@@ -35,7 +35,7 @@ import http.client
 import urllib.error
 import urllib.request
 
-from .publish import ANALYSIS_NS, DATASET_XSI_TYPE, XNAT_NS, RecordFile, _element, _put, bounded_results_json, publish_record
+from .publish import ANALYSIS_NS, DATASET_XSI_TYPE, RESULTS_JSON_MAX, XNAT_NS, RecordFile, _element, _put, bounded_results_json, publish_record
 from .register import auth_headers
 from .register import LABEL_MAX, XnatContext
 
@@ -149,6 +149,45 @@ def default_checkpoint(declared, weights: list[str]) -> str | None:
     return weights[0] if len(weights) == 1 else None
 
 
+#: Every ``*_json`` element of the analysis schema is capped at 65,536 characters (see
+#: :func:`segwrapup.publish.bounded_results_json`); ``engine_metadata_json`` is no exception.
+ENGINE_METADATA_MAX = RESULTS_JSON_MAX
+
+LINK_KEYS = ("source_run_id", "source_run_type")
+
+
+def bounded_engine_metadata(meta: dict) -> str:
+    """``engine_metadata_json`` under the schema cap. A detailed model card (per-epoch history in
+    ``train_stats``) must not make XNAT refuse the record for weights that are otherwise fine
+    (Codex P2, PR #21 round 10): first the ``train_stats`` lists and nested objects go (the
+    scalars, best metric and epoch, stay), then ``train_stats`` as a whole, then everything but
+    the run link. ``truncated`` names what was dropped; the full card is on ``MODEL_CARD``."""
+    text = json.dumps(meta)
+    if len(text) <= ENGINE_METADATA_MAX:
+        return text
+    reduced = dict(meta)
+    stats = reduced.get("train_stats")
+    if isinstance(stats, dict):
+        reduced["train_stats"] = {k: v for k, v in stats.items() if not isinstance(v, (list, dict))}
+        reduced["truncated"] = ["train_stats"]
+        candidate = json.dumps(reduced)
+        if len(candidate) <= ENGINE_METADATA_MAX:
+            logger.warning("engine_metadata_json would be %d characters (cap %d); train_stats is reduced to its scalars, "
+                           "the full card is on MODEL_CARD", len(text), ENGINE_METADATA_MAX)
+            return candidate
+    reduced.pop("train_stats", None)
+    reduced["truncated"] = ["train_stats"]
+    candidate = json.dumps(reduced)
+    if len(candidate) <= ENGINE_METADATA_MAX:
+        logger.warning("engine_metadata_json would be %d characters (cap %d); train_stats is left off, "
+                       "the full card is on MODEL_CARD", len(text), ENGINE_METADATA_MAX)
+        return candidate
+    dropped = sorted(k for k in meta if k not in LINK_KEYS)
+    logger.warning("engine_metadata_json would be %d characters (cap %d); only the run link is kept, %s left off, "
+                   "the full card is on MODEL_CARD", len(text), ENGINE_METADATA_MAX, dropped)
+    return json.dumps({**{k: meta[k] for k in LINK_KEYS if k in meta}, "truncated": dropped})
+
+
 def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, contract: dict,
                     weights: list[str], dataset_facts: dict, when: datetime | None = None, created_by: str | None = None) -> str:
     now = when or datetime.now(timezone.utc)
@@ -174,10 +213,10 @@ def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, c
         # and provenance.json instead, and the run names the model in results_json.trained_model.
         # Re-pointing source_training_id at the group record is a schema change for the analysis
         # plugin, not for this wrapup.
-        _element("engine_metadata_json", json.dumps({**{k: card.get(k) for k in ("app", "max_epochs", "train_cases", "val_cases",
-                                                                                 "val_split", "base_model", "train_stats", "card_id",
-                                                                                 "card_revision", "container_digest") if k in card},
-                                                     "source_run_id": run_id, "source_run_type": "analysis:groupAnalysisData"})),
+        _element("engine_metadata_json", bounded_engine_metadata({**{k: card.get(k) for k in ("app", "max_epochs", "train_cases", "val_cases",
+                                                                                             "val_split", "base_model", "train_stats", "card_id",
+                                                                                             "card_revision", "container_digest") if k in card},
+                                                                  "source_run_id": run_id, "source_run_type": "analysis:groupAnalysisData"})),
         _element("label_names", ",".join(f"{name}:{index}" for name, index in labels.items()) if labels else None),
         _element("num_classes", num_classes(labels)),
         _element("best_validation_dice", _best_dice(card)),

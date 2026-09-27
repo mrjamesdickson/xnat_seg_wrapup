@@ -210,6 +210,10 @@ def fetch_dataset_facts(context: XnatContext, timeout_seconds: float = 60.0) -> 
             payload = json.loads(response.read().decode())
         item = payload["items"][0]
         fields = item["data_fields"]
+        if not isinstance(item, dict) or not isinstance(fields, dict):
+            # valid JSON of the wrong shape (data_fields null or a list) is as unreadable as no
+            # answer; caught here, not as an AttributeError below (Codex P2, PR #21 round 10)
+            raise TypeError(f"data_fields is {type(fields).__name__}, not an object")
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError) as error:
         # HTTPException: a truncated body (IncompleteRead) is not an OSError (Codex P2, PR #21)
         logger.warning("could not read dataset %s (%s); the record names the id and no member count", context.dataset, error)

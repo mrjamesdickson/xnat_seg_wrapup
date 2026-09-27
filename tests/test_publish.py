@@ -1136,3 +1136,27 @@ def test_relabel_reaches_a_trained_model_root_too():
     assert 'label="model_a_1_x9"' in out and 'label="model_a_1"' not in out
     assert _relabel('<analysis:GroupAnalysis label="g"><analysis:notes>label="keep"</analysis:notes></analysis:GroupAnalysis>', "g2").startswith('<analysis:GroupAnalysis label="g2">')
 
+
+
+def test_publish_if_possible_treats_the_label_it_stamps_as_generated(xnat, tmp_path, monkeypatch):
+    """seg-wrapup's cli calls publish_if_possible without a record label; the label stamped here is a
+    generated one, so a same-second collision on the dataset is retried with a suffix rather than
+    refused (Codex P2, PR #21 round 10). A caller's own label is still never rewritten."""
+    from types import SimpleNamespace
+    from segwrapup import publish
+    host, handler = xnat
+    (tmp_path / "report.html").write_text("<html/>")
+    for k, v in {"XNW_CARD_ID": "c", "XNW_ANALYSIS_TYPE": "group_glm", "XNW_CONTAINER_IMAGE": "i:1"}.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(publish, "collection_label", lambda *a, **k: "stamped_X")
+    handler.existing_labels = {"stamped_X"}
+    args = SimpleNamespace(no_publish=False, record_label="", model="m", scan="")
+    outcome = publish.publish_if_possible(args, tmp_path, {"model": "m", "model_version": "1"}, [], False, context=_dataset_context(host))
+    assert outcome.get("error") is None, outcome
+    assert outcome["label"].startswith("stamped_X_") and len(outcome["label"]) == len("stamped_X_") + 4
+    # a label the caller chose that is taken stays an error
+    handler.calls.clear(); handler.existing_labels = {"mine_X"}
+    args = SimpleNamespace(no_publish=False, record_label="mine_X", model="m", scan="")
+    outcome = publish.publish_if_possible(args, tmp_path, {"model": "m", "model_version": "1"}, [], False, context=_dataset_context(host))
+    assert "already exists" in outcome["error"]
+    assert [c["method"] for c in handler.calls if c["path"] != "/data/JSESSION" and "XNAT_D1" not in c["path"]] == ["GET"]

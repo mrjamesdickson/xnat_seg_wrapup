@@ -298,7 +298,9 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
     # fields in ``data_fields``; ``included_count`` arrives as a number.
     answers = {"XNAT_D1": ("analysis:analysisDatasetData", {"label": "cohort-v1", "included_count": 26}),
                "XNAT_D2": ("xnat:mrSessionData", {"label": "not-a-cohort"}),
-               "XNAT_D3": ("analysis:analysisDatasetData", {"label": "odd", "included_count": "many"})}
+               "XNAT_D3": ("analysis:analysisDatasetData", {"label": "odd", "included_count": "many"}),
+               "XNAT_D5": ("analysis:analysisDatasetData", None),                 # valid JSON, data_fields null
+               "XNAT_D6": ("analysis:analysisDatasetData", ["label", "cohort"])}  # or not an object
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -333,6 +335,9 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
             assert fetch_dataset_facts(ctx("XNAT_D3")) == {"label": "odd"}
             assert fetch_dataset_label(ctx("XNAT_D9")) == "XNAT_D9"
             assert fetch_dataset_facts(ctx("XNAT_D4")) == {}, "a truncated answer is best-effort too (Codex P2, PR #21)"
+            assert fetch_dataset_facts(ctx("XNAT_D5")) == {}, "data_fields null: best-effort, not AttributeError (Codex P2, round 10)"
+            assert fetch_dataset_facts(ctx("XNAT_D6")) == {}
+        assert "data_fields is NoneType, not an object" in caplog.text and "data_fields is list, not an object" in caplog.text
         assert "is a xnat:mrSessionData, not an analysis:analysisDatasetData" in caplog.text
         assert "non-numeric included_count" in caplog.text
         assert "could not read dataset XNAT_D9" in caplog.text

@@ -803,3 +803,31 @@ def test_default_checkpoint_must_be_an_uploaded_weight():
     assert default_checkpoint(123, ["only.pt"]) == "only.pt" and default_checkpoint({"path": "x"}, ["a.pt", "b.pt"]) is None
     assert default_checkpoint(["best.pt"], ["best.pt"]) == "best.pt", "a list is not a string either; the only weight wins"
 
+
+
+def test_engine_metadata_is_bounded_to_the_schema_cap(caplog):
+    """A detailed model card must not make XNAT refuse the trained-model record (Codex P2, PR #21 round 10):
+    the train_stats lists go first, then train_stats, then everything but the run link."""
+    import logging
+    from segwrapup.model import ENGINE_METADATA_MAX, bounded_engine_metadata
+    link = {"source_run_id": "XNAT_E1", "source_run_type": "analysis:groupAnalysisData"}
+    small = {"app": "radiology", "train_stats": {"best_metric": 0.8, "epochs": 5, "history": [0.1, 0.5, 0.8]}, **link}
+    assert json.loads(bounded_engine_metadata(small)) == small, "under the cap: verbatim"
+    history = [{"epoch": i, "loss": 0.5, "dice": 0.7} for i in range(3000)]
+    detailed = {"app": "radiology", "max_epochs": 3000, "train_stats": {"best_metric": 0.8, "best_epoch": 2999, "history": history,
+                                                                        "per_class": {"spleen": history}}, **link}
+    assert len(json.dumps(detailed)) > ENGINE_METADATA_MAX
+    with caplog.at_level(logging.WARNING):
+        reduced = json.loads(bounded_engine_metadata(detailed))
+    assert reduced["train_stats"] == {"best_metric": 0.8, "best_epoch": 2999} and reduced["truncated"] == ["train_stats"]
+    assert reduced["app"] == "radiology" and reduced["source_run_id"] == "XNAT_E1"
+    assert len(json.dumps(reduced)) <= ENGINE_METADATA_MAX and "reduced to its scalars" in caplog.text
+    # scalars alone over the cap: train_stats goes entirely
+    wide = {**detailed, "train_stats": {f"metric_{i}": i for i in range(9000)}}
+    reduced = json.loads(bounded_engine_metadata(wide))
+    assert "train_stats" not in reduced and reduced["truncated"] == ["train_stats"] and reduced["app"] == "radiology"
+    # the rest over the cap too: only the link survives, and the record says what it lost
+    huge = {"app": "x" * 70000, "base_model": "b", **link}
+    reduced = json.loads(bounded_engine_metadata(huge))
+    assert reduced == {**link, "truncated": ["app", "base_model"]}
+    assert len(json.dumps(reduced)) <= ENGINE_METADATA_MAX

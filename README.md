@@ -382,7 +382,9 @@ in `DRAFT` (`model_<dataset label>_<stamp>_<run id>`, the run's `E…` part, so 
 the run (not `source_training_id`: in the analysis schema plugin up to 0.2.0 that field is a foreign
 key to `analysis:groupTrainingData`, and a group record there makes XNAT answer 500),
 `model_framework`/`model_name`/`default_checkpoint`/`task_type`/`label_names`/`num_classes`/
-`best_validation_dice` come from the model card when present. The run record then gets
+`best_validation_dice` come from the model card when present, and `engine_metadata_json` carries the card's
+training facts under the schema's 65,536-character cap (an over-long `train_stats` is reduced to its
+scalars, then dropped, with `truncated` saying so; the full card stays on `MODEL_CARD`). The run record then gets
 `results_json.trained_model` (`{id, label, xsi_type, status}`) by a partial XML PUT keyed on its ID,
 so the two point at each other. Not `produced_model_id`: in the analysis schema plugin up to 0.2.0 that
 field exists only on `analysis:groupTrainingData`, and XNAT's query-parameter update of a project
