@@ -557,10 +557,34 @@ def upload_format(path: Path) -> str:
     return inferred or "FILE"
 
 
+#: What XML 1.0 will carry: tab, newline, carriage return, then #x20 upwards without the surrogate
+#: block and without the two non-characters #xFFFE/#xFFFF. Everything else — every other C0 control
+#: — is forbidden *in the document*, however well it encodes as UTF-8, so a card field holding one
+#: made XNAT reject the whole document (Codex P2, PR #21 round 77).
+_XML_FORBIDDEN = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+
+
+def _xml_text(name: str, text: str) -> str:
+    """``text`` with every code point XML 1.0 forbids written out as its escape.
+
+    `json.loads` accepts ``"\u0001"`` and `str.encode` encodes it, so a model card saying
+    ``{"model": "bad\u0001"}`` used to travel all the way into the document and XNAT then refused the
+    POST as malformed XML — leaving usable checkpoints unregistered over one character (Codex P2, PR
+    #21 round 77). Like the unpaired-surrogate case (:func:`segwrapup.register._encodable`), the value
+    comes back readable and diagnosable rather than unwritable: the reader is best effort by contract,
+    and a record naming ``bad\\x01`` says what happened, where no record at all does not."""
+    cleaned, replaced = _XML_FORBIDDEN.subn(
+        lambda hit: ("\\x%02x" if ord(hit.group()) < 0x100 else "\\u%04x") % ord(hit.group()), text)
+    if replaced:
+        logger.warning("%s holds %d character(s) XML cannot carry; they are written as their escapes (%r)",
+                       name, replaced, cleaned[:80])
+    return cleaned
+
+
 def _element(name: str, value) -> str:
     if value is None or value == "":
         return ""
-    return f"  <analysis:{name}>{escape(str(value))}</analysis:{name}>\n"
+    return f"  <analysis:{name}>{escape(_xml_text(name, str(value)))}</analysis:{name}>\n"
 
 
 def build_record_xml(context: XnatContext, contract: RecordContract, label: str,

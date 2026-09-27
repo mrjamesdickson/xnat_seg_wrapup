@@ -1218,3 +1218,30 @@ def test_publish_if_possible_treats_the_label_it_stamps_as_generated(xnat, tmp_p
     outcome = publish.publish_if_possible(args, tmp_path, {"model": "m", "model_version": "1"}, [], False, context=_dataset_context(host))
     assert "already exists" in outcome["error"]
     assert [c["method"] for c in handler.calls if c["path"] != "/data/JSESSION" and "XNAT_D1" not in c["path"]] == ["GET"]
+
+
+def test_a_character_xml_cannot_carry_is_written_as_its_escape_not_into_the_document():
+    """XML 1.0 carries tab, newline, carriage return and #x20 upwards; every other C0 control is
+    forbidden *in the document* however cleanly it encodes as UTF-8. `json.loads` accepts
+    "\\u0001" and `str.encode` encodes it, so a model card saying {"model": "bad\\u0001"} used to
+    travel into the record document and XNAT refused the POST as malformed — usable checkpoints left
+    unregistered over one character (Codex P2, PR #21 round 77). Unlike the unpaired surrogate, which
+    fails at encode() and is caught there, nothing downstream noticed this one."""
+    import xml.etree.ElementTree as ET
+    from segwrapup.publish import _element, _xml_text
+
+    document = ("<r xmlns:analysis='urn:x'>"
+                + _element("model_name", "bad\x01end")
+                + _element("notes", "vertical\x0btab and the non-character ￾")
+                + _element("description", "tab\there, newline\nhere, return\rhere")
+                + "</r>")
+    root = ET.fromstring(document)                      # the whole point: it parses at all
+    text = {child.tag.split("}")[-1]: child.text for child in root}
+    assert text["model_name"] == "bad\\x01end"
+    assert text["notes"] == "vertical\\x0btab and the non-character \\ufffe"
+    # DEL and the C1 controls are legal in XML 1.0 (only 1.1 restricts them), so they are left alone
+    assert _xml_text("notes", "a \x7f delete") == "a \x7f delete"
+    # the three XML allows are untouched (ET normalises a lone \r to \n on parse, so check the source)
+    assert "tab\there, newline\nhere, return\rhere" in document
+    # and an ordinary value is passed through unchanged, including non-ASCII text
+    assert _xml_text("model_name", "mödell 3 été \U0001f600") == "mödell 3 été \U0001f600"

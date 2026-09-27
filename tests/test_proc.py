@@ -979,9 +979,13 @@ def test_a_look_alike_card_name_in_the_model_view_is_a_weight_file_not_the_card(
     assert "/data/experiments/XNAT_E88888/resources/MODEL/files/model-card.json" not in uploads
 
 
-def test_a_card_field_the_xml_cannot_encode_is_a_registration_error_not_an_abort(cs, tmp_path, monkeypatch):
-    """A lone surrogate in a card field builds fine and fails at xml.encode(); the best-effort promise
-    means an error in the outcome and a written manifest, not an aborted wrapup (Codex P2, PR #21 round 15)."""
+def test_a_card_field_the_xml_cannot_carry_costs_the_run_nothing(cs, tmp_path, monkeypatch):
+    """A lone surrogate in a card field used to build fine and fail at xml.encode(), and the
+    best-effort promise made that an error in the outcome with a written manifest rather than an
+    aborted wrapup (Codex P2, PR #21 round 15) — but the run still lost its model record over one
+    character. XML 1.0 carries no surrogate either, so the same escaping that handles a forbidden
+    control character (round 77) handles this: the document says `\\ud800`, and the model is
+    registered."""
     host, handler = cs
     inp, out = _training_output(tmp_path), tmp_path / "out"
     (inp / "model-card.json").write_text('{"model_framework": "monailabel", "model": "\\ud800", "labels": {"spleen": 1}}')
@@ -989,9 +993,14 @@ def test_a_card_field_the_xml_cannot_encode_is_a_registration_error_not_an_abort
     assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["analysis_record"]["id"] == "XNAT_E77777"
-    assert "surrogates not allowed" in manifest["trained_model"]["error"] or "codec can't encode" in manifest["trained_model"]["error"]
+    assert manifest["trained_model"]["id"] == "XNAT_E88888" and not manifest["trained_model"].get("error")
     creates = [c["path"] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
-    assert len(creates) == 1, "the run record only; no model asset"
+    assert len(creates) == 2, "the run record and the model asset"
+    posted = [(c.get("body") or b"").decode(errors="replace") for c in handler.calls if c["method"] == "PUT"]
+    model_doc = next(b for b in posted if "analysis:model_status" in b)
+    import xml.etree.ElementTree as ET
+    ET.fromstring(model_doc)                        # the control: the document parses at all
+    assert "\\ud800" in model_doc, "the escape, not the unwritable character"
 
 
 def test_a_zero_byte_model_card_is_not_advertised(cs, tmp_path, monkeypatch):
@@ -1258,3 +1267,22 @@ def test_a_card_nested_past_the_recursion_limit_is_a_registration_outcome_not_an
     assert manifest["analysis_record"]["id"] == "XNAT_E77777" and "recursion depth" in manifest["trained_model"]["error"]
     creates = [c["path"] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
     assert len(creates) == 1
+
+
+def test_a_control_character_in_a_card_field_still_registers_the_model(cs, tmp_path, monkeypatch):
+    """The live counterpart of the XML-character fix: a card whose model name holds \\u0001 used to
+    build a document XNAT refuses as malformed, so the checkpoints went unregistered. The escape goes
+    into the record instead and the model is registered (Codex P2, PR #21 round 77)."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "model-card.json").write_text('{"model_framework": "monailabel", "model": "spleen\\u0001", "labels": {"spleen": 1}}')
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["trained_model"]["id"] == "XNAT_E88888" and not manifest["trained_model"].get("error")
+    bodies = [(c.get("body") or b"").decode(errors="replace") for c in handler.calls if c["method"] == "PUT"]
+    posted = [b for b in bodies if "analysis:model_status" in b]   # the model document, not the run's
+    assert posted, "the model document was posted"
+    import xml.etree.ElementTree as ET
+    ET.fromstring(posted[0])                    # the control: the document parses at all
+    assert "spleen\\x01" in posted[0], "the escape, not the raw control character"
