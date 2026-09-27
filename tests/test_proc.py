@@ -771,6 +771,13 @@ def test_a_generated_model_label_names_its_run_so_two_runs_in_one_second_do_not_
     assert len(bounded) <= 64 and bounded.startswith("model_nnunet") and "_20260926T221538Z_" in bounded
     assert bounded != model_label("nnunet-nnunet_msd_spleen_demo-20260803_121930", when, run_id=long_run[:-1] + "y")
     assert model_label("ds", when, run_id="") == "model_ds_20260926T221538Z"
+    # only an accession id loses its site prefix: two pipelines' fallback labels on one dataset in one
+    # second differ only before the first underscore, and must give two model labels (round 11)
+    a = model_label("ds", when, run_id="trainerA_ds_20260926T221538Z_record")
+    b = model_label("ds", when, run_id="trainerB_ds_20260926T221538Z_record")
+    assert a != b and "trainerA" in a and "trainerB" in b and len(a) <= 64
+    assert model_label("ds", when, run_id="CENTRAL_E7").endswith("_E7") and model_label("ds", when, run_id="XNAT_E26051").endswith("_E26051")
+    assert model_label("ds", when, run_id="XNAT_E26051x").endswith("_XNAT_E26051x"), "not an accession id: kept whole"
 
 
 def test_num_classes_comes_from_the_label_indices_not_the_number_of_names():

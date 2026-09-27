@@ -214,6 +214,13 @@ def fetch_dataset_facts(context: XnatContext, timeout_seconds: float = 60.0) -> 
             # valid JSON of the wrong shape (data_fields null or a list) is as unreadable as no
             # answer; caught here, not as an AttributeError below (Codex P2, PR #21 round 10)
             raise TypeError(f"data_fields is {type(fields).__name__}, not an object")
+        # XNAT puts the type in the item's ``meta``, not among the data fields; a meta of the wrong
+        # shape only costs the type check, still inside the guarded parse (Codex P2, round 11)
+        meta = item.get("meta")
+        if meta is not None and not isinstance(meta, dict):
+            logger.warning("dataset %s answered a meta of type %s, not an object; its type is not checked", context.dataset, type(meta).__name__)
+            meta = {}
+        xsi = str((meta or {}).get("xsi:type") or "")
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError) as error:
         # HTTPException: a truncated body (IncompleteRead) is not an OSError (Codex P2, PR #21)
         logger.warning("could not read dataset %s (%s); the record names the id and no member count", context.dataset, error)
@@ -225,8 +232,6 @@ def fetch_dataset_facts(context: XnatContext, timeout_seconds: float = 60.0) -> 
             facts["included_count"] = int(count)
         except (TypeError, ValueError):
             logger.warning("dataset %s carries a non-numeric included_count %r; not recorded", context.dataset, count)
-    # XNAT puts the type in the item's ``meta``, not among the data fields.
-    xsi = str((item.get("meta") or {}).get("xsi:type") or "")
     if xsi and xsi != "analysis:analysisDatasetData":
         logger.warning("dataset %s is a %s, not an analysis:analysisDatasetData; the record still cites it", context.dataset, xsi)
     return facts

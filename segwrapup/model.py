@@ -54,13 +54,23 @@ _LABEL_SAFE = re.compile(r"[^A-Za-z0-9_-]+")
 RUN_TOKEN_MAX = 20   # of the 64: the stamp takes 17, leaving at least 26 for the dataset head
 
 
+_ACCESSION_ID = re.compile(r"^[A-Za-z0-9]+_E\d+$")   # <site id>_E<number>, XNAT's experiment accession id
+
+
 def model_label(dataset_label: str, when: datetime | None = None, run_id: str | None = None) -> str:
     """``model_<dataset>_<stamp>_<run>``: the run's id (its part after ``XNAT_``) makes the label
     unique per run, so two training cards finishing on the same dataset in the same second do
     not collide on the create-only preflight (Codex P2, PR #21 round 4); the stamp keeps the
     labels sortable by hand."""
     stamp = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
-    run = _LABEL_SAFE.sub("_", (run_id or "").split("_", 1)[-1]).strip("_")
+    # only an accession id (XNAT_E26051, CENTRAL_E7) loses its site prefix; publish_record falls back
+    # to the run's *label* as its id when XNAT answers no id, and splitting that at its first
+    # underscore would throw away the pipeline name, making trainerA_ds_stamp_record and
+    # trainerB_ds_stamp_record the same model label (Codex P2, PR #21 round 11)
+    token = run_id or ""
+    if _ACCESSION_ID.match(token):
+        token = token.split("_", 1)[1]
+    run = _LABEL_SAFE.sub("_", token).strip("_")
     if len(run) > RUN_TOKEN_MAX:
         # publish_record falls back to the run's label as its id when XNAT answers no id; a label can
         # be 64 characters, and the tail must leave room for a head (Codex P2, PR #21 round 8)

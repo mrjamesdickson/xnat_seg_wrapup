@@ -300,7 +300,8 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
                "XNAT_D2": ("xnat:mrSessionData", {"label": "not-a-cohort"}),
                "XNAT_D3": ("analysis:analysisDatasetData", {"label": "odd", "included_count": "many"}),
                "XNAT_D5": ("analysis:analysisDatasetData", None),                 # valid JSON, data_fields null
-               "XNAT_D6": ("analysis:analysisDatasetData", ["label", "cohort"])}  # or not an object
+               "XNAT_D6": ("analysis:analysisDatasetData", ["label", "cohort"]),  # or not an object
+               "XNAT_D7": (["analysis:analysisDatasetData"], {"label": "listy", "included_count": 3})}   # meta of the wrong shape
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -312,7 +313,8 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
             if asset not in answers:
                 self.send_response(500); self.end_headers(); return
             xsi, fields = answers[asset]
-            body = json.dumps({"items": [{"meta": {"xsi:type": xsi, "isHistory": False}, "data_fields": fields}]}).encode()
+            meta = xsi if isinstance(xsi, list) else {"xsi:type": xsi, "isHistory": False}
+            body = json.dumps({"items": [{"meta": meta, "data_fields": fields}]}).encode()
             self.send_response(200); self.end_headers(); self.wfile.write(body)
 
         def do_POST(self):
@@ -337,6 +339,8 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
             assert fetch_dataset_facts(ctx("XNAT_D4")) == {}, "a truncated answer is best-effort too (Codex P2, PR #21)"
             assert fetch_dataset_facts(ctx("XNAT_D5")) == {}, "data_fields null: best-effort, not AttributeError (Codex P2, round 10)"
             assert fetch_dataset_facts(ctx("XNAT_D6")) == {}
+            assert fetch_dataset_facts(ctx("XNAT_D7")) == {"label": "listy", "included_count": 3}, "a meta of the wrong shape costs only the type check (round 11)"
+        assert "meta of type list, not an object" in caplog.text
         assert "data_fields is NoneType, not an object" in caplog.text and "data_fields is list, not an object" in caplog.text
         assert "is a xnat:mrSessionData, not an analysis:analysisDatasetData" in caplog.text
         assert "non-numeric included_count" in caplog.text
