@@ -186,6 +186,9 @@ def default_checkpoint(declared, weights: list[str]) -> str | None:
     if declared:
         if declared in weights:
             return declared
+        if "\\" in declared and declared.replace("\\", "/") in weights:
+            # a portable card's `fold-0\best.pt` names the uploaded `fold-0/best.pt` (Codex P2, round 25)
+            return declared.replace("\\", "/")
         if "/" in declared or "\\" in declared:
             # a Windows-style `fold-0\best.pt` from a portable card is a path too: read as a bare
             # basename it would fall through to the only-weight fallback and another fold (Codex P2, round 23)

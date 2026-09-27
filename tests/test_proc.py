@@ -832,6 +832,7 @@ def test_a_missing_path_qualified_default_checkpoint_is_not_remapped_to_another_
     assert default_checkpoint("best.pt", ["fold-1/best.pt"]) == "fold-1/best.pt", "a bare basename still matches by basename"
     assert default_checkpoint("models/best.pt", ["best.pt"]) is None, "a path is not shortened to its basename either"
     assert default_checkpoint("fold-0\\best.pt", ["fold-1/best.pt"]) is None, "a Windows-style path is a path, not a basename"
+    assert default_checkpoint("fold-0\\best.pt", ["fold-0/best.pt", "fold-1/best.pt"]) == "fold-0/best.pt", "and names the POSIX path it was uploaded as (round 25)"
     assert default_checkpoint("fold-0\\best.pt", ["fold-0\\best.pt"]) == "fold-0\\best.pt", "an exact match is still honoured"
     assert default_checkpoint("models\\best.pt", ["best.pt"]) is None
 
