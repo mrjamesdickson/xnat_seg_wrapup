@@ -1050,6 +1050,14 @@ def test_publish_at_dataset_scope_creates_under_the_project_and_uploads_to_exper
     with pytest.raises(RuntimeError, match="already exists on XNAT_D1"):
         publish_record(_dataset_context(host), "taken_X", "<xml/>", files, output_dir=tmp_path)
     assert [c["method"] for c in handler.calls if c["path"] != "/data/JSESSION"] == ["GET"]
+    # a label the wrapup generated itself is retried once with a suffix (two runs in one second on one dataset;
+    # dataset scope has no per-session namespace, so the preflight sees the other run's record: Codex P2, PR #21 round 9)
+    handler.calls.clear(); handler.existing_labels = {"taken_X"}
+    outcome = publish_record(_dataset_context(host), "taken_X", '<a:GroupAnalysis label="taken_X"/>', files, output_dir=tmp_path, generated_label=True)
+    assert outcome["id"] == "XNAT_E99999" and outcome["label"].startswith("taken_X_") and len(outcome["label"]) == len("taken_X_") + 4
+    paths = [c["path"] for c in handler.calls if c["path"] != "/data/JSESSION"]
+    assert paths[0] == "/data/projects/PROJ_1/experiments/taken_X?format=json" and paths[1].startswith("/data/projects/PROJ_1/experiments/taken_X_") and paths[1].endswith("?format=json")
+    assert paths[2] == paths[1].replace("?format=json", "?inbody=true"), "the retried label is created, not the taken one"
     handler.existing_labels = set(); handler.fail_paths = {"/data/experiments/XNAT_E99999/resources/DERIVED/files/sub-01"}
     with pytest.raises(RuntimeError, match="record XNAT_E99999 deleted"):
         publish_record(_dataset_context(host), "fresh_X", "<xml/>", files, output_dir=tmp_path)

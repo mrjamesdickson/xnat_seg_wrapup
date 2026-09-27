@@ -89,8 +89,14 @@ def _best_dice(card: dict) -> float | None:
     stats = card.get("train_stats") if isinstance(card.get("train_stats"), dict) else {}
     for key in ("best_validation_dice", "best_metric"):
         value = stats.get(key, card.get(key))
-        if isinstance(value, (int, float)):
+        if isinstance(value, bool):
+            continue
+        # a Dice is in [0, 1]; a 400-digit JSON integer would overflow float() while the model XML is
+        # built, after the run record was published (Codex P2, PR #21 round 9): bound before converting
+        if isinstance(value, int) and -1_000_000 <= value <= 1_000_000:
             return float(value)
+        if isinstance(value, float) and math.isfinite(value):
+            return value
     return None
 
 

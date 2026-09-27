@@ -582,7 +582,8 @@ def _relabel(xml: str, label: str) -> str:
 
 
 def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, list],
-                   timeout_seconds: float = 300.0, output_dir: Path | None = None, xsi_type: str | None = None) -> dict:
+                   timeout_seconds: float = 300.0, output_dir: Path | None = None, xsi_type: str | None = None,
+                   generated_label: bool = False) -> dict:
     """Create the record, then upload each role's files to its ``out`` resource. Raises RuntimeError.
 
     Create-only, enforced twice: a label that already exists on the session is refused before
@@ -597,6 +598,16 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     xsi_type = xsi_type or xsi_type_for(context)   # a caller may publish another project asset (a trained model) at dataset scope
     label_url, _ = record_urls(context, label)
     probe = _request(context, "GET", f"{label_url}?format=json", timeout_seconds)
+    if probe == 200 and generated_label:
+        # A label the wrapup stamped itself, taken by another run of the same pipeline on the same
+        # owner within the same second (dataset scope has no per-session namespace): one retry with a
+        # short random suffix, as the 409 path below does (Codex P2, PR #21 round 9). A label the
+        # caller chose is never rewritten.
+        retry = f"{label[:LABEL_MAX - 5]}_{secrets.token_hex(2)}"
+        logger.warning("generated label %s already exists on %s; retrying once as %s", label, context.target, retry)
+        label, xml = retry, _relabel(xml, retry)
+        label_url, _ = record_urls(context, label)
+        probe = _request(context, "GET", f"{label_url}?format=json", timeout_seconds)
     if probe == 200:
         raise RuntimeError(f"label {label} already exists on {context.target}; the record is create-only, "
                            "pass a fresh --record-label or let the run stamp one")
@@ -662,7 +673,8 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
                         source_dicom_present: bool, unmeasured_masks: int = 0,
                         context: XnatContext | None = None, facts: dict | None = None,
                         default_resources: dict[str, list[str]] | None = None,
-                        derived_root: str | None = None, manifest: dict | None = None) -> dict | None:
+                        derived_root: str | None = None, manifest: dict | None = None,
+                        generated_label: bool = False) -> dict | None:
     """Publish when the card opted in and the context is present. Never raises.
 
     ``derived_root`` is the subdirectory of ``output_dir`` that holds the tool's output tree
@@ -712,7 +724,7 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
         xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present,
                                output_dir=output_dir, unmeasured_masks=unmeasured_masks, facts=facts, views=views,
                                provenance=provenance)
-        outcome = publish_record(context, label, xml, files, output_dir=output_dir)
+        outcome = publish_record(context, label, xml, files, output_dir=output_dir, generated_label=generated_label)
         outcome["skipped_empty"] = sorted(set(outcome.get("skipped_empty") or []) | {f.name for f in empties})
         outcome["output_paths"]["skipped_empty"] = sorted(set(outcome["output_paths"]["skipped_empty"])
                                                           | {upload_name(f.path, output_dir) for f in empties})

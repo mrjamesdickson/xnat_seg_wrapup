@@ -220,14 +220,16 @@ def run(args: argparse.Namespace) -> int:
                                    "prerequisites": [{"name": q["name"], "record": (q.get("record") or {}).get("ID"),
                                                       "resource": q.get("resource"), "role": q.get("role")} for q in prerequisites],
                                    "upstream_record": next(((q.get("record") or {}).get("ID") for q in prerequisites if q.get("record")), None)}}
-        if not (args.record_label or "").strip():
+        generated_label = not (args.record_label or "").strip()
+        if generated_label:
             # The owner's label: the session's or subject's from XNAT; at dataset scope the one
             # already read with the facts above (no second request; the id when it did not answer).
             owner_label = ((dataset_facts.get("label") or context.dataset) if context and context.scope == "dataset"
                            else fetch_target_label(context) if context else "")
             args.record_label = collection_label(args.pipeline, args.scan, session_label=owner_label, reserve=len("_record")) + "_record"
         outcome = publish_if_possible(args, output_dir, report, [], False, context=context, facts=record_facts,
-                                      default_resources=PROC_DEFAULT_RESOURCES, derived_root=RAW_DIRNAME, manifest=manifest)
+                                      default_resources=PROC_DEFAULT_RESOURCES, derived_root=RAW_DIRNAME, manifest=manifest,
+                                      generated_label=generated_label)
         # Local paths of what went up (and of the empty files that could not): for the pointer
         # reduction below, not for the manifest, which already lists the record's names.
         output_paths = (outcome or {}).pop("output_paths", None) or {}

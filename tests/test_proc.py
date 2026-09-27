@@ -783,6 +783,10 @@ def test_num_classes_comes_from_the_label_indices_not_the_number_of_names():
     assert num_classes({"lesion": float("inf"), "spleen": 1}) == 2 and num_classes({"lesion": float("nan")}) is None
     assert num_classes({"half": 1.5, "two": 2.0}) == 3 and num_classes({"neg": -1}) is None
     assert num_classes({"huge": 10 ** 400, "spleen": 1}) == 2, "a 400-digit integer is not an index and must not overflow"
+    from segwrapup.model import _best_dice
+    assert _best_dice({"best_metric": 10 ** 400}) is None and _best_dice({"best_metric": 1}) == 1.0 and _best_dice({"best_metric": True}) is None
+    assert _best_dice({"train_stats": {"best_metric": float("nan")}, "best_validation_dice": 0.7}) == 0.7 and _best_dice({"best_metric": float("nan")}) is None, "NaN is no dice"
+    assert _best_dice({"train_stats": {"best_metric": 0.91}}) == 0.91
     assert num_classes({"top": 65535}) == 65536 and num_classes({"over": 65536}) is None
 
 
