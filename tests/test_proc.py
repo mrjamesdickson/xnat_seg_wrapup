@@ -995,3 +995,40 @@ def test_the_run_link_is_keyed_on_the_accession_resolved_from_the_lookup(monkeyp
     with pytest.raises(RuntimeError, match="accession id could not be resolved"):
         model.note_model_on_run(context, "monailabel-train_ds_20260926T221538Z_record", "XNAT_E88888", "model_x")
     assert "put" not in seen
+
+
+def test_fallback_labels_are_resolved_to_accessions_before_the_model_names_the_run_or_the_run_the_model(tmp_path, monkeypatch):
+    """publish_record hands back a label when XNAT's create answers no id. The model's reverse link
+    (engine_metadata_json.source_run_id, provenance.json) and the run's forward link
+    (results_json.trained_model.id) must both be accessions a consumer can GET (Codex P2, PR #21 round 17)."""
+    from segwrapup import model
+    from segwrapup.register import XnatContext
+    context = XnatContext(host="http://x", user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    out = tmp_path / "out"; (out / "raw").mkdir(parents=True)
+    (out / "raw" / "segmentation_spleen.pt").write_bytes(b"W")
+    lookups, published, links = [], {}, {}
+    def record_fields(ctx, record_id, timeout):
+        lookups.append(record_id)
+        run = {"ID": "XNAT_E77777", "label": "run_lbl_x", "results_json": "{}"}
+        return {"run_lbl_x": run, "XNAT_E77777": run, "model_ds_x": {"ID": "XNAT_E88888", "label": "model_ds_x"}}[record_id]
+    monkeypatch.setattr(model, "_record_fields", record_fields)
+    monkeypatch.setattr(model, "_username", lambda ctx, timeout: "jdickson")
+    monkeypatch.setattr(model, "model_label", lambda dataset_label, when=None, run_id=None: "model_ds_x")
+    def publish_record(ctx, label, xml, files, timeout_seconds=300.0, xsi_type=None):
+        published["xml"] = xml
+        published["provenance"] = json.loads(files["PROVENANCE"][0].path.read_text())
+        return {"id": label, "label": label}   # XNAT answered no id: the label stands in
+    monkeypatch.setattr(model, "publish_record", publish_record)
+    monkeypatch.setattr(model, "_put", lambda ctx, url, body, ctype, timeout: (links.update(url=url, xml=body.decode()), (200, "XNAT_E77777"))[1])
+    result = model.register_trained_model(context, out, "raw", {"id": "run_lbl_x", "label": "run_lbl_x"}, "SUCCEEDED",
+                                          {"MODEL": ["segmentation_spleen.pt"]}, {"pipeline": "monailabel-train"}, {"label": "ds"})
+    assert lookups[0] == "run_lbl_x", "the run is resolved before the model is built"
+    assert '"source_run_id": "XNAT_E77777"' in published["xml"].replace("&quot;", '"') and published["provenance"]["source_run_id"] == "XNAT_E77777"
+    assert "run_lbl_x" not in published["xml"].split("<analysis:engine_metadata_json>")[1].split("</analysis:engine_metadata_json>")[0]
+    assert result["id"] == "XNAT_E88888" and result["source_run_id"] == "XNAT_E77777" and result["linked"] is True
+    assert '"id": "XNAT_E88888"' in links["xml"].replace("&quot;", '"') and links["url"].startswith("http://x/data/experiments/XNAT_E77777?")
+    # a run label that resolves to nothing: no model is registered at all
+    monkeypatch.setattr(model, "_record_fields", lambda ctx, record_id, timeout: {"label": record_id})
+    result = model.register_trained_model(context, out, "raw", {"id": "run_lbl_y", "label": "run_lbl_y"}, "SUCCEEDED",
+                                          {"MODEL": ["segmentation_spleen.pt"]}, {"pipeline": "monailabel-train"}, {"label": "ds"})
+    assert "accession id could not be resolved" in result["error"]

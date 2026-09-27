@@ -338,6 +338,24 @@ def _current_results(run_id: str, raw) -> dict:
     return current if isinstance(current, dict) else {"results": current}
 
 
+def resolve_accession(context: XnatContext, record_id: str, timeout_seconds: float = 60.0) -> str:
+    """The accession id behind ``record_id``: itself when it already is one, else the ``ID`` of
+    the record looked up by that label under the project. publish_record hands back the label
+    when XNAT answered a create with no id; a label is project-scoped and no reverse link, so
+    everything that names the run or the model by id resolves it first (Codex P2, PR #21 round
+    17). Raises RuntimeError when it cannot be resolved."""
+    record_id = (record_id or "").strip()
+    if not record_id:
+        raise RuntimeError("no record id to resolve")
+    if _ACCESSION_ID.match(record_id):
+        return record_id
+    accession = str(_record_fields(context, record_id, timeout_seconds).get("ID") or "").strip()
+    if not _ACCESSION_ID.match(accession):
+        raise RuntimeError(f"record {record_id}: the accession id could not be resolved from its data_fields ({accession!r})")
+    logger.info("record label %s resolved to %s", record_id, accession)
+    return accession
+
+
 def note_model_on_run(context: XnatContext, run_id: str, model_id: str, model_label: str, timeout_seconds: float = 60.0) -> str:
     """Write ``results_json.trained_model`` on the run record by a partial XML PUT keyed on the
     record's ID.
@@ -386,6 +404,13 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     if run_status != "SUCCEEDED":
         logger.warning("run %s is %s; no model is registered from a run that did not succeed", run_id, run_status)
         return {"skipped": f"run {run_status}"}
+    try:
+        # the model's reverse link (engine_metadata_json.source_run_id, provenance.json) must be an
+        # accession a consumer can GET, not the label publish_record fell back to (round 17)
+        run_id = resolve_accession(context, run_id, min(timeout_seconds, 60.0))
+    except RuntimeError as error:
+        logger.error("no model registered: the run's accession id is unknown (%s)", error)
+        return {"error": f"the run's accession id could not be resolved: {error}"}
     names = [n for n in (views or {}).get(MODEL_ROLE, []) if not is_model_card(n)]
     if not names:
         logger.error("produces=model but the %s view names no weights on DERIVED; declare results.resources.%s in the card",
@@ -423,7 +448,9 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     result = {"xsi_type": MODEL_XSI_TYPE, "id": outcome["id"], "label": outcome["label"], "status": "DRAFT",
               "weights": weights, "model_card": card_path is not None, "source_run_id": run_id, "linked": False}
     try:
-        result["source_run_id"] = note_model_on_run(context, run_id, outcome["id"], outcome["label"], timeout_seconds=min(timeout_seconds, 60.0))
+        # the forward link names the model by accession too; a create that answered no id is looked up by label
+        result["id"] = resolve_accession(context, outcome["id"], min(timeout_seconds, 60.0))
+        result["source_run_id"] = note_model_on_run(context, run_id, result["id"], outcome["label"], timeout_seconds=min(timeout_seconds, 60.0))
         result["linked"] = True
     except (RuntimeError, UnicodeEncodeError) as error:
         # The model still names the run in engine_metadata_json/provenance.json; only the forward link is missing.
