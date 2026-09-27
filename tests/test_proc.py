@@ -1052,9 +1052,10 @@ def test_fallback_labels_are_resolved_to_accessions_before_the_model_names_the_r
     assert '"source_run_id": "XNAT_E77777"' in published["xml"].replace("&quot;", '"')
     result = model.register_trained_model(context, out, "raw", {"id": "MY_SITE_E123", "label": "l", "id_is_accession": True}, "SUCCEEDED",
                                           {"MODEL": ["segmentation_spleen.pt"]}, {"pipeline": "monailabel-train"}, {"label": "ds"})
-    assert result["source_run_id"] == "MY_SITE_E123" and "MY_SITE_E123" not in record_fields_by or record_fields_by.get("MY_SITE_E123") is not None
+    assert result["source_run_id"] == "MY_SITE_E123", "trusted as the create's own answer"
+    assert record_fields_by.get("MY_SITE_E123") is not True, "never looked up by label"
     # a run label that resolves to nothing: no model is registered at all
-    monkeypatch.setattr(model, "_record_fields", lambda ctx, record_id, timeout: {"label": record_id})
+    monkeypatch.setattr(model, "_record_fields", lambda ctx, record_id, timeout, by_label=None: {"label": record_id})
     result = model.register_trained_model(context, out, "raw", {"id": "run_lbl_y", "label": "run_lbl_y"}, "SUCCEEDED",
                                           {"MODEL": ["segmentation_spleen.pt"]}, {"pipeline": "monailabel-train"}, {"label": "ds"})
     assert "accession id could not be resolved" in result["error"]
