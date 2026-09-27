@@ -176,6 +176,10 @@ def collection_label(model_name: str, scan: str, when: datetime | None = None, s
     model = _LABEL_SAFE.sub("_", model_name).strip("_") or "SEG"
     # what must survive: the stamp and the scan (uniqueness); then the owner, then the model.
     # A long dataset label used to push the stamp off the end (proc-wrapup dataset scope).
+    # "M_" plus the scan and stamp must fit the limit; a very long scan id gives up its tail before
+    # the stamp does, and the model keeps at least its one letter (Codex P2, PR #21 round 15)
+    if scan_part and len(scan_part) + 1 + len(stamp) + 2 > limit:
+        scan_part = scan_part[:max(limit - len(stamp) - 3, 0)].rstrip("_")
     fixed = "_".join(part for part in (scan_part, stamp) if part)
     room = limit - len(fixed) - 1                         # for "<model>_" at least
     if owner:
@@ -183,7 +187,7 @@ def collection_label(model_name: str, scan: str, when: datetime | None = None, s
     room = limit - len("_".join(part for part in (owner, fixed) if part)) - 1
     model = model[:max(room, 1)].rstrip("_") or "M"
     label = "_".join(part for part in (model, owner, fixed) if part)
-    return label[:limit] if len(fixed) >= limit else label
+    return label[:limit]
 
 
 def fetch_target_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:

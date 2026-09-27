@@ -80,12 +80,20 @@ def model_label(dataset_label: str, when: datetime | None = None, run_id: str | 
     return head[: LABEL_MAX - len(tail)] + tail
 
 
+def is_model_card(name: str) -> bool:
+    """Whether a view-relative file name is the tool's model card: the basename is exactly
+    ``model-card.json`` (``fold-0/model-card.json`` is; ``backup-model-card.json`` is not)."""
+    return Path(name).name == MODEL_CARD_FILENAME
+
+
 def model_card_path(root: Path, names: list[str]) -> Path | None:
     """The tool's ``model-card.json`` when it is among the MODEL view files or at the DERIVED
     root, whatever it contains; None when there is no such file. Presence is tracked apart from
     content: an empty ``{}`` card is still the tool's card and goes on MODEL_CARD (Codex P2, PR #21
     round 11)."""
-    candidates = [root / n for n in names if n.endswith(MODEL_CARD_FILENAME)] + [root / MODEL_CARD_FILENAME]
+    # the basename, exactly: backup-model-card.json in a broad MODEL view is a weight-side file, not
+    # the card (Codex P2, PR #21 round 15)
+    candidates = [root / n for n in names if is_model_card(n)] + [root / MODEL_CARD_FILENAME]
     path = next((path for path in candidates if path.is_file()), None)
     if path is not None and path.stat().st_size == 0:
         # publish_record skips zero-byte files (XNAT refuses them), so advertising this one would send
@@ -366,7 +374,7 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     if run_status != "SUCCEEDED":
         logger.warning("run %s is %s; no model is registered from a run that did not succeed", run_id, run_status)
         return {"skipped": f"run {run_status}"}
-    names = [n for n in (views or {}).get(MODEL_ROLE, []) if not n.endswith(MODEL_CARD_FILENAME)]
+    names = [n for n in (views or {}).get(MODEL_ROLE, []) if not is_model_card(n)]
     if not names:
         logger.error("produces=model but the %s view names no weights on DERIVED; declare results.resources.%s in the card",
                      MODEL_ROLE, MODEL_ROLE)
@@ -395,7 +403,9 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
                           created_by=_username(context, min(timeout_seconds, 30.0)), model_card=card_path is not None)
     try:
         outcome = publish_record(context, label, xml, files, timeout_seconds=timeout_seconds, xsi_type=MODEL_XSI_TYPE)
-    except RuntimeError as error:
+    except (RuntimeError, UnicodeEncodeError) as error:
+        # UnicodeEncodeError: a card field holding a lone surrogate ("\ud800") builds fine and fails at
+        # xml.encode(); the promise is best effort, so it is an outcome, not an abort (Codex P2, round 15)
         logger.error("trained model %s not registered; the run record %s stays: %s", label, run_id, error)
         return {"label": label, "error": str(error)}
     result = {"xsi_type": MODEL_XSI_TYPE, "id": outcome["id"], "label": outcome["label"], "status": "DRAFT",
@@ -403,7 +413,7 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     try:
         note_model_on_run(context, run_id, outcome["id"], outcome["label"], timeout_seconds=min(timeout_seconds, 60.0))
         result["linked"] = True
-    except RuntimeError as error:
+    except (RuntimeError, UnicodeEncodeError) as error:
         # The model still names the run in engine_metadata_json/provenance.json; only the forward link is missing.
         logger.error("model %s registered but run %s could not be noted in its results_json: %s", outcome["id"], run_id, error)
         result["link_error"] = str(error)

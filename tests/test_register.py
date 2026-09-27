@@ -217,6 +217,13 @@ def test_collection_label_carries_the_session_and_trims_only_the_model():
     long = collection_label("A" * 80, "2", when, session_label="RSNA260904145051_0002")
     assert len(long) <= LABEL_MAX and long.endswith("_RSNA260904145051_0002_scan2_20260906T201135Z")
     assert collection_label("!!!", "2", when, session_label="S/1") == "SEG_S_1_scan2_20260906T201135Z"
+    # the reserve holds at the boundary: a 35-character scan id with reserve 7 must leave a 57-character
+    # label at most, stamp intact, and a longer id gives up its own tail, never the stamp (round 15)
+    for scan in ("s" * 35, "s" * 36, "s" * 60):
+        label = collection_label("merlin", scan, when, session_label="RSNA0001", reserve=len("_record"))
+        assert len(label) <= LABEL_MAX - len("_record"), (scan, label)
+        assert label.endswith("_20260906T201135Z") and label.startswith("m")
+    assert len(collection_label("merlin", "s" * 80, when)) <= LABEL_MAX
 
 
 def test_fetch_session_label_falls_back_to_the_id(caplog):

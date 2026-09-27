@@ -870,6 +870,44 @@ def test_an_empty_model_card_is_still_uploaded_and_named(cs, tmp_path, monkeypat
     assert read_model_card(inp, ["model-card.json"]) == {} and model_card_path(inp, ["model-card.json"]) is not None, "unreadable: no metadata, but the file is there"
     (inp / "model-card.json").write_bytes(b"")
     assert model_card_path(inp, ["model-card.json"]) is None, "zero bytes: XNAT would refuse the upload, so no card is advertised (round 12)"
+    # only the exact basename is the card: a look-alike in a broad view is not (round 15)
+    from segwrapup.model import is_model_card
+    (bare / "backup-model-card.json").write_text(json.dumps({"model": "old"}))
+    assert not is_model_card("backup-model-card.json") and is_model_card("fold-0/model-card.json")
+    assert model_card_path(bare, ["backup-model-card.json", "segmentation_spleen.pt"]) is None
+    assert read_model_card(bare, ["backup-model-card.json"]) == {}
+
+
+def test_a_look_alike_card_name_in_the_model_view_is_a_weight_file_not_the_card(cs, tmp_path, monkeypatch):
+    """`backup-model-card.json` sorts before `model-card.json` in a broad MODEL view; it must neither
+    supply the metadata nor be uploaded under the canonical name (Codex P2, PR #21 round 15)."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "backup-model-card.json").write_text(json.dumps({"model": "stale", "labels": {"liver": 1}}))
+    _training_env(monkeypatch, host, {"XNW_RESOURCE_MODEL": "*.pt,*.json"})
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    model_xml = creates[1]["body"].decode()
+    assert "<analysis:model_name>segmentation_spleen</analysis:model_name>" in model_xml and "stale" not in model_xml
+    uploads = sorted(c["path"].split("?")[0] for c in handler.calls if c["method"] == "PUT" and "/resources/MODEL" in c["path"])
+    assert "/data/experiments/XNAT_E88888/resources/MODEL_CARD/files/model-card.json" in uploads
+    assert "/data/experiments/XNAT_E88888/resources/MODEL/files/backup-model-card.json" in uploads, "a view file, so it rides with the weights"
+    assert "/data/experiments/XNAT_E88888/resources/MODEL/files/model-card.json" not in uploads
+
+
+def test_a_card_field_the_xml_cannot_encode_is_a_registration_error_not_an_abort(cs, tmp_path, monkeypatch):
+    """A lone surrogate in a card field builds fine and fails at xml.encode(); the best-effort promise
+    means an error in the outcome and a written manifest, not an aborted wrapup (Codex P2, PR #21 round 15)."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "model-card.json").write_text('{"model_framework": "monailabel", "model": "\\ud800", "labels": {"spleen": 1}}')
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777"
+    assert "surrogates not allowed" in manifest["trained_model"]["error"] or "codec can't encode" in manifest["trained_model"]["error"]
+    creates = [c["path"] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert len(creates) == 1, "the run record only; no model asset"
 
 
 def test_a_zero_byte_model_card_is_not_advertised(cs, tmp_path, monkeypatch):
