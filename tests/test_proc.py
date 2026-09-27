@@ -787,6 +787,10 @@ def test_num_classes_comes_from_the_label_indices_not_the_number_of_names():
     assert _best_dice({"best_metric": 10 ** 400}) is None and _best_dice({"best_metric": 1}) == 1.0 and _best_dice({"best_metric": True}) is None
     assert _best_dice({"train_stats": {"best_metric": float("nan")}, "best_validation_dice": 0.7}) == 0.7 and _best_dice({"best_metric": float("nan")}) is None, "NaN is no dice"
     assert _best_dice({"train_stats": {"best_metric": 0.91}}) == 0.91
+    # a finite value outside [0, 1] is a loss or a count under the generic key, not a Dice (round 11)
+    assert _best_dice({"best_metric": 12}) is None and _best_dice({"best_metric": -0.5}) is None and _best_dice({"best_metric": 1.0000001}) is None
+    assert _best_dice({"best_validation_dice": 7, "best_metric": 0.5}) == 0.5, "the out-of-range key is skipped, the next one read"
+    assert _best_dice({"best_metric": 0.0}) == 0.0 and _best_dice({"best_metric": 1}) == 1.0
     assert num_classes({"top": 65535}) == 65536 and num_classes({"over": 65536}) is None
 
 
@@ -831,3 +835,53 @@ def test_engine_metadata_is_bounded_to_the_schema_cap(caplog):
     reduced = json.loads(bounded_engine_metadata(huge))
     assert reduced == {**link, "truncated": ["app", "base_model"]}
     assert len(json.dumps(reduced)) <= ENGINE_METADATA_MAX
+
+
+def test_an_empty_model_card_is_still_uploaded_and_named(cs, tmp_path, monkeypatch):
+    """`{}` is a valid card with no metadata: the file the MODEL view selected goes on MODEL_CARD and
+    the record names the resource; only the metadata-derived fields are absent (Codex P2, PR #21 round 11)."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "model-card.json").write_text("{}")
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    model_xml = creates[1]["body"].decode()
+    assert "<analysis:model_card_resource_label>MODEL_CARD</analysis:model_card_resource_label>" in model_xml
+    assert "<analysis:label_names>" not in model_xml and "<analysis:best_validation_dice>" not in model_xml
+    uploads = [c["path"].split("?")[0] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/experiments/XNAT_E88888/resources/")]
+    assert "/data/experiments/XNAT_E88888/resources/MODEL_CARD/files/model-card.json" in uploads
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["trained_model"]["model_card"] is True
+    # no card file at all: no MODEL_CARD resource, and the record does not name one
+    from segwrapup.model import model_card_path, read_model_card
+    bare = tmp_path / "bare"; bare.mkdir(); (bare / "segmentation_spleen.pt").write_bytes(b"w")
+    assert model_card_path(bare, ["segmentation_spleen.pt"]) is None and read_model_card(bare, ["segmentation_spleen.pt"]) == {}
+    assert model_card_path(inp, ["segmentation_spleen.pt"]) == inp / "model-card.json", "the DERIVED-root fallback"
+    assert model_card_path(inp, ["model-card.json"]) == inp / "model-card.json"
+    (inp / "model-card.json").write_text("not json")
+    assert read_model_card(inp, ["model-card.json"]) == {} and model_card_path(inp, ["model-card.json"]) is not None, "unreadable: no metadata, but the file is there"
+
+
+def test_run_data_fields_of_the_wrong_shape_are_a_link_error_not_an_abort(cs, tmp_path, monkeypatch):
+    """A null or list data_fields on the run record must surface as link_error in the outcome
+    (RuntimeError, which register_trained_model handles), not an AttributeError after run and model
+    exist (Codex P2, PR #21 round 11)."""
+    import urllib.request
+    from segwrapup.model import _record_fields
+    from segwrapup.register import XnatContext
+    host, handler = cs
+    context = XnatContext(host=host, user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    real = urllib.request.urlopen
+    class Answer:
+        def __init__(self, body): self.body = body
+        def read(self): return self.body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    for shape in (None, ["a", "b"], "text"):
+        monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None, s=shape: Answer(json.dumps({"items": [{"data_fields": s}]}).encode()))
+        with pytest.raises(RuntimeError, match="data_fields is .*, not an object"):
+            _record_fields(context, "XNAT_E77777", 5.0)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(json.dumps({"items": [{"data_fields": {"results_json": "{}"}}]}).encode()))
+    assert _record_fields(context, "XNAT_E77777", 5.0) == {"results_json": "{}"}
+    monkeypatch.setattr(urllib.request, "urlopen", real)

@@ -292,7 +292,7 @@ session, where the reviewer looks. A FAILED record never satisfies a prerequisit
 A subject-scoped wrapper (plan D26: `<app>-subject` beside `<app>-session`) mounts the project
 archive through a derived Project input, because a Subject has no directory of its own. Its
 records mount is a second Project input carrying `via-setup-command
-xnatworks/record-fetch:0.7.0:record-fetch-subject`, which is `record-fetch --no-passthrough`
+xnatworks/record-fetch:0.7.1:record-fetch-subject`, which is `record-fetch --no-passthrough`
 (`commands/record-fetch-subject.json`, the same image): the prerequisites are resolved on every
 session of the subject and written to `prereq/<name>/<session label>/`, and nothing is passed
 through, since passing the archive through would copy it. Register it beside `record-fetch`

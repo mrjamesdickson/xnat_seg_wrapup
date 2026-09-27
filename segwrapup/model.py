@@ -70,19 +70,28 @@ def model_label(dataset_label: str, when: datetime | None = None, run_id: str | 
     return head[: LABEL_MAX - len(tail)] + tail
 
 
-def read_model_card(root: Path, names: list[str]) -> dict:
+def model_card_path(root: Path, names: list[str]) -> Path | None:
     """The tool's ``model-card.json`` when it is among the MODEL view files or at the DERIVED
-    root; ``{}`` otherwise. A broken card is logged and ignored: the weights still register."""
+    root, whatever it contains; None when there is no such file. Presence is tracked apart from
+    content: an empty ``{}`` card is still the tool's card and goes on MODEL_CARD (Codex P2, PR #21
+    round 11)."""
     candidates = [root / n for n in names if n.endswith(MODEL_CARD_FILENAME)] + [root / MODEL_CARD_FILENAME]
-    for path in candidates:
-        if path.is_file():
-            try:
-                data = json.loads(path.read_text())
-                return data if isinstance(data, dict) else {}
-            except (ValueError, OSError) as error:
-                logger.warning("%s is not readable JSON (%s); the model registers without it", path.name, error)
-                return {}
-    return {}
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def read_model_card(root: Path, names: list[str]) -> dict:
+    """The metadata in the tool's ``model-card.json`` (:func:`model_card_path`); ``{}`` when there
+    is no card or it holds no object. A broken card is logged and ignored: the weights still
+    register, and the file still goes on MODEL_CARD."""
+    path = model_card_path(root, names)
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (ValueError, OSError) as error:
+        logger.warning("%s is not readable JSON (%s); the model registers without its metadata", path.name, error)
+        return {}
 
 
 def _best_dice(card: dict) -> float | None:
@@ -92,11 +101,15 @@ def _best_dice(card: dict) -> float | None:
         if isinstance(value, bool):
             continue
         # a Dice is in [0, 1]; a 400-digit JSON integer would overflow float() while the model XML is
-        # built, after the run record was published (Codex P2, PR #21 round 9): bound before converting
+        # built, after the run record was published (Codex P2, PR #21 round 9): bound before converting.
+        # A finite value outside [0, 1] (a loss, an epoch count under the generic best_metric) is not
+        # a Dice and is not published as one (round 11).
         if isinstance(value, int) and -1_000_000 <= value <= 1_000_000:
-            return float(value)
+            value = float(value)
         if isinstance(value, float) and math.isfinite(value):
-            return value
+            if 0.0 <= value <= 1.0:
+                return value
+            logger.warning("%s %r is outside [0, 1]; not a Dice, not recorded as best_validation_dice", key, value)
     return None
 
 
@@ -189,8 +202,10 @@ def bounded_engine_metadata(meta: dict) -> str:
 
 
 def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, contract: dict,
-                    weights: list[str], dataset_facts: dict, when: datetime | None = None, created_by: str | None = None) -> str:
+                    weights: list[str], dataset_facts: dict, when: datetime | None = None, created_by: str | None = None,
+                    model_card: bool | None = None) -> str:
     now = when or datetime.now(timezone.utc)
+    has_card = bool(card) if model_card is None else model_card   # the file's presence, not its content
     labels = card.get("labels") if isinstance(card.get("labels"), dict) else {}
     framework = card.get("model_framework") or contract.get("analysis_type") or ""
     model_name = card.get("model") or contract.get("pipeline") or "model"
@@ -221,7 +236,7 @@ def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, c
         _element("num_classes", num_classes(labels)),
         _element("best_validation_dice", _best_dice(card)),
         _element("model_resource_label", MODEL_ROLE),
-        _element("model_card_resource_label", MODEL_CARD_ROLE if card else None),
+        _element("model_card_resource_label", MODEL_CARD_ROLE if has_card else None),
         _element("provenance_resource_label", PROVENANCE_ROLE),
         _element("default_checkpoint", default_checkpoint(card.get("default_checkpoint"), weights)),
         _element("task_type", card.get("task_type")),
@@ -247,9 +262,14 @@ def _record_fields(context: XnatContext, run_id: str, timeout: float) -> dict:
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError) as error:
         raise RuntimeError(f"GET {url.split('?')[0]} failed: {error}") from error
     try:
-        return payload["items"][0]["data_fields"]
+        fields = payload["items"][0]["data_fields"]
     except (KeyError, IndexError, TypeError) as error:
         raise RuntimeError(f"GET {url.split('?')[0]}: no data_fields in the answer") from error
+    if not isinstance(fields, dict):
+        # valid JSON of the wrong shape must be the RuntimeError register_trained_model handles, not
+        # an AttributeError out of note_model_on_run after run and model exist (Codex P2, round 11)
+        raise RuntimeError(f"GET {url.split('?')[0]}: data_fields is {type(fields).__name__}, not an object")
+    return fields
 
 
 def _username(context: XnatContext, timeout: float) -> str:
@@ -323,13 +343,14 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
         return {"error": f"no {MODEL_ROLE} view files on DERIVED"}
     root = output_dir / derived_root if derived_root else output_dir
     card = read_model_card(root, (views or {}).get(MODEL_ROLE, []))
+    card_path = model_card_path(root, (views or {}).get(MODEL_ROLE, []))
     label = model_label(dataset_facts.get("label") or context.dataset, run_id=run_id)
     # view-relative names, not basenames: fold-0/best.pt and fold-1/best.pt are two files, and
     # default_checkpoint must name a path that exists on the MODEL resource (Codex P1, PR #21)
     weights = [n.replace(os.sep, "/") for n in names]
     files: dict[str, list[RecordFile]] = {MODEL_ROLE: [RecordFile(root / n, w) for n, w in zip(names, weights)]}
-    if card:
-        card_path = next((root / n for n in (views or {}).get(MODEL_ROLE, []) if n.endswith(MODEL_CARD_FILENAME)), root / MODEL_CARD_FILENAME)
+    if card_path is not None:
+        # the tool's card goes up whatever it says, an empty {} included (Codex P2, PR #21 round 11)
         files[MODEL_CARD_ROLE] = [RecordFile(card_path, MODEL_CARD_FILENAME)]
     provenance = {"registered_by": "proc-wrapup", "source_run_id": run_id, "source_run_type": "analysis:groupAnalysisData",
                   "source_run_label": run_outcome.get("label"),
@@ -341,14 +362,14 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     (scratch / "provenance.json").write_text(json.dumps(provenance, indent=2))
     files[PROVENANCE_ROLE] = [RecordFile(scratch / "provenance.json", "provenance.json")]
     xml = build_model_xml(context, label, run_id, card, contract, weights, dataset_facts,
-                          created_by=_username(context, min(timeout_seconds, 30.0)))
+                          created_by=_username(context, min(timeout_seconds, 30.0)), model_card=card_path is not None)
     try:
         outcome = publish_record(context, label, xml, files, timeout_seconds=timeout_seconds, xsi_type=MODEL_XSI_TYPE)
     except RuntimeError as error:
         logger.error("trained model %s not registered; the run record %s stays: %s", label, run_id, error)
         return {"label": label, "error": str(error)}
     result = {"xsi_type": MODEL_XSI_TYPE, "id": outcome["id"], "label": outcome["label"], "status": "DRAFT",
-              "weights": weights, "model_card": bool(card), "source_run_id": run_id, "linked": False}
+              "weights": weights, "model_card": card_path is not None, "source_run_id": run_id, "linked": False}
     try:
         note_model_on_run(context, run_id, outcome["id"], outcome["label"], timeout_seconds=min(timeout_seconds, 60.0))
         result["linked"] = True
