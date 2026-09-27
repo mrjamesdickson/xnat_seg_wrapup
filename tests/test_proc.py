@@ -1090,6 +1090,34 @@ def test_the_run_link_is_keyed_on_the_accession_resolved_from_the_lookup(monkeyp
     assert "put" not in seen
 
 
+def test_the_link_document_stays_under_the_cap_when_the_runs_results_cannot_be_parsed(monkeypatch):
+    """The link step re-reads the run'"'"'s ``results_json`` and keeps what it cannot parse as raw text.
+    That value is not reduced by the view counts, so the merged document stayed over the 65,536-character
+    schema cap, XNAT refused the PUT, and the run was left without its forward link to the model that had
+    just been registered (Codex P2, PR #21 round 30)."""
+    import urllib.request
+    from segwrapup import model
+    from segwrapup.publish import RESULTS_JSON_MAX
+    from segwrapup.register import XnatContext
+    context = XnatContext(host="http://x", user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    seen = {}
+    class Answer:
+        def __init__(self, body): self.body = body
+        def read(self): return self.body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    unparseable = "[" * 100000 + "]" * 100000   # valid JSON, nested past the parser'"'"'s limit: kept raw
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(
+        json.dumps({"items": [{"data_fields": {"ID": "XNAT_E77777", "label": "run_x", "results_json": unparseable}}]}).encode()))
+    monkeypatch.setattr(model, "_put", lambda ctx, url, body, ctype, timeout: (seen.update(xml=body.decode()), (200, "XNAT_E77777"))[1])
+    assert model.note_model_on_run(context, "XNAT_E77777", "XNAT_E88888", "model_x") == "XNAT_E77777"
+    written = seen["xml"].split("<analysis:results_json>")[1].split("</analysis:results_json>")[0]
+    results = json.loads(written.replace("&quot;", '"').replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"))
+    assert len(json.dumps(results)) <= RESULTS_JSON_MAX, "the document XNAT is asked to store is within the cap"
+    assert results["trained_model"]["id"] == "XNAT_E88888", "and it carries the forward link, which is the point of the PUT"
+    assert results["truncated"] == ["results_raw"] and "results_raw" not in results
+
+
 def test_fallback_labels_are_resolved_to_accessions_before_the_model_names_the_run_or_the_run_the_model(tmp_path, monkeypatch):
     """publish_record hands back a label when XNAT's create answers no id. The model's reverse link
     (engine_metadata_json.source_run_id, provenance.json) and the run's forward link

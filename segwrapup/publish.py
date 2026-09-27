@@ -147,20 +147,52 @@ def scope_provenance(context: XnatContext, caller_inputs: dict) -> dict | None:
     return None
 
 
+#: What a bounded ``results_json`` keeps whatever else has to go: ``trained_model`` is the run's only
+#: forward link to the model it produced, and nothing else holds it (Codex P2, PR #21 round 30).
+RESULTS_KEPT_KEYS = ("trained_model",)
+
+
 def bounded_results_json(summary: dict) -> str:
     """``results_json`` under the schema cap. The per-role file lists are counts (the files
     are enumerable on the record's resources); if the view lists alone still overrun, they
     become counts too and ``truncated`` names what was dropped, so a consumer knows to read
-    ``PROVENANCE/wrapup.json`` for the full mapping."""
+    ``PROVENANCE/wrapup.json`` for the full mapping.
+
+    Reducing the views is not enough on its own. The link step re-reads the run's existing
+    ``results_json`` and merges ``trained_model`` into it, and a value it could not parse is kept as
+    raw text (:func:`segwrapup.model._current_results`): the view counts do not touch that, so the
+    document could stay over the cap, XNAT would refuse the whole PUT, and the run would be left
+    without its forward link to the model that was just registered (Codex P2, PR #21 round 30). So
+    whatever still overruns is dropped, largest value first, until the document fits. Everything
+    droppable was written by this run and its full form is in ``PROVENANCE/wrapup.json`` on the same
+    record; ``truncated`` names it."""
     text = json.dumps(summary)
     if len(text) <= RESULTS_JSON_MAX:
         return text
     reduced = dict(summary)
-    reduced["views"] = {role: len(paths) for role, paths in (summary.get("views") or {}).items()}
-    reduced["truncated"] = ["views"]
-    logger.warning("results_json would be %d characters (cap %d); the view file lists are replaced by counts, "
-                   "the full mapping stays in PROVENANCE/wrapup.json", len(text), RESULTS_JSON_MAX)
-    return json.dumps(reduced)
+    dropped: list[str] = []
+    if summary.get("views"):
+        reduced["views"] = {role: len(paths) for role, paths in (summary.get("views") or {}).items()}
+        dropped.append("views")
+        logger.warning("results_json would be %d characters (cap %d); the view file lists are replaced by counts, "
+                       "the full mapping stays in PROVENANCE/wrapup.json", len(text), RESULTS_JSON_MAX)
+    reduced["truncated"] = dropped
+    text = json.dumps(reduced)
+    while len(text) > RESULTS_JSON_MAX:
+        removable = [(len(json.dumps(value)), key) for key, value in reduced.items()
+                     if key != "truncated" and key not in RESULTS_KEPT_KEYS]
+        if not removable:
+            logger.error("results_json is %d characters with only %s left (cap %d); XNAT will refuse it",
+                         len(text), list(RESULTS_KEPT_KEYS), RESULTS_JSON_MAX)
+            break
+        biggest = max(removable)[1]
+        del reduced[biggest]
+        dropped.append(biggest)
+        reduced["truncated"] = dropped
+        logger.warning("results_json is %d characters, still over the cap of %d; %s is left off (it is in "
+                       "PROVENANCE/wrapup.json)", len(text), RESULTS_JSON_MAX, biggest)
+        text = json.dumps(reduced)
+    return text
 
 ANALYSIS_NS = "http://xnatworks.io/analysis"
 XNAT_NS = "http://nrg.wustl.edu/xnat"

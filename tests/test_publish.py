@@ -890,6 +890,25 @@ def test_results_json_stays_under_the_schema_cap_on_a_big_tree(tmp_path, caplog)
     # a small tree keeps its view paths verbatim
     small = json.loads(bounded_results_json({"views": {"METRICS": ["a.json"]}, "file_counts": {"DERIVED": 1}}))
     assert small["views"] == {"METRICS": ["a.json"]} and "truncated" not in small
+    # the view counts do not touch a value the link step could not parse and kept as raw text, so the
+    # document stayed over the cap, XNAT refused the whole PUT, and the run lost its only forward link
+    # to the model that had just been registered (Codex P2, PR #21 round 30)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        bounded = json.loads(bounded_results_json({"results_raw": "x" * 200000, "views": {"METRICS": ["a.json"]},
+                                                   "trained_model": {"id": "XNAT_E1", "label": "model_x"}}))
+    assert len(json.dumps(bounded)) <= RESULTS_JSON_MAX
+    assert bounded["trained_model"] == {"id": "XNAT_E1", "label": "model_x"}, "the forward link is what must survive"
+    assert "results_raw" not in bounded and bounded["truncated"] == ["views", "results_raw"]
+    assert "is left off" in caplog.text
+    # nothing to reduce first: the overrunning value is named on its own
+    only_raw = json.loads(bounded_results_json({"results_raw": "y" * 100000, "trained_model": {"id": "XNAT_E2"}}))
+    assert only_raw["truncated"] == ["results_raw"] and only_raw["trained_model"] == {"id": "XNAT_E2"}
+    # and the pathological case, the link itself over the cap: said plainly rather than written silently
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        kept = json.loads(bounded_results_json({"trained_model": {"id": "x" * 100000}}))
+    assert kept["trained_model"]["id"] == "x" * 100000 and "XNAT will refuse it" in caplog.text
 
 
 def test_create_409_at_subject_scope_relabels_the_subject_document(xnat, tmp_path):
