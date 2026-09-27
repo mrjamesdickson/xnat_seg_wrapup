@@ -778,6 +778,12 @@ def test_a_generated_model_label_names_its_run_so_two_runs_in_one_second_do_not_
     assert a != b and "trainerA" in a and "trainerB" in b and len(a) <= 64
     assert model_label("ds", when, run_id="CENTRAL_E7").endswith("_E7") and model_label("ds", when, run_id="XNAT_E26051").endswith("_E26051")
     assert model_label("ds", when, run_id="XNAT_E26051x").endswith("_XNAT_E26051x"), "not an accession id: kept whole"
+    # a site prefix with _, - or . is still an accession id (round 18)
+    from segwrapup.model import _ACCESSION_ID
+    for site_id in ("MY_SITE_E123", "my-site.v2_E7", "A_E1"):
+        assert _ACCESSION_ID.match(site_id), site_id
+    assert model_label("ds", when, run_id="MY_SITE_E123").endswith("_E123") and model_label("ds", when, run_id="my-site.v2_E7").endswith("_E7")
+    assert not _ACCESSION_ID.match("_E1") and not _ACCESSION_ID.match("trainerA_ds_20260926T221538Z_record")
 
 
 def test_num_classes_comes_from_the_label_indices_not_the_number_of_names():

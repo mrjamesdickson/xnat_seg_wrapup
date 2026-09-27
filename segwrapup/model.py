@@ -54,7 +54,10 @@ _LABEL_SAFE = re.compile(r"[^A-Za-z0-9_-]+")
 RUN_TOKEN_MAX = 20   # of the 64: the stamp takes 17, leaving at least 26 for the dataset head
 
 
-_ACCESSION_ID = re.compile(r"^[A-Za-z0-9]+_E\d+$")   # <site id>_E<number>, XNAT's experiment accession id
+#: ``<site id>_E<number>``, XNAT's experiment accession id. The site id is whatever the site configured
+#: and may carry ``_``, ``-`` or ``.`` (``MY_SITE_E123``), the same token characters
+#: ``publish.created_record_id`` accepts (Codex P2, PR #21 round 18).
+_ACCESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*_E\d+$")
 
 
 def model_label(dataset_label: str, when: datetime | None = None, run_id: str | None = None) -> str:
@@ -69,7 +72,7 @@ def model_label(dataset_label: str, when: datetime | None = None, run_id: str | 
     # trainerB_ds_stamp_record the same model label (Codex P2, PR #21 round 11)
     token = run_id or ""
     if _ACCESSION_ID.match(token):
-        token = token.split("_", 1)[1]
+        token = "E" + token.rsplit("_E", 1)[1]   # the whole site prefix goes, whatever it contains
     run = _LABEL_SAFE.sub("_", token).strip("_")
     if len(run) > RUN_TOKEN_MAX:
         # publish_record falls back to the run's label as its id when XNAT answers no id; a label can
