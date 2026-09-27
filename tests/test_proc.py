@@ -853,6 +853,12 @@ def test_engine_metadata_is_bounded_to_the_schema_cap(caplog):
     assert "Infinity" not in text and "NaN" not in text
     strict = json.loads(text, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
     assert strict["train_stats"] == {"best_metric": None, "loss": [0.5, None]} and strict["non_finite_values_replaced"] == 2 and strict["val_split"] == 0.2
+    # nested past the recursion limit: the run link survives, the rest is named as dropped (round 20)
+    deep = {}
+    for _ in range(3000):
+        deep = {"n": deep}
+    text = bounded_engine_metadata({"app": "radiology", "train_stats": deep, **link})
+    assert json.loads(text) == {**link, "truncated": ["app", "train_stats"]}
 
 
 def test_an_empty_model_card_is_still_uploaded_and_named(cs, tmp_path, monkeypatch):
@@ -1059,3 +1065,20 @@ def test_fallback_labels_are_resolved_to_accessions_before_the_model_names_the_r
     result = model.register_trained_model(context, out, "raw", {"id": "run_lbl_y", "label": "run_lbl_y"}, "SUCCEEDED",
                                           {"MODEL": ["segmentation_spleen.pt"]}, {"pipeline": "monailabel-train"}, {"label": "ds"})
     assert "accession id could not be resolved" in result["error"]
+
+
+def test_a_card_nested_past_the_recursion_limit_is_a_registration_outcome_not_an_abort(cs, tmp_path, monkeypatch):
+    """build_model_xml runs inside the guarded block now: whatever the card does to the document
+    builder ends as trained_model.error with the manifest written (Codex P2, PR #21 round 20)."""
+    from segwrapup import model
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    _training_env(monkeypatch, host)
+    def exploding(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+    monkeypatch.setattr(model, "build_model_xml", exploding)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777" and "recursion depth" in manifest["trained_model"]["error"]
+    creates = [c["path"] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert len(creates) == 1

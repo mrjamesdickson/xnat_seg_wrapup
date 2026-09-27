@@ -202,7 +202,14 @@ def bounded_engine_metadata(meta: dict) -> str:
     (Codex P2, PR #21 round 10): first the ``train_stats`` lists and nested objects go (the
     scalars, best metric and epoch, stay), then ``train_stats`` as a whole, then everything but
     the run link. ``truncated`` names what was dropped; the full card is on ``MODEL_CARD``."""
-    meta, replaced = _finite_json(meta)
+    try:
+        meta, replaced = _finite_json(meta)
+    except RecursionError:
+        # a card nested a thousand objects deep is no metadata a consumer can use; the run link is
+        # kept and the rest named as dropped, the full card stays on MODEL_CARD (round 20)
+        dropped = sorted(k for k in meta if k not in LINK_KEYS)
+        logger.warning("engine_metadata_json is nested past the recursion limit; only the run link is kept, %s left off", dropped)
+        return json.dumps({**{k: meta[k] for k in LINK_KEYS if k in meta}, "truncated": dropped}, allow_nan=False)
     if replaced:
         # a JSON number that overflowed to infinity, or a NaN the decoder accepted, would be written as
         # the non-standard token Infinity/NaN and strict consumers could not parse the metadata (round 19)
@@ -473,15 +480,16 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     scratch = Path(tempfile.mkdtemp(prefix="proc-wrapup-model-"))
     (scratch / "provenance.json").write_text(json.dumps(provenance, indent=2))
     files[PROVENANCE_ROLE] = [RecordFile(scratch / "provenance.json", "provenance.json")]
-    xml = build_model_xml(context, label, run_id, card, contract, weights, dataset_facts,
-                          created_by=_username(context, min(timeout_seconds, 30.0)), model_card=card_path is not None)
     try:
+        # built inside the guard: a card the document cannot be made from (a lone surrogate that fails
+        # at xml.encode(), metadata nested past the recursion limit) is an outcome, not an abort
+        # after the run record exists (Codex P2, rounds 15 and 20)
+        xml = build_model_xml(context, label, run_id, card, contract, weights, dataset_facts,
+                              created_by=_username(context, min(timeout_seconds, 30.0)), model_card=card_path is not None)
         outcome = publish_record(context, label, xml, files, timeout_seconds=timeout_seconds, xsi_type=MODEL_XSI_TYPE)
-    except (RuntimeError, UnicodeEncodeError) as error:
-        # UnicodeEncodeError: a card field holding a lone surrogate ("\ud800") builds fine and fails at
-        # xml.encode(); the promise is best effort, so it is an outcome, not an abort (Codex P2, round 15)
+    except (RuntimeError, UnicodeEncodeError, RecursionError, ValueError, TypeError) as error:
         logger.error("trained model %s not registered; the run record %s stays: %s", label, run_id, error)
-        return {"label": label, "error": str(error)}
+        return {"label": label, "error": str(error) if isinstance(error, RuntimeError) else f"{type(error).__name__}: {error}"}
     result = {"xsi_type": MODEL_XSI_TYPE, "id": outcome["id"], "label": outcome["label"], "status": "DRAFT",
               "weights": weights, "model_card": card_path is not None, "source_run_id": run_id, "linked": False}
     try:
