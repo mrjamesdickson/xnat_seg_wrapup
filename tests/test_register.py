@@ -311,7 +311,10 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
                "XNAT_D7": (["analysis:analysisDatasetData"], {"label": "listy", "included_count": 3}),   # meta of the wrong shape
                "XNAT_D8": ("analysis:analysisDatasetData", {"label": "huge", "included_count": 1e309}),   # decodes as infinity
                "XNAT_D9x": ("analysis:analysisDatasetData", {"label": "frac", "included_count": 2.5}),
-               "XNAT_D10": ("analysis:analysisDatasetData", {"label": "whole", "included_count": 12.0})}
+               "XNAT_D10": ("analysis:analysisDatasetData", {"label": "whole", "included_count": 12.0}),
+               # a JSON string holding an unpaired surrogate: Python decodes it, and every write of it
+               # raises UnicodeEncodeError after the run (Codex P2, PR #21 round 33)
+               "XNAT_D12": ("analysis:analysisDatasetData", {"label": "\ud800cohort", "included_count": 3})}
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -356,6 +359,10 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
             assert fetch_dataset_facts(ctx("XNAT_D8")) == {"label": "huge"}, "1e309 is infinity: no OverflowError out of the best-effort reader (round 14)"
             assert fetch_dataset_facts(ctx("XNAT_D9x")) == {"label": "frac"}
             assert fetch_dataset_facts(ctx("XNAT_D10")) == {"label": "whole", "included_count": 12}
+            surrogate = fetch_dataset_facts(ctx("XNAT_D12"))
+            assert surrogate == {"label": "\\ud800cohort", "included_count": 3}, "readable, and writable at all"
+            surrogate["label"].encode()   # what the report, the record XML and wrapup.json all do
+            assert fetch_dataset_label(ctx("XNAT_D12")) == "\\ud800cohort"
         from segwrapup.register import COUNT_MAX, _whole_count
         assert _whole_count(COUNT_MAX) == COUNT_MAX and _whole_count(str(COUNT_MAX)) == COUNT_MAX and _whole_count(float(2**31 - 1)) == COUNT_MAX
         for bad in (10 ** 400, str(10 ** 400), COUNT_MAX + 1, float(2**31), -1, True):   # a 400-digit literal is not a count (round 16)
@@ -366,6 +373,7 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
         assert "is a xnat:mrSessionData, not an analysis:analysisDatasetData" in caplog.text
         assert "non-numeric included_count" in caplog.text
         assert "could not read dataset XNAT_D9" in caplog.text
+        assert "cannot be encoded as UTF-8" in caplog.text
         assert fetch_dataset_facts(XnatContext(host=host, user="u", password="p", project="P1", session="XNAT_E1")) == {}
     finally:
         server.shutdown()

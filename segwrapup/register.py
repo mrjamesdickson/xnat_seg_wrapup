@@ -190,6 +190,24 @@ def collection_label(model_name: str, scan: str, when: datetime | None = None, s
     return label[:limit]
 
 
+def _encodable(value: str, what: str) -> str:
+    """``value`` with anything that cannot be encoded as UTF-8 written out as its escape. XNAT can
+    answer a JSON string holding a lone surrogate (``"\ud800"``, which the group-level plugin would
+    have to have stored, but the reader cannot assume it did not): Python decodes it happily and then
+    every *write* of it raises UnicodeEncodeError — the HTML report, the record XML, ``wrapup.json`` —
+    after the run has finished and before the record is published, so a whole run would lose its record
+    over a label (Codex P2, PR #21 round 33). These readers are best effort by contract, so the label
+    comes back readable and diagnosable (``\\ud800``) rather than unwritable. The offending value is
+    never logged: writing it to a log stream raises the same error."""
+    try:
+        value.encode()
+        return value
+    except UnicodeEncodeError:
+        cleaned = value.encode(errors="backslashreplace").decode()
+        logger.warning("the %s cannot be encoded as UTF-8 (it holds an unpaired surrogate); using %r", what, cleaned)
+        return cleaned
+
+
 def fetch_target_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:
     """The label of what the run belongs to: the session's, the subject's at subject scope, the
     dataset's at dataset scope."""
@@ -232,7 +250,7 @@ def fetch_dataset_facts(context: XnatContext, timeout_seconds: float = 60.0) -> 
         # RecursionError: valid JSON nested past the parser's limit, before the record is published (round 27)
         logger.warning("could not read dataset %s (%s); the record names the id and no member count", context.dataset, error)
         return {}
-    facts = {"label": str(fields.get("label") or "").strip()}
+    facts = {"label": _encodable(str(fields.get("label") or "").strip(), f"label of dataset {context.dataset}")}
     count = fields.get("included_count")
     if count not in (None, ""):
         try:
@@ -284,7 +302,8 @@ def fetch_subject_label(context: XnatContext, timeout_seconds: float = 60.0) -> 
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             payload = json.loads(response.read().decode())
-        label = str(payload["items"][0]["data_fields"].get("label") or "").strip()
+        label = _encodable(str(payload["items"][0]["data_fields"].get("label") or "").strip(),
+                           f"label of subject {context.subject}")
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError) as error:
         logger.warning("could not read the label of subject %s (%s); the record label carries the id instead", context.subject, error)
         return context.subject
@@ -315,7 +334,8 @@ def fetch_session_label(context: XnatContext, timeout_seconds: float = 60.0) -> 
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             payload = json.loads(response.read().decode())
-        label = str(payload["items"][0]["data_fields"].get("label") or "").strip()
+        label = _encodable(str(payload["items"][0]["data_fields"].get("label") or "").strip(),
+                           f"label of session {context.session}")
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError) as error:
         logger.warning("could not read the label of session %s (%s); the record label carries the id instead", context.session, error)
         return context.session
