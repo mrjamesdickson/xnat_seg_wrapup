@@ -192,8 +192,11 @@ def collection_label(model_name: str, scan: str, when: datetime | None = None, s
 
 def _encodable(value: str, what: str) -> str:
     """``value`` with anything that cannot be encoded as UTF-8 written out as its escape. XNAT can
-    answer a JSON string holding a lone surrogate (``"\ud800"``, which the group-level plugin would
-    have to have stored, but the reader cannot assume it did not): Python decodes it happily and then
+    answer a JSON string holding a lone surrogate (``"\\ud800"``, written with the backslash escaped
+    because a real one in a *docstring* fails to compile on Python 3.13 and later, "surrogates not
+    allowed", and the module could then not be imported at all — this defect's own mirror image, Codex
+    P1, PR #21 round 34; the group-level plugin would have to have stored such a label, but the reader
+    cannot assume it did not): Python decodes it happily and then
     every *write* of it raises UnicodeEncodeError — the HTML report, the record XML, ``wrapup.json`` —
     after the run has finished and before the record is published, so a whole run would lose its record
     over a label (Codex P2, PR #21 round 33). These readers are best effort by contract, so the label

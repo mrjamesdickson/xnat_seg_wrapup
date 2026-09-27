@@ -379,6 +379,28 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
         server.shutdown()
 
 
+def test_no_docstring_holds_an_unencodable_character():
+    """A docstring with a lone surrogate in it compiles here but fails on Python 3.13 and later with
+    "surrogates not allowed", so the module — and every CLI that imports it — cannot be imported at all
+    there, while `pyproject.toml` accepts those versions (Codex P1, PR #21 round 34). A test string may
+    legitimately hold one, and does; a docstring may not."""
+    import ast, pathlib, segwrapup
+    checked = 0
+    for path in sorted(pathlib.Path(segwrapup.__file__).parent.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                doc = ast.get_docstring(node)
+                if doc:
+                    checked += 1
+                    try:
+                        doc.encode()
+                    except UnicodeEncodeError as error:
+                        raise AssertionError(f"{path.name}: a docstring cannot be encoded as UTF-8 "
+                                             f"({error}); it will not compile on Python 3.13") from error
+    assert checked > 50, f"only {checked} docstrings were checked; the walk is not finding them"
+
+
 def test_collection_label_reserves_room_for_a_caller_suffix():
     """proc-wrapup appends _record; without the reservation a long dataset label made a 71-character
     record label that XNAT refuses (Codex P2, PR #21)."""
