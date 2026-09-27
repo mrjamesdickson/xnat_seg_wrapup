@@ -20,6 +20,7 @@ import re
 import urllib.error
 import urllib.parse
 import json
+import math
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -229,12 +230,29 @@ def fetch_dataset_facts(context: XnatContext, timeout_seconds: float = 60.0) -> 
     count = fields.get("included_count")
     if count not in (None, ""):
         try:
-            facts["included_count"] = int(count)
-        except (TypeError, ValueError):
+            facts["included_count"] = _whole_count(count)
+        except (TypeError, ValueError, OverflowError):
+            # 1e309 decodes as infinity and int() of it raises OverflowError; 2.5 is no member count
+            # either. Best effort: the record names the id and no count (Codex P2, PR #21 round 14)
             logger.warning("dataset %s carries a non-numeric included_count %r; not recorded", context.dataset, count)
     if xsi and xsi != "analysis:analysisDatasetData":
         logger.warning("dataset %s is a %s, not an analysis:analysisDatasetData; the record still cites it", context.dataset, xsi)
     return facts
+
+
+def _whole_count(value) -> int:
+    """``included_count`` as a non-negative whole number; raises for anything else (bool, a
+    non-integral or non-finite float, text that is not an integer)."""
+    if isinstance(value, bool):
+        raise TypeError("a boolean is not a count")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{value!r} is not a whole number")
+        value = int(value)
+    count = int(value)
+    if count < 0:
+        raise ValueError(f"{count} is negative")
+    return count
 
 
 def fetch_dataset_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:

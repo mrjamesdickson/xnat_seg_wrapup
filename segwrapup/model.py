@@ -303,6 +303,26 @@ def _username(context: XnatContext, timeout: float) -> str:
     return name or context.user
 
 
+def _current_results(run_id: str, raw) -> dict:
+    """The run's ``results_json`` as a dict to merge ``trained_model`` into. XNAT answers the
+    element as a string, but a JSON-native value (a dict, a number) must not raise TypeError out
+    of the link step after run and model exist (Codex P2, PR #21 round 14): a dict is taken as is,
+    anything else that is not JSON text is kept under ``results``."""
+    if raw is None or raw == "":
+        return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not isinstance(raw, str):
+        logger.warning("run %s results_json is a %s, not text; trained_model is written beside it", run_id, type(raw).__name__)
+        return {"results": raw}
+    try:
+        current = json.loads(raw)
+    except ValueError:
+        logger.warning("run %s results_json is not JSON; trained_model is written beside its raw text", run_id)
+        return {"results_raw": raw}
+    return current if isinstance(current, dict) else {"results": current}
+
+
 def note_model_on_run(context: XnatContext, run_id: str, model_id: str, model_label: str, timeout_seconds: float = 60.0) -> None:
     """Write ``results_json.trained_model`` on the run record by a partial XML PUT keyed on the
     record's ID.
@@ -317,13 +337,7 @@ def note_model_on_run(context: XnatContext, run_id: str, model_id: str, model_la
     project and label merges into the existing record (XNAT_E26034 updated in place, no stray).
     ``results_json`` is re-read first so nothing the publish wrote is lost."""
     fields = _record_fields(context, run_id, timeout_seconds)
-    try:
-        current = json.loads(fields.get("results_json") or "{}")
-        if not isinstance(current, dict):
-            current = {"results": current}
-    except ValueError:
-        logger.warning("run %s results_json is not JSON; trained_model is written beside its raw text", run_id)
-        current = {"results_raw": fields.get("results_json")}
+    current = _current_results(run_id, fields.get("results_json"))
     current["trained_model"] = {"id": model_id, "label": model_label, "xsi_type": MODEL_XSI_TYPE, "status": "DRAFT"}
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'

@@ -911,3 +911,15 @@ def test_run_data_fields_of_the_wrong_shape_are_a_link_error_not_an_abort(cs, tm
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(json.dumps({"items": [{"data_fields": {"results_json": "{}"}}]}).encode()))
     assert _record_fields(context, "XNAT_E77777", 5.0) == {"results_json": "{}"}
     monkeypatch.setattr(urllib.request, "urlopen", real)
+
+
+def test_the_link_step_accepts_json_native_results_fields():
+    """XNAT answers results_json as text, but a dict or a number in its place must not raise TypeError
+    out of the link step after run and model exist (Codex P2, PR #21 round 14)."""
+    from segwrapup.model import _current_results
+    assert _current_results("XNAT_E1", None) == {} and _current_results("XNAT_E1", "") == {}
+    assert _current_results("XNAT_E1", '{"views": {"MODEL": ["a.pt"]}}') == {"views": {"MODEL": ["a.pt"]}}
+    assert _current_results("XNAT_E1", {"views": {}}) == {"views": {}}, "a dict is taken as is"
+    assert _current_results("XNAT_E1", 7) == {"results": 7} and _current_results("XNAT_E1", [1, 2]) == {"results": [1, 2]}
+    assert _current_results("XNAT_E1", "[1, 2]") == {"results": [1, 2]}
+    assert _current_results("XNAT_E1", "{not json") == {"results_raw": "{not json"}
