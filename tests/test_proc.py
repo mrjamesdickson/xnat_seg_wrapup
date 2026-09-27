@@ -961,3 +961,37 @@ def test_the_link_step_accepts_json_native_results_fields():
     assert _current_results("XNAT_E1", 7) == {"results": 7} and _current_results("XNAT_E1", [1, 2]) == {"results": [1, 2]}
     assert _current_results("XNAT_E1", "[1, 2]") == {"results": [1, 2]}
     assert _current_results("XNAT_E1", "{not json") == {"results_raw": "{not json"}
+
+
+def test_the_run_link_is_keyed_on_the_accession_resolved_from_the_lookup(monkeypatch):
+    """publish_record hands back the run's label as its id when XNAT answered no id; the partial XML
+    update is keyed on the accession, so the lookup goes by label under the project and the answer's
+    ID is what the document and the PUT use (Codex P2, PR #21 round 16)."""
+    import urllib.request
+    from segwrapup import model
+    from segwrapup.register import XnatContext
+    context = XnatContext(host="http://x", user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    seen = {}
+    class Answer:
+        def __init__(self, body): self.body = body
+        def read(self): return self.body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def urlopen(req, timeout=None):
+        seen["get"] = req.full_url
+        return Answer(json.dumps({"items": [{"data_fields": {"ID": "XNAT_E77777", "label": "monailabel-train_ds_20260926T221538Z_record", "results_json": "{}"}}]}).encode())
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(model, "_put", lambda ctx, url, body, ctype, timeout: (seen.update(put=url, xml=body.decode()), (200, "XNAT_E77777"))[1])
+    accession = model.note_model_on_run(context, "monailabel-train_ds_20260926T221538Z_record", "XNAT_E88888", "model_x")
+    assert accession == "XNAT_E77777"
+    assert seen["get"] == "http://x/data/projects/PROJ_1/experiments/monailabel-train_ds_20260926T221538Z_record?format=json", "a label is looked up under the project"
+    assert seen["put"].startswith("http://x/data/experiments/XNAT_E77777?") and 'ID="XNAT_E77777"' in seen["xml"]
+    # an accession id is looked up directly, as before
+    assert model.note_model_on_run(context, "XNAT_E77777", "XNAT_E88888", "model_x") == "XNAT_E77777"
+    assert seen["get"] == "http://x/data/experiments/XNAT_E77777?format=json"
+    # no resolvable accession in the answer: a link error, never a document keyed on the label
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(json.dumps({"items": [{"data_fields": {"label": "l", "results_json": "{}"}}]}).encode()))
+    seen.pop("put")
+    with pytest.raises(RuntimeError, match="accession id could not be resolved"):
+        model.note_model_on_run(context, "monailabel-train_ds_20260926T221538Z_record", "XNAT_E88888", "model_x")
+    assert "put" not in seen

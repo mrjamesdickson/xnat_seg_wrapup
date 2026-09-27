@@ -244,6 +244,11 @@ def fetch_dataset_facts(context: XnatContext, timeout_seconds: float = 60.0) -> 
     return facts
 
 
+#: ``subject_count`` is an xs:integer stored as a 32-bit column; a larger literal makes XNAT refuse
+#: the otherwise valid record, so the best-effort reader leaves it off (Codex P2, PR #21 round 16).
+COUNT_MAX = 2_147_483_647
+
+
 def _whole_count(value) -> int:
     """``included_count`` as a non-negative whole number; raises for anything else (bool, a
     non-integral or non-finite float, text that is not an integer)."""
@@ -253,9 +258,13 @@ def _whole_count(value) -> int:
         if not math.isfinite(value) or not value.is_integer():
             raise ValueError(f"{value!r} is not a whole number")
         value = int(value)
+    if isinstance(value, str) and len(value.strip()) > 12:
+        raise ValueError("too many digits for a member count")   # before int(): a 400-digit literal is not a count
     count = int(value)
     if count < 0:
         raise ValueError(f"{count} is negative")
+    if count > COUNT_MAX:
+        raise ValueError(f"{count} exceeds the schema's integer range")
     return count
 
 

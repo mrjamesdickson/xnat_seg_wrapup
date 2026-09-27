@@ -353,6 +353,11 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
             assert fetch_dataset_facts(ctx("XNAT_D8")) == {"label": "huge"}, "1e309 is infinity: no OverflowError out of the best-effort reader (round 14)"
             assert fetch_dataset_facts(ctx("XNAT_D9x")) == {"label": "frac"}
             assert fetch_dataset_facts(ctx("XNAT_D10")) == {"label": "whole", "included_count": 12}
+        from segwrapup.register import COUNT_MAX, _whole_count
+        assert _whole_count(COUNT_MAX) == COUNT_MAX and _whole_count(str(COUNT_MAX)) == COUNT_MAX and _whole_count(float(2**31 - 1)) == COUNT_MAX
+        for bad in (10 ** 400, str(10 ** 400), COUNT_MAX + 1, float(2**31), -1, True):   # a 400-digit literal is not a count (round 16)
+            with pytest.raises((ValueError, TypeError)):
+                _whole_count(bad)
         assert "meta of type list, not an object" in caplog.text
         assert "data_fields is NoneType, not an object" in caplog.text and "data_fields is list, not an object" in caplog.text
         assert "is a xnat:mrSessionData, not an analysis:analysisDatasetData" in caplog.text

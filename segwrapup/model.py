@@ -276,7 +276,14 @@ def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, c
 
 
 def _record_fields(context: XnatContext, run_id: str, timeout: float) -> dict:
-    url = f"{context.host}/data/experiments/{urllib.parse.quote(run_id, safe='')}?format=json"
+    """The run record's data_fields, looked up by accession id, or by label under the project when
+    ``run_id`` is the fallback label publish_record hands back when XNAT answered no id (Codex P2,
+    PR #21 round 16). The answer's ``ID`` is the accession the link is keyed on."""
+    if _ACCESSION_ID.match(run_id or ""):
+        url = f"{context.host}/data/experiments/{urllib.parse.quote(run_id, safe='')}?format=json"
+    else:
+        url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/experiments/"
+               f"{urllib.parse.quote(run_id, safe='')}?format=json")
     request = urllib.request.Request(url, headers=auth_headers(context))
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -331,7 +338,7 @@ def _current_results(run_id: str, raw) -> dict:
     return current if isinstance(current, dict) else {"results": current}
 
 
-def note_model_on_run(context: XnatContext, run_id: str, model_id: str, model_label: str, timeout_seconds: float = 60.0) -> None:
+def note_model_on_run(context: XnatContext, run_id: str, model_id: str, model_label: str, timeout_seconds: float = 60.0) -> str:
     """Write ``results_json.trained_model`` on the run record by a partial XML PUT keyed on the
     record's ID.
 
@@ -345,21 +352,26 @@ def note_model_on_run(context: XnatContext, run_id: str, model_id: str, model_la
     project and label merges into the existing record (XNAT_E26034 updated in place, no stray).
     ``results_json`` is re-read first so nothing the publish wrote is lost."""
     fields = _record_fields(context, run_id, timeout_seconds)
-    current = _current_results(run_id, fields.get("results_json"))
+    accession = str(fields.get("ID") or "").strip()
+    if not _ACCESSION_ID.match(accession):
+        # the partial document is keyed on the accession; a label (the fallback id) would create a stray
+        raise RuntimeError(f"run {run_id}: the record's accession id could not be resolved from its data_fields ({accession!r})")
+    current = _current_results(accession, fields.get("results_json"))
     current["trained_model"] = {"id": model_id, "label": model_label, "xsi_type": MODEL_XSI_TYPE, "status": "DRAFT"}
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         f'<analysis:GroupAnalysis xmlns:analysis="{ANALYSIS_NS}" xmlns:xnat="{XNAT_NS}" '
-        f'ID="{escape(run_id)}" project="{escape(context.project)}" label="{escape(str(fields.get("label") or ""))}">\n'
+        f'ID="{escape(accession)}" project="{escape(context.project)}" label="{escape(str(fields.get("label") or ""))}">\n'
         f"  <analysis:results_json>{escape(bounded_results_json(current))}</analysis:results_json>\n"
         "</analysis:GroupAnalysis>\n"
     )
-    url = f"{context.host}/data/experiments/{urllib.parse.quote(run_id, safe='')}?xsiType={urllib.parse.quote(DATASET_XSI_TYPE, safe='')}"
+    url = f"{context.host}/data/experiments/{urllib.parse.quote(accession, safe='')}?xsiType={urllib.parse.quote(DATASET_XSI_TYPE, safe='')}"
     status, text = _put(context, url, xml.encode(), "application/xml", timeout_seconds)
     answered = text.strip()
-    if answered and answered != run_id:
+    if answered and answered != accession:
         # XNAT answers the id of the record it wrote; anything else means it made a new one
-        raise RuntimeError(f"PUT {url.split('?')[0]} answered {answered!r}, not {run_id}: a record was created instead of updated")
+        raise RuntimeError(f"PUT {url.split('?')[0]} answered {answered!r}, not {accession}: a record was created instead of updated")
+    return accession
 
 
 def register_trained_model(context: XnatContext, output_dir: Path, derived_root: str | None, run_outcome: dict,
@@ -411,7 +423,7 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     result = {"xsi_type": MODEL_XSI_TYPE, "id": outcome["id"], "label": outcome["label"], "status": "DRAFT",
               "weights": weights, "model_card": card_path is not None, "source_run_id": run_id, "linked": False}
     try:
-        note_model_on_run(context, run_id, outcome["id"], outcome["label"], timeout_seconds=min(timeout_seconds, 60.0))
+        result["source_run_id"] = note_model_on_run(context, run_id, outcome["id"], outcome["label"], timeout_seconds=min(timeout_seconds, 60.0))
         result["linked"] = True
     except (RuntimeError, UnicodeEncodeError) as error:
         # The model still names the run in engine_metadata_json/provenance.json; only the forward link is missing.
