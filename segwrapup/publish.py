@@ -664,7 +664,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
         raise RuntimeError(f"{error}; {rollback}") from error
     logger.info("analysis record %s published as %s with %d file(s)", label, record_id,
                 sum(len(v) for v in uploaded.values()))
-    return {"xsi_type": xsi_type, "id": record_id, "label": label, "status": status,
+    return {"xsi_type": xsi_type, "id": record_id, "id_is_accession": bool(created_id), "label": label, "status": status,
             "uploaded": uploaded, "skipped_empty": skipped_empty, "url": create_url.split("?")[0],
             "output_paths": output_paths}
 

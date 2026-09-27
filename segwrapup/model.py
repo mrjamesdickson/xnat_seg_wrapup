@@ -202,7 +202,12 @@ def bounded_engine_metadata(meta: dict) -> str:
     (Codex P2, PR #21 round 10): first the ``train_stats`` lists and nested objects go (the
     scalars, best metric and epoch, stay), then ``train_stats`` as a whole, then everything but
     the run link. ``truncated`` names what was dropped; the full card is on ``MODEL_CARD``."""
-    text = json.dumps(meta)
+    meta, replaced = _finite_json(meta)
+    if replaced:
+        # a JSON number that overflowed to infinity, or a NaN the decoder accepted, would be written as
+        # the non-standard token Infinity/NaN and strict consumers could not parse the metadata (round 19)
+        meta = dict(meta, non_finite_values_replaced=replaced)
+    text = json.dumps(meta, allow_nan=False)
     if len(text) <= ENGINE_METADATA_MAX:
         return text
     reduced = dict(meta)
@@ -210,14 +215,14 @@ def bounded_engine_metadata(meta: dict) -> str:
     if isinstance(stats, dict):
         reduced["train_stats"] = {k: v for k, v in stats.items() if not isinstance(v, (list, dict))}
         reduced["truncated"] = ["train_stats"]
-        candidate = json.dumps(reduced)
+        candidate = json.dumps(reduced, allow_nan=False)
         if len(candidate) <= ENGINE_METADATA_MAX:
             logger.warning("engine_metadata_json would be %d characters (cap %d); train_stats is reduced to its scalars, "
                            "the full card is on MODEL_CARD", len(text), ENGINE_METADATA_MAX)
             return candidate
     reduced.pop("train_stats", None)
     reduced["truncated"] = ["train_stats"]
-    candidate = json.dumps(reduced)
+    candidate = json.dumps(reduced, allow_nan=False)
     if len(candidate) <= ENGINE_METADATA_MAX:
         logger.warning("engine_metadata_json would be %d characters (cap %d); train_stats is left off, "
                        "the full card is on MODEL_CARD", len(text), ENGINE_METADATA_MAX)
@@ -225,7 +230,28 @@ def bounded_engine_metadata(meta: dict) -> str:
     dropped = sorted(k for k in meta if k not in LINK_KEYS)
     logger.warning("engine_metadata_json would be %d characters (cap %d); only the run link is kept, %s left off, "
                    "the full card is on MODEL_CARD", len(text), ENGINE_METADATA_MAX, dropped)
-    return json.dumps({**{k: meta[k] for k in LINK_KEYS if k in meta}, "truncated": dropped})
+    return json.dumps({**{k: meta[k] for k in LINK_KEYS if k in meta}, "truncated": dropped}, allow_nan=False)
+
+
+def _finite_json(value):
+    """``value`` with every non-finite float replaced by None, and how many were: JSON has no
+    Infinity or NaN, whatever Python's encoder writes by default."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None, 1
+    if isinstance(value, dict):
+        out, n = {}, 0
+        for k, v in value.items():
+            out[k], m = _finite_json(v)
+            n += m
+        return out, n
+    if isinstance(value, (list, tuple)):
+        out, n = [], 0
+        for v in value:
+            item, m = _finite_json(v)
+            out.append(item)
+            n += m
+        return out, n
+    return value, 0
 
 
 def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, contract: dict,
@@ -278,11 +304,15 @@ def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, c
     )
 
 
-def _record_fields(context: XnatContext, run_id: str, timeout: float) -> dict:
+def _record_fields(context: XnatContext, run_id: str, timeout: float, by_label: bool | None = None) -> dict:
     """The run record's data_fields, looked up by accession id, or by label under the project when
     ``run_id`` is the fallback label publish_record hands back when XNAT answered no id (Codex P2,
-    PR #21 round 16). The answer's ``ID`` is the accession the link is keyed on."""
-    if _ACCESSION_ID.match(run_id or ""):
+    PR #21 round 16). ``by_label`` says which when the caller knows (the create's answer says);
+    only without it is the id's shape consulted, since a label may look like an accession
+    (round 19). The answer's ``ID`` is the accession the link is keyed on."""
+    if by_label is None:
+        by_label = not _ACCESSION_ID.match(run_id or "")
+    if not by_label:
         url = f"{context.host}/data/experiments/{urllib.parse.quote(run_id, safe='')}?format=json"
     else:
         url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/experiments/"
@@ -341,18 +371,22 @@ def _current_results(run_id: str, raw) -> dict:
     return current if isinstance(current, dict) else {"results": current}
 
 
-def resolve_accession(context: XnatContext, record_id: str, timeout_seconds: float = 60.0) -> str:
-    """The accession id behind ``record_id``: itself when it already is one, else the ``ID`` of
-    the record looked up by that label under the project. publish_record hands back the label
-    when XNAT answered a create with no id; a label is project-scoped and no reverse link, so
-    everything that names the run or the model by id resolves it first (Codex P2, PR #21 round
-    17). Raises RuntimeError when it cannot be resolved."""
+def resolve_accession(context: XnatContext, record_id: str, timeout_seconds: float = 60.0, is_accession: bool | None = None) -> str:
+    """The accession id behind ``record_id``: itself when it is one, else the ``ID`` of the record
+    looked up by that label under the project. publish_record hands back the label when XNAT
+    answered a create with no id, and says so (``id_is_accession``); a label is project-scoped
+    and no reverse link, so everything that names the run or the model by id resolves it first
+    (Codex P2, PR #21 round 17). ``is_accession`` is that answer; a label may itself look like an
+    accession (``MY_SITE_E123``), so the shape decides only when nobody knows (round 19). Raises
+    RuntimeError when it cannot be resolved."""
     record_id = (record_id or "").strip()
     if not record_id:
         raise RuntimeError("no record id to resolve")
-    if _ACCESSION_ID.match(record_id):
+    if is_accession is None:
+        is_accession = bool(_ACCESSION_ID.match(record_id))
+    if is_accession:
         return record_id
-    accession = str(_record_fields(context, record_id, timeout_seconds).get("ID") or "").strip()
+    accession = str(_record_fields(context, record_id, timeout_seconds, by_label=True).get("ID") or "").strip()
     if not _ACCESSION_ID.match(accession):
         raise RuntimeError(f"record {record_id}: the accession id could not be resolved from its data_fields ({accession!r})")
     logger.info("record label %s resolved to %s", record_id, accession)
@@ -410,7 +444,7 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     try:
         # the model's reverse link (engine_metadata_json.source_run_id, provenance.json) must be an
         # accession a consumer can GET, not the label publish_record fell back to (round 17)
-        run_id = resolve_accession(context, run_id, min(timeout_seconds, 60.0))
+        run_id = resolve_accession(context, run_id, min(timeout_seconds, 60.0), is_accession=run_outcome.get("id_is_accession"))
     except RuntimeError as error:
         logger.error("no model registered: the run's accession id is unknown (%s)", error)
         return {"error": f"the run's accession id could not be resolved: {error}"}
@@ -452,7 +486,7 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
               "weights": weights, "model_card": card_path is not None, "source_run_id": run_id, "linked": False}
     try:
         # the forward link names the model by accession too; a create that answered no id is looked up by label
-        result["id"] = resolve_accession(context, outcome["id"], min(timeout_seconds, 60.0))
+        result["id"] = resolve_accession(context, outcome["id"], min(timeout_seconds, 60.0), is_accession=outcome.get("id_is_accession"))
         result["source_run_id"] = note_model_on_run(context, run_id, result["id"], outcome["label"], timeout_seconds=min(timeout_seconds, 60.0))
         result["linked"] = True
     except (RuntimeError, UnicodeEncodeError) as error:

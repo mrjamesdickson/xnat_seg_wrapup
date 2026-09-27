@@ -848,6 +848,11 @@ def test_engine_metadata_is_bounded_to_the_schema_cap(caplog):
     reduced = json.loads(bounded_engine_metadata(huge))
     assert reduced == {**link, "truncated": ["app", "base_model"]}
     assert len(json.dumps(reduced)) <= ENGINE_METADATA_MAX
+    # a number that overflowed to infinity, or a NaN, is never written as Infinity/NaN (round 19)
+    text = bounded_engine_metadata({"train_stats": {"best_metric": float("inf"), "loss": [0.5, float("nan")]}, "val_split": 0.2, **link})
+    assert "Infinity" not in text and "NaN" not in text
+    strict = json.loads(text, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    assert strict["train_stats"] == {"best_metric": None, "loss": [0.5, None]} and strict["non_finite_values_replaced"] == 2 and strict["val_split"] == 0.2
 
 
 def test_an_empty_model_card_is_still_uploaded_and_named(cs, tmp_path, monkeypatch):
@@ -1013,7 +1018,7 @@ def test_fallback_labels_are_resolved_to_accessions_before_the_model_names_the_r
     out = tmp_path / "out"; (out / "raw").mkdir(parents=True)
     (out / "raw" / "segmentation_spleen.pt").write_bytes(b"W")
     lookups, published, links = [], {}, {}
-    def record_fields(ctx, record_id, timeout):
+    def record_fields(ctx, record_id, timeout, by_label=None):
         lookups.append(record_id)
         run = {"ID": "XNAT_E77777", "label": "run_lbl_x", "results_json": "{}"}
         return {"run_lbl_x": run, "XNAT_E77777": run, "model_ds_x": {"ID": "XNAT_E88888", "label": "model_ds_x"}}[record_id]
@@ -1033,6 +1038,21 @@ def test_fallback_labels_are_resolved_to_accessions_before_the_model_names_the_r
     assert "run_lbl_x" not in published["xml"].split("<analysis:engine_metadata_json>")[1].split("</analysis:engine_metadata_json>")[0]
     assert result["id"] == "XNAT_E88888" and result["source_run_id"] == "XNAT_E77777" and result["linked"] is True
     assert '"id": "XNAT_E88888"' in links["xml"].replace("&quot;", '"') and links["url"].startswith("http://x/data/experiments/XNAT_E77777?")
+    # a label that looks like an accession is still looked up by label when the create answered no id (round 19)
+    lookups.clear()
+    record_fields_by = {}
+    def record_fields_flagged(ctx, record_id, timeout, by_label=None):
+        record_fields_by[record_id] = by_label
+        lookups.append(record_id)
+        return {"ID": "XNAT_E77777", "label": record_id, "results_json": "{}"} if by_label else {"ID": record_id, "label": "l", "results_json": "{}"}
+    monkeypatch.setattr(model, "_record_fields", record_fields_flagged)
+    result = model.register_trained_model(context, out, "raw", {"id": "MY_SITE_E123", "label": "MY_SITE_E123", "id_is_accession": False}, "SUCCEEDED",
+                                          {"MODEL": ["segmentation_spleen.pt"]}, {"pipeline": "monailabel-train"}, {"label": "ds"})
+    assert record_fields_by["MY_SITE_E123"] is True and result["source_run_id"] == "XNAT_E77777"
+    assert '"source_run_id": "XNAT_E77777"' in published["xml"].replace("&quot;", '"')
+    result = model.register_trained_model(context, out, "raw", {"id": "MY_SITE_E123", "label": "l", "id_is_accession": True}, "SUCCEEDED",
+                                          {"MODEL": ["segmentation_spleen.pt"]}, {"pipeline": "monailabel-train"}, {"label": "ds"})
+    assert result["source_run_id"] == "MY_SITE_E123" and "MY_SITE_E123" not in record_fields_by or record_fields_by.get("MY_SITE_E123") is not None
     # a run label that resolves to nothing: no model is registered at all
     monkeypatch.setattr(model, "_record_fields", lambda ctx, record_id, timeout: {"label": record_id})
     result = model.register_trained_model(context, out, "raw", {"id": "run_lbl_y", "label": "run_lbl_y"}, "SUCCEEDED",
