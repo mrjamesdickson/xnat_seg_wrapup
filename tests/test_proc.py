@@ -1048,6 +1048,8 @@ def test_the_link_step_accepts_json_native_results_fields():
     from segwrapup.model import _current_results
     assert _current_results("XNAT_E1", None) == {} and _current_results("XNAT_E1", "") == {}
     assert _current_results("XNAT_E1", '{"views": {"MODEL": ["a.pt"]}}') == {"views": {"MODEL": ["a.pt"]}}
+    deep = "[" * 100000 + "]" * 100000
+    assert _current_results("XNAT_E1", deep) == {"results_raw": deep}, "nested past the recursion limit: kept raw, not an abort (round 29)"
     assert _current_results("XNAT_E1", {"views": {}}) == {"views": {}}, "a dict is taken as is"
     assert _current_results("XNAT_E1", 7) == {"results": 7} and _current_results("XNAT_E1", [1, 2]) == {"results": [1, 2]}
     assert _current_results("XNAT_E1", "[1, 2]") == {"results": [1, 2]}

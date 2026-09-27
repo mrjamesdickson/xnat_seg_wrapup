@@ -389,7 +389,9 @@ def _current_results(run_id: str, raw) -> dict:
         return {"results": raw}
     try:
         current = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: valid JSON nested past the parser's limit; the model exists by now, so it is
+        # malformed existing results, not an abort before the manifest (Codex P2, round 29)
         logger.warning("run %s results_json is not JSON; trained_model is written beside its raw text", run_id)
         return {"results_raw": raw}
     return current if isinstance(current, dict) else {"results": current}
