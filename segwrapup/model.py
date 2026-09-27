@@ -86,7 +86,13 @@ def model_card_path(root: Path, names: list[str]) -> Path | None:
     content: an empty ``{}`` card is still the tool's card and goes on MODEL_CARD (Codex P2, PR #21
     round 11)."""
     candidates = [root / n for n in names if n.endswith(MODEL_CARD_FILENAME)] + [root / MODEL_CARD_FILENAME]
-    return next((path for path in candidates if path.is_file()), None)
+    path = next((path for path in candidates if path.is_file()), None)
+    if path is not None and path.stat().st_size == 0:
+        # publish_record skips zero-byte files (XNAT refuses them), so advertising this one would send
+        # consumers to a MODEL_CARD resource with nothing on it (Codex P2, PR #21 round 12)
+        logger.warning("%s is empty; the model registers without a card", path.name)
+        return None
+    return path
 
 
 def read_model_card(root: Path, names: list[str]) -> dict:

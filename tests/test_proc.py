@@ -868,6 +868,25 @@ def test_an_empty_model_card_is_still_uploaded_and_named(cs, tmp_path, monkeypat
     assert model_card_path(inp, ["model-card.json"]) == inp / "model-card.json"
     (inp / "model-card.json").write_text("not json")
     assert read_model_card(inp, ["model-card.json"]) == {} and model_card_path(inp, ["model-card.json"]) is not None, "unreadable: no metadata, but the file is there"
+    (inp / "model-card.json").write_bytes(b"")
+    assert model_card_path(inp, ["model-card.json"]) is None, "zero bytes: XNAT would refuse the upload, so no card is advertised (round 12)"
+
+
+def test_a_zero_byte_model_card_is_not_advertised(cs, tmp_path, monkeypatch):
+    """publish_record skips zero-byte files; the record must not name a MODEL_CARD resource that holds
+    nothing, nor the manifest say model_card: true (Codex P2, PR #21 round 12)."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "model-card.json").write_bytes(b"")
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    model_xml = creates[1]["body"].decode()
+    assert "model_card_resource_label" not in model_xml
+    uploads = [c["path"].split("?")[0] for c in handler.calls if c["method"] == "PUT" and "/resources/MODEL_CARD/" in c["path"]]
+    assert uploads == []
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["trained_model"]["model_card"] is False and manifest["trained_model"]["id"] == "XNAT_E88888"
 
 
 def test_run_data_fields_of_the_wrong_shape_are_a_link_error_not_an_abort(cs, tmp_path, monkeypatch):
