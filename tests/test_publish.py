@@ -900,7 +900,7 @@ def test_results_json_stays_under_the_schema_cap_on_a_big_tree(tmp_path, caplog)
     assert len(json.dumps(bounded)) <= RESULTS_JSON_MAX
     assert bounded["trained_model"] == {"id": "XNAT_E1", "label": "model_x"}, "the forward link is what must survive"
     assert "results_raw" not in bounded and bounded["truncated"] == ["views", "results_raw"]
-    assert "is left off" in caplog.text
+    assert "left off (they are in PROVENANCE/wrapup.json)" in caplog.text
     # nothing to reduce first: the overrunning value is named on its own
     only_raw = json.loads(bounded_results_json({"results_raw": "y" * 100000, "trained_model": {"id": "XNAT_E2"}}))
     assert only_raw["truncated"] == ["results_raw"] and only_raw["trained_model"] == {"id": "XNAT_E2"}
@@ -935,6 +935,19 @@ def test_results_json_stays_under_the_schema_cap_on_a_big_tree(tmp_path, caplog)
                                                    "trained_model": {"id": "XNAT_E4"}}))
     assert reduced == {"trained_model": {"id": "XNAT_E4"}, "truncated": ["results_raw", "views"]}
     assert "nested too deep" in caplog.text
+    # a run's existing results can hold thousands of fields, and naming every one made the note itself
+    # overrun the cap, so the document the PUT carried was refused after all (Codex P2, PR #21 round 36)
+    many = {f"field_{i:04d}_" + "x" * 200: i for i in range(3000)}
+    crowded = json.loads(bounded_results_json({**many, "trained_model": {"id": "XNAT_E5"}}))
+    assert len(json.dumps(crowded)) <= RESULTS_JSON_MAX, "the note is bounded too"
+    assert crowded["trained_model"] == {"id": "XNAT_E5"}, "and the forward link still survives"
+    assert crowded["truncated"][-1].startswith("and ") and crowded["truncated"][-1].endswith("more")
+    assert crowded["truncated"][0].startswith("field_"), "the names that fit are still there to read"
+    named = int(crowded["truncated"][-1].split()[1])
+    kept_fields = [key for key in crowded if key.startswith("field_")]
+    listed = [entry for entry in crowded["truncated"] if entry.startswith("field_")]
+    assert named == 3000 - len(kept_fields) - len(listed), "the count accounts for every field left off"
+    assert kept_fields, "and the fields that did fit are kept, not thrown away wholesale"
 
 
 def test_create_409_at_subject_scope_relabels_the_subject_document(xnat, tmp_path):

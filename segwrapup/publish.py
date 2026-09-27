@@ -148,6 +148,26 @@ def scope_provenance(context: XnatContext, caller_inputs: dict) -> dict | None:
     return None
 
 
+#: How much of a bounded ``results_json`` may be spent naming what was left off. A run's existing
+#: results can hold thousands of fields, and naming every one made the note itself overrun the cap, so
+#: the document the PUT carried was refused after all (Codex P2, PR #21 round 36).
+TRUNCATED_BUDGET = 4096
+
+
+def _truncated_note(left_off: list[str]) -> list[str]:
+    """``left_off``, or as much of it as fits in :data:`TRUNCATED_BUDGET` followed by a count of the
+    rest. A consumer reads ``PROVENANCE/wrapup.json`` for the whole picture either way."""
+    note: list[str] = []
+    spent = 0
+    for name in left_off:
+        if spent + len(name) + 4 > TRUNCATED_BUDGET:
+            note.append(f"and {len(left_off) - len(note)} more")
+            break
+        note.append(name)
+        spent += len(name) + 4
+    return note
+
+
 #: What a bounded ``results_json`` keeps whatever else has to go: ``trained_model`` is the run's only
 #: forward link to the model it produced, and nothing else holds it (Codex P2, PR #21 round 30).
 RESULTS_KEPT_KEYS = ("trained_model",)
@@ -203,7 +223,7 @@ def bounded_results_json(summary: dict) -> str:
         # before writing its manifest (Codex P2, PR #21 round 35). Reduced instead to what must survive,
         # with the rest named; the full summary is in PROVENANCE/wrapup.json.
         kept = {key: summary[key] for key in RESULTS_KEPT_KEYS if key in summary}
-        left_off = sorted(key for key in summary if key not in kept)
+        left_off = _truncated_note(sorted(key for key in summary if key not in kept))
         logger.error("results_json is nested too deep to check for non-finite numbers; keeping %s and leaving %s off "
                      "(the full summary is in PROVENANCE/wrapup.json)", sorted(kept), left_off)
         try:
@@ -226,8 +246,30 @@ def bounded_results_json(summary: dict) -> str:
         dropped.append("views")
         logger.warning("results_json would be %d characters (cap %d); the view file lists are replaced by counts, "
                        "the full mapping stays in PROVENANCE/wrapup.json", len(text), RESULTS_JSON_MAX)
-    reduced["truncated"] = dropped
+    reduced["truncated"] = _truncated_note(dropped)
     text = json.dumps(reduced, allow_nan=False)
+    if len(text) > RESULTS_JSON_MAX:
+        # Size every value once and drop the largest first by arithmetic. The loop below re-serialises
+        # the whole document per drop, which is quadratic: a summary carrying thousands of fields — the
+        # case that made the note itself overrun — took a minute of it. The loop stays as the backstop,
+        # since these sizes ignore the note growing as names are added to it.
+        sizes = sorted(((len(json.dumps(value, allow_nan=False)) + len(key) + 6, key)
+                        for key, value in reduced.items()
+                        if key != "truncated" and key not in RESULTS_KEPT_KEYS), reverse=True)
+        remaining, here = len(text), []
+        for size, key in sizes:
+            if remaining <= RESULTS_JSON_MAX:
+                break
+            del reduced[key]
+            here.append(key)
+            remaining -= size
+        if here:
+            dropped.extend(here)
+            reduced["truncated"] = _truncated_note(dropped)
+            text = json.dumps(reduced, allow_nan=False)
+            logger.warning("results_json was %d characters, over the cap of %d; %s left off (they are in "
+                           "PROVENANCE/wrapup.json)", remaining + sum(s for s, k in sizes if k in here),
+                           RESULTS_JSON_MAX, _truncated_note(here))
     while len(text) > RESULTS_JSON_MAX:
         removable = [(len(json.dumps(value, allow_nan=False)), key) for key, value in reduced.items()
                      if key != "truncated" and key not in RESULTS_KEPT_KEYS]
@@ -238,7 +280,7 @@ def bounded_results_json(summary: dict) -> str:
         biggest = max(removable)[1]
         del reduced[biggest]
         dropped.append(biggest)
-        reduced["truncated"] = dropped
+        reduced["truncated"] = _truncated_note(dropped)
         logger.warning("results_json is %d characters, still over the cap of %d; %s is left off (it is in "
                        "PROVENANCE/wrapup.json)", len(text), RESULTS_JSON_MAX, biggest)
         text = json.dumps(reduced, allow_nan=False)
