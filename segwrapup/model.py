@@ -183,7 +183,9 @@ def default_checkpoint(declared, weights: list[str]) -> str | None:
     if declared:
         if declared in weights:
             return declared
-        if "/" in declared:
+        if "/" in declared or "\\" in declared:
+            # a Windows-style `fold-0\best.pt` from a portable card is a path too: read as a bare
+            # basename it would fall through to the only-weight fallback and another fold (Codex P2, round 23)
             logger.error("model card default_checkpoint %r names a path that is not among the uploaded weights %s; "
                          "the model is registered without one rather than remapped to another file", declared, weights)
             return None
