@@ -31,6 +31,7 @@ import http.client
 import json
 import re
 import logging
+import math
 import mimetypes
 import os
 import secrets
@@ -152,6 +153,28 @@ def scope_provenance(context: XnatContext, caller_inputs: dict) -> dict | None:
 RESULTS_KEPT_KEYS = ("trained_model",)
 
 
+def _finite_json(value):
+    """``value`` with every non-finite float replaced by None, and how many were: JSON has no
+    Infinity or NaN, whatever Python's encoder writes by default. Lives here, beside the two
+    serialisers that must not emit those tokens; :mod:`segwrapup.model` imports it."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None, 1
+    if isinstance(value, dict):
+        out, n = {}, 0
+        for k, v in value.items():
+            out[k], m = _finite_json(v)
+            n += m
+        return out, n
+    if isinstance(value, (list, tuple)):
+        out, n = [], 0
+        for v in value:
+            item, m = _finite_json(v)
+            out.append(item)
+            n += m
+        return out, n
+    return value, 0
+
+
 def bounded_results_json(summary: dict) -> str:
     """``results_json`` under the schema cap. The per-role file lists are counts (the files
     are enumerable on the record's resources); if the view lists alone still overrun, they
@@ -165,8 +188,24 @@ def bounded_results_json(summary: dict) -> str:
     without its forward link to the model that was just registered (Codex P2, PR #21 round 30). So
     whatever still overruns is dropped, largest value first, until the document fits. Everything
     droppable was written by this run and its full form is in ``PROVENANCE/wrapup.json`` on the same
-    record; ``truncated`` names it."""
-    text = json.dumps(summary)
+    record; ``truncated`` names it.
+
+    Non-finite numbers are replaced by None first, and every dump here is ``allow_nan=False``. Python's
+    decoder accepts ``NaN`` and ``Infinity`` and its encoder writes them straight back, so a measured
+    volume that came out NaN, or a run's own ``results_json`` re-read by the link step, could be stored
+    as a token no strict JSON consumer can read (Codex P2, PR #21 round 31)."""
+    try:
+        summary, replaced = _finite_json(summary)
+    except RecursionError:
+        # nested past this walk's limit; json.dumps below is at the same limit and raises, which the
+        # publish and link guards already report — the tokens cannot slip through silently
+        logger.warning("results_json is nested too deep to check for non-finite numbers")
+        replaced = 0
+    if replaced:
+        summary = dict(summary, non_finite_values_replaced=replaced)
+        logger.warning("results_json had %d non-finite number(s) (NaN or Infinity, which JSON has no tokens "
+                       "for); they are written as null and counted in non_finite_values_replaced", replaced)
+    text = json.dumps(summary, allow_nan=False)
     if len(text) <= RESULTS_JSON_MAX:
         return text
     reduced = dict(summary)
@@ -177,9 +216,9 @@ def bounded_results_json(summary: dict) -> str:
         logger.warning("results_json would be %d characters (cap %d); the view file lists are replaced by counts, "
                        "the full mapping stays in PROVENANCE/wrapup.json", len(text), RESULTS_JSON_MAX)
     reduced["truncated"] = dropped
-    text = json.dumps(reduced)
+    text = json.dumps(reduced, allow_nan=False)
     while len(text) > RESULTS_JSON_MAX:
-        removable = [(len(json.dumps(value)), key) for key, value in reduced.items()
+        removable = [(len(json.dumps(value, allow_nan=False)), key) for key, value in reduced.items()
                      if key != "truncated" and key not in RESULTS_KEPT_KEYS]
         if not removable:
             logger.error("results_json is %d characters with only %s left (cap %d); XNAT will refuse it",
@@ -191,7 +230,7 @@ def bounded_results_json(summary: dict) -> str:
         reduced["truncated"] = dropped
         logger.warning("results_json is %d characters, still over the cap of %d; %s is left off (it is in "
                        "PROVENANCE/wrapup.json)", len(text), RESULTS_JSON_MAX, biggest)
-        text = json.dumps(reduced)
+        text = json.dumps(reduced, allow_nan=False)
     return text
 
 ANALYSIS_NS = "http://xnatworks.io/analysis"

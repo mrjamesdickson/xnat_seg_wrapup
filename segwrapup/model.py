@@ -35,7 +35,8 @@ import http.client
 import urllib.error
 import urllib.request
 
-from .publish import ANALYSIS_NS, DATASET_XSI_TYPE, RESULTS_JSON_MAX, XNAT_NS, RecordFile, _element, _put, bounded_results_json, publish_record
+from .publish import (ANALYSIS_NS, DATASET_XSI_TYPE, RESULTS_JSON_MAX, XNAT_NS, RecordFile, _element, _finite_json,
+                      _put, bounded_results_json, publish_record)
 from .register import auth_headers
 from .register import LABEL_MAX, XnatContext
 
@@ -255,33 +256,19 @@ def bounded_engine_metadata(meta: dict) -> str:
     return json.dumps({**{k: meta[k] for k in LINK_KEYS if k in meta}, "truncated": dropped}, allow_nan=False)
 
 
-def _finite_json(value):
-    """``value`` with every non-finite float replaced by None, and how many were: JSON has no
-    Infinity or NaN, whatever Python's encoder writes by default."""
-    if isinstance(value, float) and not math.isfinite(value):
-        return None, 1
-    if isinstance(value, dict):
-        out, n = {}, 0
-        for k, v in value.items():
-            out[k], m = _finite_json(v)
-            n += m
-        return out, n
-    if isinstance(value, (list, tuple)):
-        out, n = [], 0
-        for v in value:
-            item, m = _finite_json(v)
-            out.append(item)
-            n += m
-        return out, n
-    return value, 0
-
-
 def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, contract: dict,
                     weights: list[str], dataset_facts: dict, when: datetime | None = None, created_by: str | None = None,
                     model_card: bool | None = None) -> str:
     now = when or datetime.now(timezone.utc)
     has_card = bool(card) if model_card is None else model_card   # the file's presence, not its content
     labels = card.get("labels") if isinstance(card.get("labels"), dict) else {}
+    # label_names and num_classes must agree: an index num_classes rejects (1e309, -1, a 400-digit
+    # integer) was still published as `lesion:inf`, an impossible class mapping for a catalog
+    # consumer to read (Codex P2, PR #21 round 31). One validated mapping feeds both.
+    usable = {name: int(index) for name, index in labels.items() if _is_label_index(index)}
+    if len(usable) != len(labels):
+        logger.warning("card labels %s have no usable index (a finite integer in 0..%d); they are left off "
+                       "label_names and num_classes", sorted(set(labels) - set(usable)), MAX_LABEL_INDEX)
     framework = card.get("model_framework") or contract.get("analysis_type") or ""
     model_name = card.get("model") or contract.get("pipeline") or "model"
     body = "".join(x for x in [
@@ -307,8 +294,8 @@ def build_model_xml(context: XnatContext, label: str, run_id: str, card: dict, c
                                                                                              "val_split", "base_model", "train_stats", "card_id",
                                                                                              "card_revision", "container_digest") if k in card},
                                                                   "source_run_id": run_id, "source_run_type": "analysis:groupAnalysisData"})),
-        _element("label_names", ",".join(f"{name}:{index}" for name, index in labels.items()) if labels else None),
-        _element("num_classes", num_classes(labels)),
+        _element("label_names", ",".join(f"{name}:{index}" for name, index in usable.items()) if usable else None),
+        _element("num_classes", num_classes(usable)),
         _element("best_validation_dice", _best_dice(card)),
         _element("model_resource_label", MODEL_ROLE),
         _element("model_card_resource_label", MODEL_CARD_ROLE if has_card else None),

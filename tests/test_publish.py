@@ -909,6 +909,20 @@ def test_results_json_stays_under_the_schema_cap_on_a_big_tree(tmp_path, caplog)
     with caplog.at_level(logging.ERROR):
         kept = json.loads(bounded_results_json({"trained_model": {"id": "x" * 100000}}))
     assert kept["trained_model"]["id"] == "x" * 100000 and "XNAT will refuse it" in caplog.text
+    # Python decodes NaN and Infinity and writes them straight back; nothing strict can read the
+    # element then. A measured volume that came out NaN, or a run's own results_json re-read by the
+    # link step, must not be stored as one of those tokens (Codex P2, PR #21 round 31)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        written = bounded_results_json({"total_volume_ml": float("nan"), "structures": [{"dice": float("inf")}],
+                                        "trained_model": {"id": "XNAT_E3"}})
+    assert "NaN" not in written and "Infinity" not in written
+    finite = json.loads(written)
+    assert finite["total_volume_ml"] is None and finite["structures"] == [{"dice": None}]
+    assert finite["non_finite_values_replaced"] == 2 and finite["trained_model"] == {"id": "XNAT_E3"}
+    assert "non_finite_values_replaced" in caplog.text
+    assert json.loads(bounded_results_json({"total_volume_ml": 1.5})) == {"total_volume_ml": 1.5}, \
+        "finite numbers are untouched and nothing is added"
 
 
 def test_create_409_at_subject_scope_relabels_the_subject_document(xnat, tmp_path):

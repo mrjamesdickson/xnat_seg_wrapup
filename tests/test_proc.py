@@ -805,6 +805,22 @@ def test_num_classes_comes_from_the_label_indices_not_the_number_of_names():
     assert _best_dice({"best_validation_dice": 7, "best_metric": 0.5}) == 0.5, "the out-of-range key is skipped, the next one read"
     assert _best_dice({"best_metric": 0.0}) == 0.0 and _best_dice({"best_metric": 1}) == 1.0
     assert num_classes({"top": 65535}) == 65536 and num_classes({"over": 65536}) is None
+    # label_names is built from the same validated indices, so the record cannot advertise a mapping
+    # num_classes refused: `lesion:inf` was an impossible class for a catalog consumer to read
+    # (Codex P2, PR #21 round 31)
+    from segwrapup.model import build_model_xml
+    from segwrapup.register import XnatContext
+    context = XnatContext(host="http://x", user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    xml = build_model_xml(context, "model_x", "XNAT_E77777", {"labels": {"lesion": 1e309, "spleen": 1, "liver": 2.0,
+                                                                        "bad": -1, "huge": 10 ** 400}},
+                          {"pipeline": "monailabel-train"}, ["w.pt"], {"label": "ds"})
+    assert "<analysis:label_names>spleen:1,liver:2</analysis:label_names>" in xml, xml
+    assert "<analysis:num_classes>3</analysis:num_classes>" in xml
+    assert "inf" not in xml and "lesion" not in xml and "huge" not in xml
+    # every index unusable: neither element is written, rather than a mapping of nothing
+    bare = build_model_xml(context, "model_x", "XNAT_E77777", {"labels": {"lesion": 1e309}},
+                           {"pipeline": "monailabel-train"}, ["w.pt"], {"label": "ds"})
+    assert "<analysis:label_names>" not in bare and "<analysis:num_classes>" not in bare
 
 
 def test_default_checkpoint_must_be_an_uploaded_weight():
