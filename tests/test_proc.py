@@ -902,22 +902,32 @@ def test_engine_metadata_is_bounded_to_the_schema_cap(caplog):
     assert json.loads(text) == {**link, "truncated": ["app", "train_stats"]}
 
 
-def test_an_empty_card_candidate_does_not_hide_a_usable_one(tmp_path, caplog):
-    """A broad MODEL view can name an empty `fold-0/model-card.json` before the usable card at the
-    output root. Taking the first candidate and checking its size alone registered the model with no
-    metadata and no MODEL_CARD resource at all (Codex P2, PR #21 round 35)."""
+def test_the_root_card_wins_and_an_empty_candidate_does_not_hide_a_usable_one(tmp_path, caplog):
+    """The card the contract means is the one at the DERIVED root. A broad MODEL view can also name
+    `fold-0/model-card.json`, and while round 35 stopped an *empty* nested card hiding the root one, a
+    stale but valid nested card still supplied the registered metadata and was uploaded under the
+    canonical name (Codex P2, PR #21 round 78). The root comes first; a nested candidate is used only
+    when the root card is not usable, which is what keeps round 35's case working."""
     import logging
     from segwrapup.model import model_card_path, read_model_card
     root = tmp_path / "derived"; (root / "fold-0").mkdir(parents=True)
-    (root / "fold-0" / "model-card.json").write_bytes(b"")
-    (root / "model-card.json").write_text(json.dumps({"model": "spleen", "labels": {"spleen": 1}}))
     names = ["fold-0/model-card.json", "fold-0/best.pt", "model-card.json"]
+    # a stale but perfectly valid nested card: not the one that registers
+    (root / "fold-0" / "model-card.json").write_text(json.dumps({"model": "stale-fold", "labels": {"stale": 1}}))
+    (root / "model-card.json").write_text(json.dumps({"model": "spleen", "labels": {"spleen": 1}}))
     with caplog.at_level(logging.WARNING):
         assert model_card_path(root, names) == root / "model-card.json"
     assert read_model_card(root, names)["model"] == "spleen", "and its metadata is read"
-    assert "fold-0/model-card.json is empty; using model-card.json instead" in caplog.text
-    # every candidate empty: no card, as before, and the message names them
+    assert "model-card.json is the model card; fold-0/model-card.json also match by name" in caplog.text
+    # an empty root card does not leave the model cardless: the nested one is used, and said so (round 35)
     (root / "model-card.json").write_bytes(b"")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert model_card_path(root, names) == root / "fold-0" / "model-card.json"
+    assert read_model_card(root, names)["model"] == "stale-fold"
+    assert "model-card.json is empty; using fold-0/model-card.json instead" in caplog.text
+    # every candidate empty: no card, as before, and the message names them
+    (root / "fold-0" / "model-card.json").write_bytes(b"")
     caplog.clear()
     with caplog.at_level(logging.WARNING):
         assert model_card_path(root, names) is None and read_model_card(root, names) == {}

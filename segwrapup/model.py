@@ -107,7 +107,17 @@ def model_card_path(root: Path, names: list[str]) -> Path | None:
     round 11)."""
     # the basename, exactly: backup-model-card.json in a broad MODEL view is a weight-side file, not
     # the card (Codex P2, PR #21 round 15)
-    candidates = [root / n for n in names if is_model_card(n)] + [root / MODEL_CARD_FILENAME]
+    root_card = root / MODEL_CARD_FILENAME
+    nested = [root / n for n in names if is_model_card(n) and root / n != root_card]
+    # the root card first. The contract's card is the one at the DERIVED root, and a *stale but valid*
+    # fold-0/model-card.json in a broad MODEL view would otherwise supply the registered metadata and
+    # be uploaded under the canonical name: round 35 only stopped that happening when the nested card
+    # was zero bytes (Codex P2, PR #21 round 78). A nested card is still a candidate, because an empty
+    # root card must not leave the model with no card at all.
+    candidates = [root_card] + nested
+    if nested and root_card.is_file() and root_card.stat().st_size:
+        logger.warning("%s is the model card; %s also match by name and are not used",
+                       MODEL_CARD_FILENAME, ", ".join(_under(root, path) for path in nested))
     empty = []
     for path in candidates:
         if not path.is_file():
