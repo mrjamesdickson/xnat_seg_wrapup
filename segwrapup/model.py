@@ -168,11 +168,14 @@ def _is_label_index(value) -> bool:
 
 def default_checkpoint(declared, weights: list[str]) -> str | None:
     """The checkpoint a consumer loads first: the model card's value when it names one of the
-    uploaded weights (exactly, or by basename), else the only weight, else nothing. A card value
-    that is not among the weights (a stale `best.ckpt` beside an uploaded `best.pt`) would send
-    every consumer to a file the MODEL resource does not hold (Codex P2, PR #21). A value that
-    is not a string (a number, an object) is treated as undeclared, not raised: the card is the
-    engine's, and registration is best effort after the run record is published."""
+    uploaded weights (exactly, or by basename when the card gave only a basename), else the only
+    weight, else nothing. A card value that is not among the weights (a stale `best.ckpt` beside
+    an uploaded `best.pt`) would send every consumer to a file the MODEL resource does not hold
+    (Codex P2, PR #21). A path-qualified value that is missing (`fold-0/best.pt` when only
+    `fold-1/best.pt` was uploaded) stays unresolved: matching it by basename, or handing over the
+    only weight, would load a different fold from the one the card declared (Codex P2, round 22).
+    A value that is not a string (a number, an object) is treated as undeclared, not raised: the
+    card is the engine's, and registration is best effort after the run record is published."""
     if declared is not None and not isinstance(declared, str):
         logger.warning("model card default_checkpoint is a %s, not a string; treating it as undeclared", type(declared).__name__)
         declared = None
@@ -180,7 +183,11 @@ def default_checkpoint(declared, weights: list[str]) -> str | None:
     if declared:
         if declared in weights:
             return declared
-        by_name = [w for w in weights if w.rsplit("/", 1)[-1] == declared.rsplit("/", 1)[-1]]
+        if "/" in declared:
+            logger.error("model card default_checkpoint %r names a path that is not among the uploaded weights %s; "
+                         "the model is registered without one rather than remapped to another file", declared, weights)
+            return None
+        by_name = [w for w in weights if w.rsplit("/", 1)[-1] == declared]
         if len(by_name) == 1:
             logger.warning("model card default_checkpoint %r is not an uploaded path; using %r", declared, by_name[0])
             return by_name[0]

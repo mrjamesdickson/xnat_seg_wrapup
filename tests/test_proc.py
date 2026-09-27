@@ -821,6 +821,18 @@ def test_default_checkpoint_must_be_an_uploaded_weight():
     assert default_checkpoint(["best.pt"], ["best.pt"]) == "best.pt", "a list is not a string either; the only weight wins"
 
 
+def test_a_missing_path_qualified_default_checkpoint_is_not_remapped_to_another_fold():
+    """`fold-0/best.pt` declared, only `fold-1/best.pt` uploaded: a basename match or the only-weight
+    fallback would make every consumer load the other fold under the card's name (Codex P2, round 22).
+    A bare basename keeps its basename match; an exact path match is still honoured."""
+    from segwrapup.model import default_checkpoint
+    assert default_checkpoint("fold-0/best.pt", ["fold-1/best.pt"]) is None, "the only weight is a different fold"
+    assert default_checkpoint("fold-0/best.pt", ["fold-1/best.pt", "fold-1/final.pt"]) is None
+    assert default_checkpoint("fold-0/best.pt", ["fold-0/best.pt"]) == "fold-0/best.pt"
+    assert default_checkpoint("best.pt", ["fold-1/best.pt"]) == "fold-1/best.pt", "a bare basename still matches by basename"
+    assert default_checkpoint("models/best.pt", ["best.pt"]) is None, "a path is not shortened to its basename either"
+
+
 
 def test_engine_metadata_is_bounded_to_the_schema_cap(caplog):
     """A detailed model card must not make XNAT refuse the trained-model record (Codex P2, PR #21 round 10):
