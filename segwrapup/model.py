@@ -509,15 +509,25 @@ def register_trained_model(context: XnatContext, output_dir: Path, derived_root:
     # publish_record skips zero-byte files (XNAT refuses them), so an empty checkpoint is not a weight:
     # advertised in `weights` or as default_checkpoint it would name a file the MODEL resource does not
     # hold (Codex P2, PR #21 round 26; the card had the same rule since round 12)
-    empty = [n for n in listed if not (root / n).is_file() or (root / n).stat().st_size == 0]
+    try:
+        # inspecting the view is filesystem work as well: `is_file()` swallows only ENOENT and its
+        # kin, and `stat()` nothing, so a transiently unavailable output (EIO, ESTALE) raised out of
+        # this function after the run record was published — proc-wrapup then aborted before the
+        # manifest and the pointer reduction, against the never-raises contract above (Codex P2, PR
+        # #21 round 79). The failure is an outcome, like every other one here.
+        empty = [n for n in listed if not (root / n).is_file() or (root / n).stat().st_size == 0]
+        card = read_model_card(root, (views or {}).get(MODEL_ROLE, []))
+        card_path = model_card_path(root, (views or {}).get(MODEL_ROLE, []))
+    except OSError as error:
+        logger.error("produces=model but the %s view on DERIVED could not be inspected (%s); no model is registered, "
+                     "the run record %s stays", MODEL_ROLE, error, run_id)
+        return {"error": f"the {MODEL_ROLE} view could not be inspected: {type(error).__name__}: {error}"}
     for n in empty:
         logger.warning("%s is empty or missing; not a checkpoint, left off the model", n)
     names = [n for n in listed if n not in empty]
     if not names:
         logger.error("produces=model but every %s view file is empty (%s); no model is registered", MODEL_ROLE, empty)
         return {"error": f"no usable checkpoint in the {MODEL_ROLE} view: {empty} are empty"}
-    card = read_model_card(root, (views or {}).get(MODEL_ROLE, []))
-    card_path = model_card_path(root, (views or {}).get(MODEL_ROLE, []))
     label = model_label(dataset_facts.get("label") or context.dataset, run_id=run_id)
     # view-relative names, not basenames: fold-0/best.pt and fold-1/best.pt are two files, and
     # default_checkpoint must name a path that exists on the MODEL resource (Codex P1, PR #21)

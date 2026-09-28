@@ -1296,3 +1296,37 @@ def test_a_control_character_in_a_card_field_still_registers_the_model(cs, tmp_p
     import xml.etree.ElementTree as ET
     ET.fromstring(posted[0])                    # the control: the document parses at all
     assert "spleen\\x01" in posted[0], "the escape, not the raw control character"
+
+
+def test_a_view_that_cannot_be_inspected_is_an_outcome_not_an_abort(cs, tmp_path, monkeypatch):
+    """`register_trained_model` never raises: the run record is already published. The checkpoint
+    inspection (`is_file()`/`stat()`) ran outside its guard, so a transiently unavailable output —
+    EIO on a stat — escaped, and proc-wrapup aborted before the manifest and the pointer reduction
+    (Codex P2, PR #21 round 79). The EIO is raised from the real `stat` here, and only once the run
+    record exists, which is exactly when it hurt."""
+    import errno
+    from segwrapup import model
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    _training_env(monkeypatch, host)
+    armed = []
+    real_resolve = model.resolve_accession
+    def resolve_then_arm(*a, **kw):          # the call just before the inspection: the run record is published
+        result = real_resolve(*a, **kw)
+        armed.append(True)
+        return result
+    monkeypatch.setattr(model, "resolve_accession", resolve_then_arm)
+    real_stat = Path.stat
+    def failing_stat(self, *a, **kw):
+        if armed and self.name == "segmentation_spleen.pt":
+            raise OSError(errno.EIO, "Input/output error")
+        return real_stat(self, *a, **kw)
+    monkeypatch.setattr(Path, "stat", failing_stat)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert armed, "the control: the fault was armed after the run record was published"
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777", "the run record stands"
+    error = manifest["trained_model"]["error"]
+    assert "could not be inspected" in error and "Input/output error" in error, error
+    creates = [c["path"] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert len(creates) == 1, "the run record only; no model asset"
