@@ -195,6 +195,26 @@ def _finite_json(value):
     return value, 0
 
 
+def _view_counts(views) -> dict | None:
+    """``views`` with each role's file list replaced by its count, or None when ``views`` is not a map
+    of roles at all. A count already there is kept: the run's own ``results_json``, reduced once at
+    publish, is reduced again by the link step, and ``len`` of a count raised TypeError, which cost the
+    run its link to the model (Codex P2, PR #21 round 80). A role whose value is neither is left out
+    of the counts and logged; the full mapping is in ``PROVENANCE/wrapup.json``."""
+    if not isinstance(views, dict):
+        return None
+    counts: dict = {}
+    for role, paths in views.items():
+        if isinstance(paths, (list, tuple)):
+            counts[role] = len(paths)
+        elif isinstance(paths, int) and not isinstance(paths, bool):
+            counts[role] = paths
+        else:
+            logger.warning("results_json view %r is a %s, not a file list or a count; it is left out of the counts",
+                           role, type(paths).__name__)
+    return counts
+
+
 def bounded_results_json(summary: dict) -> str:
     """``results_json`` under the schema cap. The per-role file lists are counts (the files
     are enumerable on the record's resources); if the view lists alone still overrun, they
@@ -240,12 +260,28 @@ def bounded_results_json(summary: dict) -> str:
     if len(text) <= RESULTS_JSON_MAX:
         return text
     reduced = dict(summary)
-    dropped: list[str] = []
-    if summary.get("views"):
-        reduced["views"] = {role: len(paths) for role, paths in (summary.get("views") or {}).items()}
-        dropped.append("views")
-        logger.warning("results_json would be %d characters (cap %d); the view file lists are replaced by counts, "
-                       "the full mapping stays in PROVENANCE/wrapup.json", len(text), RESULTS_JSON_MAX)
+    # The link step re-reduces the run's own results_json, which the publish may already have bounded:
+    # what that reduction left off stays named, rather than a fresh note replacing the old one and the
+    # document reading as whole (Codex P2, PR #21 round 80)
+    earlier = summary.get("truncated")
+    dropped: list[str] = [name for name in earlier if isinstance(name, str)] if isinstance(earlier, list) else []
+    views = summary.get("views")
+    if views:
+        counts = _view_counts(views)
+        if counts is None:
+            # not a map of roles, so there is nothing to count: `.items()` on a string or a list raised
+            # AttributeError out of the link step after the model was registered, which the never-raises
+            # contract does not allow (round 80). Left off whole; the mapping is in PROVENANCE/wrapup.json
+            del reduced["views"]
+            logger.warning("results_json views is a %s, not a map of roles, and the document would be %d characters "
+                           "(cap %d); views is left off, the full mapping stays in PROVENANCE/wrapup.json",
+                           type(views).__name__, len(text), RESULTS_JSON_MAX)
+        else:
+            reduced["views"] = counts
+            logger.warning("results_json would be %d characters (cap %d); the view file lists are replaced by counts, "
+                           "the full mapping stays in PROVENANCE/wrapup.json", len(text), RESULTS_JSON_MAX)
+        if "views" not in dropped:
+            dropped.append("views")
     reduced["truncated"] = _truncated_note(dropped)
     text = json.dumps(reduced, allow_nan=False)
     if len(text) > RESULTS_JSON_MAX:

@@ -1209,6 +1209,65 @@ def test_the_link_document_stays_under_the_cap_when_the_runs_results_cannot_be_p
     assert results["truncated"] == ["results_raw"] and "results_raw" not in results
 
 
+def test_a_near_cap_run_whose_views_are_not_file_lists_is_still_linked(monkeypatch):
+    """The link step merges ``trained_model`` into the run's own ``results_json`` and bounds the result.
+    A run already near the cap goes over, and the reduction counted each view's files: a ``views`` that
+    is a string or a list raised AttributeError out of the link step, after the model was registered
+    and past its guard; one the publish had already reduced to counts raised TypeError, and the run lost
+    its link to the model. And a second reduction replaced the publish's note of what it had left off
+    (Codex P2, PR #21 round 80)."""
+    import urllib.request
+    from segwrapup import model
+    from segwrapup.publish import RESULTS_JSON_MAX
+    from segwrapup.register import XnatContext
+    context = XnatContext(host="http://x", user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    link = {"trained_model": {"id": "XNAT_E88888", "label": "model_x", "xsi_type": model.MODEL_XSI_TYPE, "status": "DRAFT"}}
+
+    def near_cap(doc):
+        """`doc` padded so that it fits the cap and the link pushes it 50 characters over."""
+        over = len(json.dumps({**dict(doc, notes=""), **link}))
+        padded = dict(doc, notes="n" * (RESULTS_JSON_MAX + 50 - over))
+        assert len(json.dumps(padded)) <= RESULTS_JSON_MAX < len(json.dumps({**padded, **link}))
+        return padded
+
+    class Answer:
+        def __init__(self, body): self.body = body
+        def read(self): return self.body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    cases = (
+        # views as a string or a list: nothing to count, so it is left off whole and the rest fits
+        ({"views": "MODEL=segmentation_spleen.pt;" * 100, "model": "monailabel-train"}, ["views"], None),
+        ({"views": ["segmentation_spleen.pt"] * 100, "model": "monailabel-train"}, ["views"], None),
+        # views the publish already reduced to counts, with its note: the counts stay, the note keeps what
+        # the publish left off, and the padding is what goes this time
+        ({"views": {"MODEL": 2, "METRICS": 1}, "truncated": ["views", "per_structure"], "model": "monailabel-train"},
+         ["views", "per_structure", "notes"], {"MODEL": 2, "METRICS": 1}),
+    )
+    for current, truncated, views in cases:
+        seen = {}
+        run = near_cap(current)
+        monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(
+            json.dumps({"items": [{"data_fields": {"ID": "XNAT_E77777", "label": "run_x", "results_json": json.dumps(run)}}]}).encode()))
+        monkeypatch.setattr(model, "_put", lambda ctx, url, body, ctype, timeout: (seen.update(xml=body.decode()), (200, "XNAT_E77777"))[1])
+        assert model.note_model_on_run(context, "XNAT_E77777", "XNAT_E88888", "model_x") == "XNAT_E77777"
+        written = seen["xml"].split("<analysis:results_json>")[1].split("</analysis:results_json>")[0]
+        results = json.loads(html.unescape(written))
+        assert len(json.dumps(results)) <= RESULTS_JSON_MAX, current
+        assert results["trained_model"]["id"] == "XNAT_E88888", "the forward link is written"
+        assert results["truncated"] == truncated, results["truncated"]
+        assert results.get("views") == views
+        assert ("notes" in results) == ("notes" not in truncated), "what fits is kept"
+    # control: a run with room for the link is written as it was, plus the link, with no note
+    seen = {}
+    roomy = {"views": {"MODEL": ["segmentation_spleen.pt"]}, "model": "monailabel-train"}
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(
+        json.dumps({"items": [{"data_fields": {"ID": "XNAT_E77777", "label": "run_x", "results_json": json.dumps(roomy)}}]}).encode()))
+    model.note_model_on_run(context, "XNAT_E77777", "XNAT_E88888", "model_x")
+    written = seen["xml"].split("<analysis:results_json>")[1].split("</analysis:results_json>")[0]
+    assert json.loads(html.unescape(written)) == {**roomy, **link}
+
+
 def test_fallback_labels_are_resolved_to_accessions_before_the_model_names_the_run_or_the_run_the_model(tmp_path, monkeypatch):
     """publish_record hands back a label when XNAT's create answers no id. The model's reverse link
     (engine_metadata_json.source_run_id, provenance.json) and the run's forward link
