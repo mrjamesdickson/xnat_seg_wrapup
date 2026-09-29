@@ -933,6 +933,28 @@ def test_the_root_card_wins_and_an_empty_candidate_does_not_hide_a_usable_one(tm
         assert model_card_path(root, names) is None and read_model_card(root, names) == {}
     assert "is empty; the model registers without a card" in caplog.text
     assert "fold-0/model-card.json" in caplog.text
+    # several usable nested cards and none usable at the root: the first in view order used to describe the
+    # whole multi-fold model and was uploaded under the canonical name. Which one describes it cannot be
+    # told, so none does (Codex P2, PR #21 round 83)
+    (root / "fold-1").mkdir()
+    (root / "fold-0" / "model-card.json").write_text(json.dumps({"model": "fold-0"}))
+    (root / "fold-1" / "model-card.json").write_text(json.dumps({"model": "fold-1"}))
+    folds = ["fold-0/model-card.json", "fold-0/best.pt", "fold-1/model-card.json", "fold-1/best.pt", "model-card.json"]
+    for root_card in (b"", None):   # an empty root card, then none at all
+        if root_card is None:
+            (root / "model-card.json").unlink()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert model_card_path(root, folds) is None and read_model_card(root, folds) == {}, root_card
+        assert "2 nested cards match (fold-0/model-card.json, fold-1/model-card.json)" in caplog.text
+        assert model_card_path(root, list(reversed(folds))) is None, "and view order does not decide it"
+    # one usable nested card beside an empty one is unambiguous, and used
+    (root / "fold-1" / "model-card.json").write_bytes(b"")
+    assert model_card_path(root, folds) == root / "fold-0" / "model-card.json"
+    # the control: a usable root card is the card whatever is nested
+    (root / "fold-1" / "model-card.json").write_text(json.dumps({"model": "fold-1"}))
+    (root / "model-card.json").write_text(json.dumps({"model": "spleen"}))
+    assert model_card_path(root, folds) == root / "model-card.json"
 
 
 def test_an_empty_model_card_is_still_uploaded_and_named(cs, tmp_path, monkeypatch):

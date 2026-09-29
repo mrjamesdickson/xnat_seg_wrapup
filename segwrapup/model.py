@@ -114,25 +114,33 @@ def model_card_path(root: Path, names: list[str]) -> Path | None:
     # be uploaded under the canonical name: round 35 only stopped that happening when the nested card
     # was zero bytes (Codex P2, PR #21 round 78). A nested card is still a candidate, because an empty
     # root card must not leave the model with no card at all.
-    candidates = [root_card] + nested
-    if nested and root_card.is_file() and root_card.stat().st_size:
-        logger.warning("%s is the model card; %s also match by name and are not used",
-                       MODEL_CARD_FILENAME, ", ".join(_under(root, path) for path in nested))
-    empty = []
-    for path in candidates:
+    if root_card.is_file() and root_card.stat().st_size:
+        if nested:
+            logger.warning("%s is the model card; %s also match by name and are not used",
+                           MODEL_CARD_FILENAME, ", ".join(_under(root, path) for path in nested))
+        return root_card
+    # publish_record skips zero-byte files (XNAT refuses them), so an empty card is never advertised:
+    # consumers would be sent to a MODEL_CARD resource with nothing on it (Codex P2, PR #21 round 12).
+    # An empty root card must not leave the model cardless when a nested one is usable (round 35) ...
+    empty = [root_card] if root_card.is_file() else []
+    usable = []
+    for path in nested:
         if not path.is_file():
             continue
-        if path.stat().st_size == 0:
-            # publish_record skips zero-byte files (XNAT refuses them), so advertising this one would
-            # send consumers to a MODEL_CARD resource with nothing on it (Codex P2, PR #21 round 12).
-            # The search goes on: a broad MODEL view can name an empty fold-0/model-card.json before
-            # the usable card at the root, and taking the first candidate alone registered the model
-            # with no metadata and no card resource at all (round 35)
-            empty.append(path)
-            continue
+        (usable if path.stat().st_size else empty).append(path)
+    if len(usable) == 1:
         if empty:
-            logger.warning("%s is empty; using %s instead", _under(root, empty[0]), _under(root, path))
-        return path
+            logger.warning("%s is empty; using %s instead", _under(root, empty[0]), _under(root, usable[0]))
+        return usable[0]
+    if len(usable) > 1:
+        # ... but only one can stand in for it: with fold-0/ and fold-1/ cards and none at the root, the
+        # first in view order supplied the whole multi-fold model's metadata and was uploaded under the
+        # canonical name, describing one fold (Codex P2, PR #21 round 83). Which one describes the model
+        # cannot be told, so none does.
+        logger.warning("there is no usable %s at the DERIVED root and %d nested cards match (%s); which describes "
+                       "the model cannot be told, so the model registers without a card",
+                       MODEL_CARD_FILENAME, len(usable), ", ".join(_under(root, path) for path in usable))
+        return None
     if empty:
         logger.warning("%s is empty; the model registers without a card",
                        ", ".join(_under(root, path) for path in empty))
