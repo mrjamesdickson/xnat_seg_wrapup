@@ -53,7 +53,9 @@ plugin's `group-analysis-wrapup` retires as its commands become cards.
 ## What a dataset-scoped run does not get
 
 - **Prerequisites.** record-fetch exits 2 with the reason when a dataset run declares
-  `XNW_PREREQ_*`. The dataset is the input and is assumed complete: which sessions carry which
+  `XNW_PREREQ_*`, before it copies anything: the pass-through of `/input` comes after every
+  refusal that needs nothing from it, so a large dataset is not copied only to be refused (and a
+  full output cannot hide the reason). The dataset is the input and is assumed complete: which sessions carry which
   derivatives was settled when it was made (the group-level plugin's readiness check, its
   ADR-0004, or whoever uploaded the tree); the run reads the tree as it is.
   Resolving records against a dataset (a FLAME group over participant records, say) is a later

@@ -682,30 +682,36 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args.output.mkdir(parents=True, exist_ok=True)
-    copied = 0 if args.no_passthrough else passthrough(args.input, args.output)
-    logger.info("passed %d input file(s) through", copied)
+    # every refusal that needs nothing from the input comes before the pass-through: a dataset wrapper
+    # declaring a prerequisite had its whole frozen dataset copied first, which cost the time and the
+    # space, or failed the copy on a full output, before the reason was ever reported (Codex P2, PR #21
+    # round 87)
     try:
         prereqs = prerequisites_from_env()
     except ValueError as error:
         logger.error("%s", error)
         return 2
+    context = None
+    if prereqs:
+        context = XnatContext.from_env()
+        if context is None:
+            logger.error("prerequisites declared but the XNAT context is incomplete (XNAT_HOST/USER/PASS, PROC_PROJECT, PROC_SESSION_ID or PROC_SUBJECT_ID)")
+            return 2
+        if context.scope == "dataset":
+            # A dataset-scoped run reads the dataset's tree as it is; which sessions carry which
+            # derivatives was settled when the dataset was made (frozen and materialised by the
+            # group-level plugin, or uploaded). Resolving records against a dataset is a later
+            # extension, not a silent no-op.
+            logger.error("prerequisites are not supported at dataset scope (record-fetch %s): the run's inputs are the frozen "
+                         "dataset %s; declare none on a dataset wrapper", __version__, context.dataset)
+            return 2
+    copied = 0 if args.no_passthrough else passthrough(args.input, args.output)
+    logger.info("passed %d input file(s) through", copied)
     manifest = {"prerequisites": [], "passthrough_files": copied}
     if not prereqs:
         logger.info("no %s* variables: nothing to fetch", PREFIX)
         (args.output / MANIFEST).write_text(json.dumps(manifest, indent=2))
         return 0
-    context = XnatContext.from_env()
-    if context is None:
-        logger.error("prerequisites declared but the XNAT context is incomplete (XNAT_HOST/USER/PASS, PROC_PROJECT, PROC_SESSION_ID or PROC_SUBJECT_ID)")
-        return 2
-    if context.scope == "dataset":
-        # A dataset-scoped run reads the dataset's tree as it is; which sessions carry which
-        # derivatives was settled when the dataset was made (frozen and materialised by the
-        # group-level plugin, or uploaded). Resolving records against a dataset is a later
-        # extension, not a silent no-op.
-        logger.error("prerequisites are not supported at dataset scope (record-fetch %s): the run's inputs are the frozen "
-                     "dataset %s; declare none on a dataset wrapper", __version__, context.dataset)
-        return 2
     try:
         try:
             resolutions = resolve(context, prereqs)
