@@ -124,9 +124,11 @@ def open_session(context: XnatContext, timeout_seconds: float = 60.0) -> bool:
     the run continues with Basic auth per request; publishing never depends on this."""
     object.__setattr__(context, "session_tried", True)
     credentials = base64.b64encode(f"{context.user}:{context.password}".encode()).decode()
-    request = urllib.request.Request(f"{context.host}/data/JSESSION", method="POST",
-                                     headers={"Authorization": f"Basic {credentials}"})
     try:
+        # built inside the guard: a host with no scheme makes Request raise ValueError, which escaped from
+        # here through auth_headers into every best-effort reader (Codex P2, PR #21 round 105)
+        request = urllib.request.Request(f"{context.host}/data/JSESSION", method="POST",
+                                         headers={"Authorization": f"Basic {credentials}"})
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             token = response.read().decode(errors="replace").strip()
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError) as error:
@@ -145,8 +147,8 @@ def close_session(context: XnatContext, timeout_seconds: float = 60.0) -> None:
     the session then expires on the server's idle timeout."""
     if not context.jsession:
         return
-    request = urllib.request.Request(f"{context.host}/data/JSESSION", method="DELETE", headers=auth_headers(context))
     try:
+        request = urllib.request.Request(f"{context.host}/data/JSESSION", method="DELETE", headers=auth_headers(context))
         with urllib.request.urlopen(request, timeout=timeout_seconds):
             pass
         logger.info("XNAT session closed")
@@ -257,8 +259,10 @@ def fetch_dataset_facts(context: XnatContext, timeout_seconds: float = 60.0) -> 
     if not context.dataset:
         return {}
     url = f"{context.host}/data/experiments/{urllib.parse.quote(context.dataset, safe='')}?format=json"
-    request = urllib.request.Request(url, headers=auth_headers(context))
     try:
+        # the request is built inside the guard too: a malformed XNAT_HOST (no scheme) raised ValueError here,
+        # before it, and aborted proc-wrapup before its report and manifest (Codex P2, PR #21 round 105)
+        request = urllib.request.Request(url, headers=auth_headers(context))
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             payload = json.loads(response.read().decode())
         item = payload["items"][0]
@@ -328,8 +332,8 @@ def fetch_subject_label(context: XnatContext, timeout_seconds: float = 60.0) -> 
     does not answer, so the record label is still unique."""
     url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/subjects/"
            f"{urllib.parse.quote(context.subject, safe='')}?format=json")
-    request = urllib.request.Request(url, headers=auth_headers(context))
     try:
+        request = urllib.request.Request(url, headers=auth_headers(context))      # inside the guard (round 105)
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             payload = json.loads(response.read().decode())
         label = _encodable(str(payload["items"][0]["data_fields"].get("label") or "").strip(),
@@ -360,8 +364,8 @@ def fetch_session_label(context: XnatContext, timeout_seconds: float = 60.0) -> 
     """The session's label (``RSNA0002``) for ``context.session`` (``XNAT_E25251``); empty when
     XNAT does not answer, so callers fall back to the id and still get a unique label."""
     url = f"{context.host}/data/experiments/{urllib.parse.quote(context.session, safe='')}?format=json"
-    request = urllib.request.Request(url, headers=auth_headers(context))
     try:
+        request = urllib.request.Request(url, headers=auth_headers(context))      # inside the guard (round 105)
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             payload = json.loads(response.read().decode())
         label = _encodable(str(payload["items"][0]["data_fields"].get("label") or "").strip(),

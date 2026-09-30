@@ -274,6 +274,29 @@ def test_a_long_scan_id_leaves_room_for_the_session_that_tells_runs_apart():
         "merlin", scan, when.replace(second=31), session_label="RSNA0001")
 
 
+def test_a_host_without_a_scheme_is_a_best_effort_failure_not_an_abort(caplog):
+    """A malformed XNAT_HOST (no scheme) makes urllib's Request raise ValueError, and the best-effort readers
+    built their request before their guard, so fetch_dataset_facts aborted proc-wrapup before its report and
+    manifest (Codex P2, PR #21 round 105). open_session, which auth_headers calls first, did the same, and so
+    did the session and subject readers and close_session. Each falls back now, as for no answer at all."""
+    from segwrapup.register import (XnatContext, close_session, fetch_dataset_facts, fetch_session_label,
+                                    fetch_subject_label, open_session)
+    def ctx(**kw):
+        return XnatContext(host="demo02.xnatworks.io", user="u", password="p", project="P1", session="XNAT_E1", **kw)
+    with caplog.at_level("WARNING"):
+        assert open_session(ctx()) is False
+        assert fetch_dataset_facts(ctx(dataset="XNAT_D1")) == {}
+        assert fetch_session_label(ctx()) == "XNAT_E1"
+        assert fetch_subject_label(ctx(subject="XNAT_S1")) == "XNAT_S1"
+        closing = ctx()
+        object.__setattr__(closing, "jsession", "ABCDEFGH12345678")
+        close_session(closing)
+        assert closing.jsession == ""
+    assert "unknown url type" in caplog.text
+    # the control: the same readers with no dataset make no request at all
+    assert fetch_dataset_facts(ctx(dataset="")) == {}
+
+
 def test_fetch_session_label_falls_back_to_the_id(caplog):
     from segwrapup.register import XnatContext, fetch_session_label
     context = XnatContext(host="http://127.0.0.1:9", user="u", password="p", project="P", session="XNAT_E1", session_tried=True)
