@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.1 (2026-09-26)
+
+Training cards register their model (the link pair of
+container-workshop `DATASET-SCOPE-CARDS-DESIGN.md` §7.2/§8, without the retired group-analysis-wrapup).
+
+- **`produces: model`.** A results block may say `"produces": "model"` (`XNW_PRODUCES=model`;
+  any other value is a contract error). At dataset scope, after the run record, proc-wrapup
+  registers the files of the card's `MODEL` view as an `analysis:trainedModelData` project
+  asset in `DRAFT` (weights on `MODEL`, the tool's `model-card.json` on `MODEL_CARD`,
+  `provenance.json` on `PROVENANCE`; `source_dataset_id`, `engine_metadata_json.source_run_id` (not
+  `source_training_id`, a foreign key to `groupTrainingData` in schema plugin 0.2.0: live 500 on
+  demo02, 2026-09-26), and the
+  card's framework/name/checkpoint/labels/best dice when a model card is present), then writes
+  `results_json.trained_model` on the run record (not `produced_model_id`, which schema plugin 0.2.0
+  gives only `groupTrainingData`; and by a partial XML PUT, since the query-parameter form creates a
+  stray record on a project asset, demo02 2026-09-26). Nothing is registered from a failed run, outside
+  dataset scope, or without weights; the run record is never rolled back for the model's sake;
+  every outcome is in `wrapup.json` under `trained_model`. `segwrapup/model.py`;
+  `RecordContract.produces`; `publish_record(..., xsi_type=)`.
+- Image tags 0.7.1 (seg-wrapup, proc-wrapup, record-fetch).
+
 ## 0.7.0 (2026-09-24)
 
 Dataset scope: group-level results save like the session and subject ones (James, 2026-09-24:

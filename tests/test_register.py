@@ -217,6 +217,84 @@ def test_collection_label_carries_the_session_and_trims_only_the_model():
     long = collection_label("A" * 80, "2", when, session_label="RSNA260904145051_0002")
     assert len(long) <= LABEL_MAX and long.endswith("_RSNA260904145051_0002_scan2_20260906T201135Z")
     assert collection_label("!!!", "2", when, session_label="S/1") == "SEG_S_1_scan2_20260906T201135Z"
+    # the reserve holds at the boundary: a 35-character scan id with reserve 7 must leave a 57-character
+    # label at most, stamp intact, and a longer id gives up its own tail, never the stamp (round 15)
+    for scan in ("s" * 35, "s" * 36, "s" * 60):
+        label = collection_label("merlin", scan, when, session_label="RSNA0001", reserve=len("_record"))
+        assert len(label) <= LABEL_MAX - len("_record"), (scan, label)
+        assert label.endswith("_20260906T201135Z") and label.startswith("m")
+    assert len(collection_label("merlin", "s" * 80, when)) <= LABEL_MAX
+
+
+def test_long_scan_ids_and_session_labels_that_share_a_prefix_keep_distinct_labels():
+    """A long scan id was cut to its prefix, so two scans of one session whose ids share it (series UIDs
+    under one study root) got the same label in the same second, and register_collection's overwrite
+    replaced the first scan's collection with the second's (Codex P2, PR #21 round 102). A shortened
+    scan id or session label keeps a digest of the whole of it."""
+    from datetime import datetime, timezone
+    from segwrapup.register import LABEL_MAX, collection_label
+    when = datetime(2026, 9, 30, 3, 5, 47, tzinfo=timezone.utc)
+    root = "1.3.12.2.1107.5.2.43.66037.30000026093003054700000"
+    scans = (root + "11", root + "12")
+    for reserve in (0, len("_record")):
+        a, b = (collection_label("merlin", scan, when, session_label="RSNA0001", reserve=reserve) for scan in scans)
+        assert a != b, (reserve, a)
+        for label in (a, b):
+            assert len(label) <= LABEL_MAX - reserve and label.endswith("_20260930T030547Z"), label
+        # the same scan always shortens the same way, so a label can be rebuilt
+        assert a == collection_label("merlin", scans[0], when, session_label="RSNA0001", reserve=reserve)
+    # two sessions whose long labels share the prefix that fits, in one project and one second
+    sessions = ("RSNA_DEMO_COHORT_" + "X" * 40 + "_0001", "RSNA_DEMO_COHORT_" + "X" * 40 + "_0002")
+    a, b = (collection_label("monailabel-train", "", when, session_label=owner, reserve=len("_record")) for owner in sessions)
+    assert a != b and all(len(label) <= LABEL_MAX - len("_record") for label in (a, b)), (a, b)
+    # the control: ids that fit are untouched
+    assert collection_label("merlin", "2", when, session_label="RSNA0001") == "merlin_RSNA0001_scan2_20260930T030547Z"
+
+
+def test_a_long_scan_id_leaves_room_for_the_session_that_tells_runs_apart():
+    """A scan id too long to fit took all the room and the session label was dropped, so two sessions running
+    one model on the same long scan id in the same second built the same label, which the project refuses
+    and the ROI registration does not retry (Codex P2, PR #21 round 103). The session keeps its digest."""
+    from datetime import datetime, timezone
+    from segwrapup.register import LABEL_MAX, collection_label
+    when = datetime(2026, 9, 30, 3, 31, 30, tzinfo=timezone.utc)
+    scan = "1.3.12.2.1107.5.2.43.66037.30000026093003313000000011"
+    for reserve in (0, len("_record")):
+        for sessions in (("RSNA0001", "RSNA0002"),
+                         ("RSNA_DEMO_COHORT_" + "X" * 40 + "_0001", "RSNA_DEMO_COHORT_" + "X" * 40 + "_0002")):
+            a, b = (collection_label("merlin", scan, when, session_label=s, reserve=reserve) for s in sessions)
+            assert a != b, (reserve, a)
+            for label, session in zip((a, b), sessions):
+                assert len(label) <= LABEL_MAX - reserve and label.endswith("_20260930T033130Z"), label
+                assert "_scan1_3_12" in label, "the scan keeps a readable start too"
+                if len(session) <= 16:
+                    assert f"_{session}_" in label, "a short session label is kept whole"
+    # the control: the same scan id and session in different seconds differ by the stamp, as before
+    assert collection_label("merlin", scan, when, session_label="RSNA0001") != collection_label(
+        "merlin", scan, when.replace(second=31), session_label="RSNA0001")
+
+
+def test_a_host_without_a_scheme_is_a_best_effort_failure_not_an_abort(caplog):
+    """A malformed XNAT_HOST (no scheme) makes urllib's Request raise ValueError, and the best-effort readers
+    built their request before their guard, so fetch_dataset_facts aborted proc-wrapup before its report and
+    manifest (Codex P2, PR #21 round 105). open_session, which auth_headers calls first, did the same, and so
+    did the session and subject readers and close_session. Each falls back now, as for no answer at all."""
+    from segwrapup.register import (XnatContext, close_session, fetch_dataset_facts, fetch_session_label,
+                                    fetch_subject_label, open_session)
+    def ctx(**kw):
+        return XnatContext(host="demo02.xnatworks.io", user="u", password="p", project="P1", session="XNAT_E1", **kw)
+    with caplog.at_level("WARNING"):
+        assert open_session(ctx()) is False
+        assert fetch_dataset_facts(ctx(dataset="XNAT_D1")) == {}
+        assert fetch_session_label(ctx()) == "XNAT_E1"
+        assert fetch_subject_label(ctx(subject="XNAT_S1")) == "XNAT_S1"
+        closing = ctx()
+        object.__setattr__(closing, "jsession", "ABCDEFGH12345678")
+        close_session(closing)
+        assert closing.jsession == ""
+    assert "unknown url type" in caplog.text
+    # the control: the same readers with no dataset make no request at all
+    assert fetch_dataset_facts(ctx(dataset="")) == {}
 
 
 def test_fetch_session_label_falls_back_to_the_id(caplog):
@@ -298,16 +376,31 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
     # fields in ``data_fields``; ``included_count`` arrives as a number.
     answers = {"XNAT_D1": ("analysis:analysisDatasetData", {"label": "cohort-v1", "included_count": 26}),
                "XNAT_D2": ("xnat:mrSessionData", {"label": "not-a-cohort"}),
-               "XNAT_D3": ("analysis:analysisDatasetData", {"label": "odd", "included_count": "many"})}
+               "XNAT_D3": ("analysis:analysisDatasetData", {"label": "odd", "included_count": "many"}),
+               "XNAT_D5": ("analysis:analysisDatasetData", None),                 # valid JSON, data_fields null
+               "XNAT_D6": ("analysis:analysisDatasetData", ["label", "cohort"]),  # or not an object
+               "XNAT_D7": (["analysis:analysisDatasetData"], {"label": "listy", "included_count": 3}),   # meta of the wrong shape
+               "XNAT_D8": ("analysis:analysisDatasetData", {"label": "huge", "included_count": 1e309}),   # decodes as infinity
+               "XNAT_D9x": ("analysis:analysisDatasetData", {"label": "frac", "included_count": 2.5}),
+               "XNAT_D10": ("analysis:analysisDatasetData", {"label": "whole", "included_count": 12.0}),
+               # a JSON string holding an unpaired surrogate: Python decodes it, and every write of it
+               # raises UnicodeEncodeError after the run (Codex P2, PR #21 round 33)
+               "XNAT_D12": ("analysis:analysisDatasetData", {"label": "\ud800cohort", "included_count": 3})}
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
             seen.append(self.path)
             asset = self.path.split("/experiments/")[-1].split("?")[0]
+            if asset == "XNAT_D11":                                  # valid JSON nested past the parser's recursion limit (round 27)
+                self.send_response(200); self.end_headers(); self.wfile.write(b'{"items": [' + b"[" * 100000 + b"]" * 100000 + b"]}"); return
+            if asset == "XNAT_D4":                                   # a body cut short: http.client.IncompleteRead
+                self.send_response(200); self.send_header("Content-Length", "4096"); self.end_headers()
+                self.wfile.write(b'{"items": [{"data_fi'); self.wfile.flush(); self.connection.close(); return
             if asset not in answers:
                 self.send_response(500); self.end_headers(); return
             xsi, fields = answers[asset]
-            body = json.dumps({"items": [{"meta": {"xsi:type": xsi, "isHistory": False}, "data_fields": fields}]}).encode()
+            meta = xsi if isinstance(xsi, list) else {"xsi:type": xsi, "isHistory": False}
+            body = json.dumps({"items": [{"meta": meta, "data_fields": fields}]}).encode()
             self.send_response(200); self.end_headers(); self.wfile.write(body)
 
         def do_POST(self):
@@ -329,9 +422,66 @@ def test_fetch_dataset_facts_reads_label_and_member_count_and_falls_back_to_the_
             assert fetch_dataset_facts(ctx("XNAT_D2")) == {"label": "not-a-cohort"}
             assert fetch_dataset_facts(ctx("XNAT_D3")) == {"label": "odd"}
             assert fetch_dataset_label(ctx("XNAT_D9")) == "XNAT_D9"
+            assert fetch_dataset_facts(ctx("XNAT_D4")) == {}, "a truncated answer is best-effort too (Codex P2, PR #21)"
+            assert fetch_dataset_facts(ctx("XNAT_D11")) == {}, "nested past the recursion limit: best-effort, not an abort (round 27)"
+            assert fetch_dataset_facts(ctx("XNAT_D5")) == {}, "data_fields null: best-effort, not AttributeError (Codex P2, round 10)"
+            assert fetch_dataset_facts(ctx("XNAT_D6")) == {}
+            assert fetch_dataset_facts(ctx("XNAT_D7")) == {"label": "listy", "included_count": 3}, "a meta of the wrong shape costs only the type check (round 11)"
+            assert fetch_dataset_facts(ctx("XNAT_D8")) == {"label": "huge"}, "1e309 is infinity: no OverflowError out of the best-effort reader (round 14)"
+            assert fetch_dataset_facts(ctx("XNAT_D9x")) == {"label": "frac"}
+            assert fetch_dataset_facts(ctx("XNAT_D10")) == {"label": "whole", "included_count": 12}
+            surrogate = fetch_dataset_facts(ctx("XNAT_D12"))
+            assert surrogate == {"label": "\\ud800cohort", "included_count": 3}, "readable, and writable at all"
+            surrogate["label"].encode()   # what the report, the record XML and wrapup.json all do
+            assert fetch_dataset_label(ctx("XNAT_D12")) == "\\ud800cohort"
+        from segwrapup.register import COUNT_MAX, _whole_count
+        assert _whole_count(COUNT_MAX) == COUNT_MAX and _whole_count(str(COUNT_MAX)) == COUNT_MAX and _whole_count(float(2**31 - 1)) == COUNT_MAX
+        for bad in (10 ** 400, str(10 ** 400), COUNT_MAX + 1, float(2**31), -1, True):   # a 400-digit literal is not a count (round 16)
+            with pytest.raises((ValueError, TypeError)):
+                _whole_count(bad)
+        assert "meta of type list, not an object" in caplog.text
+        assert "data_fields is NoneType, not an object" in caplog.text and "data_fields is list, not an object" in caplog.text
         assert "is a xnat:mrSessionData, not an analysis:analysisDatasetData" in caplog.text
         assert "non-numeric included_count" in caplog.text
         assert "could not read dataset XNAT_D9" in caplog.text
+        assert "cannot be encoded as UTF-8" in caplog.text
         assert fetch_dataset_facts(XnatContext(host=host, user="u", password="p", project="P1", session="XNAT_E1")) == {}
     finally:
         server.shutdown()
+
+
+def test_no_docstring_holds_an_unencodable_character():
+    """A docstring with a lone surrogate in it compiles here but fails on Python 3.13 and later with
+    "surrogates not allowed", so the module — and every CLI that imports it — cannot be imported at all
+    there, while `pyproject.toml` accepts those versions (Codex P1, PR #21 round 34). A test string may
+    legitimately hold one, and does; a docstring may not."""
+    import ast, pathlib, segwrapup
+    checked = 0
+    for path in sorted(pathlib.Path(segwrapup.__file__).parent.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                doc = ast.get_docstring(node)
+                if doc:
+                    checked += 1
+                    try:
+                        doc.encode()
+                    except UnicodeEncodeError as error:
+                        raise AssertionError(f"{path.name}: a docstring cannot be encoded as UTF-8 "
+                                             f"({error}); it will not compile on Python 3.13") from error
+    assert checked > 50, f"only {checked} docstrings were checked; the walk is not finding them"
+
+
+def test_collection_label_reserves_room_for_a_caller_suffix():
+    """proc-wrapup appends _record; without the reservation a long dataset label made a 71-character
+    record label that XNAT refuses (Codex P2, PR #21)."""
+    from datetime import datetime, timezone
+    from segwrapup.register import LABEL_MAX, collection_label
+    when = datetime(2026, 9, 26, 17, 41, 42, tzinfo=timezone.utc)
+    owner = "nnunet-nnunet_msd_spleen_demo-20260803_121930-with-a-very-long-cohort-name"
+    plain = collection_label("monailabel-train", "", when=when, session_label=owner)
+    assert len(plain) == LABEL_MAX
+    reserved = collection_label("monailabel-train", "", when=when, session_label=owner, reserve=len("_record"))
+    assert len(reserved + "_record") <= LABEL_MAX
+    assert reserved.endswith("20260926T174142Z"), "the stamp that makes it unique is kept; the model name gives way"
+

@@ -99,7 +99,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.7.0"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.7.1"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -212,8 +212,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.7.0 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.7.0
+docker build -t xnatworks/seg-wrapup:0.7.1 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.7.1
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
@@ -235,7 +235,13 @@ only; not a medical device.
 ROI collections and records are XNAT experiments, whose labels are unique per project. The
 default label is `<pipeline>_<session label>_scan<id>_<UTC stamp>` (since 0.4.1; the session
 id when its label cannot be read), so two sessions' runs of one pipeline finishing in the same
-second cannot collide; a 409 on create is retried once with a random suffix.
+second cannot collide. A record's create that meets a 409 is retried once with a random suffix;
+an ROI collection is registered with `overwrite=true` and not retried, so its label has to be
+distinct already. Labels are at most 64 characters: the pipeline name gives way first, and a scan
+id or session label too long to fit keeps its start and ends in eight hex digits of a digest of
+the whole, so two long scan ids that share a prefix (series UIDs under one study root, say) still
+get different labels. When both are too long, the session label keeps 16 characters (its digest
+and seven of its own) and the scan id the rest, so neither is dropped.
 
 ## record-fetch: prerequisites resolved at launch (since 0.5.0)
 
@@ -292,7 +298,7 @@ session, where the reviewer looks. A FAILED record never satisfies a prerequisit
 A subject-scoped wrapper (plan D26: `<app>-subject` beside `<app>-session`) mounts the project
 archive through a derived Project input, because a Subject has no directory of its own. Its
 records mount is a second Project input carrying `via-setup-command
-xnatworks/record-fetch:0.7.0:record-fetch-subject`, which is `record-fetch --no-passthrough`
+xnatworks/record-fetch:0.7.1:record-fetch-subject`, which is `record-fetch --no-passthrough`
 (`commands/record-fetch-subject.json`, the same image): the prerequisites are resolved on every
 session of the subject and written to `prereq/<name>/<session label>/`, and nothing is passed
 through, since passing the archive through would copy it. Register it beside `record-fetch`
@@ -369,3 +375,32 @@ No `scans`, no subject, no session. record-fetch refuses prerequisites at this s
 dataset's tree is the run's input, assumed complete, whether the group-level plugin
 materialised it or someone uploaded it; neither the run nor the record needs that plugin.
 Details and the reasons: `docs/DATASET-SCOPE.md`.
+
+### Training cards: `produces: model` (0.7.1)
+
+A dataset-scoped card whose results block says `"produces": "model"` (`XNW_PRODUCES=model` on
+the command) trains something. Its weights sit in `DERIVED` like any other output, named by
+the card's `MODEL` view (`XNW_RESOURCE_MODEL="*.pt,model-card.json"`). After the run record is
+published, proc-wrapup registers those files as an `analysis:trainedModelData` project asset
+in `DRAFT` (`model_<dataset label>_<stamp>_<run id>`, the run's `E…` part, so two runs on one dataset in the same second get distinct labels): the weights on its `MODEL` resource, the tool's
+`model-card.json` on `MODEL_CARD` when it wrote one, a small `provenance.json` on
+`PROVENANCE`; `source_dataset_id` names the frozen dataset and `engine_metadata_json.source_run_id`
+the run (not `source_training_id`: in the analysis schema plugin up to 0.2.0 that field is a foreign
+key to `analysis:groupTrainingData`, and a group record there makes XNAT answer 500),
+`model_framework`/`model_name`/`default_checkpoint`/`task_type`/`label_names`/`num_classes`/
+`best_validation_dice` come from the model card when present, and `engine_metadata_json` carries the card's
+training facts under the schema's 65,536-character cap (an over-long `train_stats` is reduced to its
+scalars, then dropped, with `truncated` saying so; the full card stays on `MODEL_CARD`). The run record then gets
+`results_json.trained_model` (`{id, label, xsi_type, status}`) by a partial XML PUT keyed on its ID,
+so the two point at each other. Not `produced_model_id`: in the analysis schema plugin up to 0.2.0 that
+field exists only on `analysis:groupTrainingData`, and XNAT's query-parameter update of a project
+asset creates a second record instead of updating (seen live, 2026-09-26). `wrapup.json` carries the outcome under `trained_model`.
+
+What it does not do: register anything from a run that did not succeed, from a session- or
+subject-scoped run, or when the `MODEL` view names no file (each is recorded under
+`trained_model` and the run record stands regardless); decide whether the model is any good
+(promotion out of `DRAFT` is a person's act in the grouplevel plugin's models page); or roll
+back the run record when the model registration fails. The copy of `wrapup.json` already on
+the run record predates the registration; the local manifest and the pointer carry it.
+`segwrapup/model.py`; the design that asked for it is
+`xnat_monailabel_plugin/docs/MONAI_TRAINING_FROM_DATASET_DESIGN.md`.

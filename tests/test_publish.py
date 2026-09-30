@@ -890,6 +890,64 @@ def test_results_json_stays_under_the_schema_cap_on_a_big_tree(tmp_path, caplog)
     # a small tree keeps its view paths verbatim
     small = json.loads(bounded_results_json({"views": {"METRICS": ["a.json"]}, "file_counts": {"DERIVED": 1}}))
     assert small["views"] == {"METRICS": ["a.json"]} and "truncated" not in small
+    # the view counts do not touch a value the link step could not parse and kept as raw text, so the
+    # document stayed over the cap, XNAT refused the whole PUT, and the run lost its only forward link
+    # to the model that had just been registered (Codex P2, PR #21 round 30)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        bounded = json.loads(bounded_results_json({"results_raw": "x" * 200000, "views": {"METRICS": ["a.json"]},
+                                                   "trained_model": {"id": "XNAT_E1", "label": "model_x"}}))
+    assert len(json.dumps(bounded)) <= RESULTS_JSON_MAX
+    assert bounded["trained_model"] == {"id": "XNAT_E1", "label": "model_x"}, "the forward link is what must survive"
+    assert "results_raw" not in bounded and bounded["truncated"] == ["views", "results_raw"]
+    assert "left off (they are in PROVENANCE/wrapup.json)" in caplog.text
+    # nothing to reduce first: the overrunning value is named on its own
+    only_raw = json.loads(bounded_results_json({"results_raw": "y" * 100000, "trained_model": {"id": "XNAT_E2"}}))
+    assert only_raw["truncated"] == ["results_raw"] and only_raw["trained_model"] == {"id": "XNAT_E2"}
+    # and the pathological case, the link itself over the cap: said plainly rather than written silently
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        kept = json.loads(bounded_results_json({"trained_model": {"id": "x" * 100000}}))
+    assert kept["trained_model"]["id"] == "x" * 100000 and "XNAT will refuse it" in caplog.text
+    # Python decodes NaN and Infinity and writes them straight back; nothing strict can read the
+    # element then. A measured volume that came out NaN, or a run's own results_json re-read by the
+    # link step, must not be stored as one of those tokens (Codex P2, PR #21 round 31)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        written = bounded_results_json({"total_volume_ml": float("nan"), "structures": [{"dice": float("inf")}],
+                                        "trained_model": {"id": "XNAT_E3"}})
+    assert "NaN" not in written and "Infinity" not in written
+    finite = json.loads(written)
+    assert finite["total_volume_ml"] is None and finite["structures"] == [{"dice": None}]
+    assert finite["non_finite_values_replaced"] == 2 and finite["trained_model"] == {"id": "XNAT_E3"}
+    assert "non_finite_values_replaced" in caplog.text
+    assert json.loads(bounded_results_json({"total_volume_ml": 1.5})) == {"total_volume_ml": 1.5}, \
+        "finite numbers are untouched and nothing is added"
+    # a structure too deep to walk cannot be checked for non-finite numbers, and carrying on would hand
+    # allow_nan=False a NaN it refuses with a ValueError — out of a link step whose contract is that it
+    # never raises, aborting the wrapup after the model was registered (Codex P2, PR #21 round 35)
+    deep = {"leaf": float("nan")}
+    for _ in range(3000):
+        deep = {"n": deep}
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        reduced = json.loads(bounded_results_json({"results_raw": deep, "views": {"METRICS": ["a.json"]},
+                                                   "trained_model": {"id": "XNAT_E4"}}))
+    assert reduced == {"trained_model": {"id": "XNAT_E4"}, "truncated": ["results_raw", "views"]}
+    assert "nested too deep" in caplog.text
+    # a run's existing results can hold thousands of fields, and naming every one made the note itself
+    # overrun the cap, so the document the PUT carried was refused after all (Codex P2, PR #21 round 36)
+    many = {f"field_{i:04d}_" + "x" * 200: i for i in range(3000)}
+    crowded = json.loads(bounded_results_json({**many, "trained_model": {"id": "XNAT_E5"}}))
+    assert len(json.dumps(crowded)) <= RESULTS_JSON_MAX, "the note is bounded too"
+    assert crowded["trained_model"] == {"id": "XNAT_E5"}, "and the forward link still survives"
+    assert crowded["truncated"][-1].startswith("and ") and crowded["truncated"][-1].endswith("more")
+    assert crowded["truncated"][0].startswith("field_"), "the names that fit are still there to read"
+    named = int(crowded["truncated"][-1].split()[1])
+    kept_fields = [key for key in crowded if key.startswith("field_")]
+    listed = [entry for entry in crowded["truncated"] if entry.startswith("field_")]
+    assert named == 3000 - len(kept_fields) - len(listed), "the count accounts for every field left off"
+    assert kept_fields, "and the fields that did fit are kept, not thrown away wholesale"
 
 
 def test_create_409_at_subject_scope_relabels_the_subject_document(xnat, tmp_path):
@@ -1050,6 +1108,14 @@ def test_publish_at_dataset_scope_creates_under_the_project_and_uploads_to_exper
     with pytest.raises(RuntimeError, match="already exists on XNAT_D1"):
         publish_record(_dataset_context(host), "taken_X", "<xml/>", files, output_dir=tmp_path)
     assert [c["method"] for c in handler.calls if c["path"] != "/data/JSESSION"] == ["GET"]
+    # a label the wrapup generated itself is retried once with a suffix (two runs in one second on one dataset;
+    # dataset scope has no per-session namespace, so the preflight sees the other run's record: Codex P2, PR #21 round 9)
+    handler.calls.clear(); handler.existing_labels = {"taken_X"}
+    outcome = publish_record(_dataset_context(host), "taken_X", '<a:GroupAnalysis label="taken_X"/>', files, output_dir=tmp_path, generated_label=True)
+    assert outcome["id"] == "XNAT_E99999" and outcome["label"].startswith("taken_X_") and len(outcome["label"]) == len("taken_X_") + 4
+    paths = [c["path"] for c in handler.calls if c["path"] != "/data/JSESSION"]
+    assert paths[0] == "/data/projects/PROJ_1/experiments/taken_X?format=json" and paths[1].startswith("/data/projects/PROJ_1/experiments/taken_X_") and paths[1].endswith("?format=json")
+    assert paths[2] == paths[1].replace("?format=json", "?inbody=true"), "the retried label is created, not the taken one"
     handler.existing_labels = set(); handler.fail_paths = {"/data/experiments/XNAT_E99999/resources/DERIVED/files/sub-01"}
     with pytest.raises(RuntimeError, match="record XNAT_E99999 deleted"):
         publish_record(_dataset_context(host), "fresh_X", "<xml/>", files, output_dir=tmp_path)
@@ -1103,3 +1169,79 @@ def test_dataset_provenance_reads_the_asset_and_publish_if_possible_stamps_it(xn
         assert dataset_provenance(_dataset_context(host)) == {"scope": "dataset", "dataset": "XNAT_D1", "dataset_label": "",
                                                              "project": "PROJ_1", "included_count": None}
     assert "could not read dataset XNAT_D1" in caplog.text
+
+
+def test_contract_produces_model_is_parsed_from_env_and_json_and_anything_else_is_refused(monkeypatch):
+    for key in ("XNW_CONTRACT", "XNW_PRODUCES"):
+        monkeypatch.delenv(key, raising=False)
+    from segwrapup import publish
+    env = {"XNW_CARD_ID": "monailabel-train", "XNW_PRODUCES": "model"}
+    assert publish.RecordContract.from_env(env).produces == "model"
+    assert publish.RecordContract.from_env({"XNW_CARD_ID": "x"}).produces == ""
+    assert publish.RecordContract.from_env({"XNW_CONTRACT": json.dumps({"card_id": "x", "produces": "model"})}).produces == "model"
+    with pytest.raises(ValueError, match="produces"):
+        publish.RecordContract.from_env({"XNW_CARD_ID": "x", "XNW_PRODUCES": "dataset"})
+    with pytest.raises(ValueError, match="produces"):
+        publish.RecordContract.from_env({"XNW_CONTRACT": json.dumps({"card_id": "x", "produces": "weights"})})
+
+
+def test_relabel_reaches_a_trained_model_root_too():
+    """A 409 retry rewrites the label in the document as well as the URL; before PR #21 round 1
+    only *Analysis roots matched, so a TrainedModel retry kept the occupied label in its body."""
+    from segwrapup.publish import _relabel
+    xml = '<analysis:TrainedModel xmlns:analysis="x" project="P" label="model_a_1"><analysis:model_status>DRAFT</analysis:model_status></analysis:TrainedModel>'
+    out = _relabel(xml, "model_a_1_x9")
+    assert 'label="model_a_1_x9"' in out and 'label="model_a_1"' not in out
+    assert _relabel('<analysis:GroupAnalysis label="g"><analysis:notes>label="keep"</analysis:notes></analysis:GroupAnalysis>', "g2").startswith('<analysis:GroupAnalysis label="g2">')
+
+
+
+def test_publish_if_possible_treats_the_label_it_stamps_as_generated(xnat, tmp_path, monkeypatch):
+    """seg-wrapup's cli calls publish_if_possible without a record label; the label stamped here is a
+    generated one, so a same-second collision on the dataset is retried with a suffix rather than
+    refused (Codex P2, PR #21 round 10). A caller's own label is still never rewritten."""
+    from types import SimpleNamespace
+    from segwrapup import publish
+    host, handler = xnat
+    (tmp_path / "report.html").write_text("<html/>")
+    for k, v in {"XNW_CARD_ID": "c", "XNW_ANALYSIS_TYPE": "group_glm", "XNW_CONTAINER_IMAGE": "i:1"}.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(publish, "collection_label", lambda *a, **k: "stamped_X")
+    handler.existing_labels = {"stamped_X"}
+    args = SimpleNamespace(no_publish=False, record_label="", model="m", scan="")
+    outcome = publish.publish_if_possible(args, tmp_path, {"model": "m", "model_version": "1"}, [], False, context=_dataset_context(host))
+    assert outcome.get("error") is None, outcome
+    assert outcome["label"].startswith("stamped_X_") and len(outcome["label"]) == len("stamped_X_") + 4
+    # a label the caller chose that is taken stays an error
+    handler.calls.clear(); handler.existing_labels = {"mine_X"}
+    args = SimpleNamespace(no_publish=False, record_label="mine_X", model="m", scan="")
+    outcome = publish.publish_if_possible(args, tmp_path, {"model": "m", "model_version": "1"}, [], False, context=_dataset_context(host))
+    assert "already exists" in outcome["error"]
+    assert [c["method"] for c in handler.calls if c["path"] != "/data/JSESSION" and "XNAT_D1" not in c["path"]] == ["GET"]
+
+
+def test_a_character_xml_cannot_carry_is_written_as_its_escape_not_into_the_document():
+    """XML 1.0 carries tab, newline, carriage return and #x20 upwards; every other C0 control is
+    forbidden *in the document* however cleanly it encodes as UTF-8. `json.loads` accepts
+    "\\u0001" and `str.encode` encodes it, so a model card saying {"model": "bad\\u0001"} used to
+    travel into the record document and XNAT refused the POST as malformed — usable checkpoints left
+    unregistered over one character (Codex P2, PR #21 round 77). Unlike the unpaired surrogate, which
+    fails at encode() and is caught there, nothing downstream noticed this one."""
+    import xml.etree.ElementTree as ET
+    from segwrapup.publish import _element, _xml_text
+
+    document = ("<r xmlns:analysis='urn:x'>"
+                + _element("model_name", "bad\x01end")
+                + _element("notes", "vertical\x0btab and the non-character ￾")
+                + _element("description", "tab\there, newline\nhere, return\rhere")
+                + "</r>")
+    root = ET.fromstring(document)                      # the whole point: it parses at all
+    text = {child.tag.split("}")[-1]: child.text for child in root}
+    assert text["model_name"] == "bad\\x01end"
+    assert text["notes"] == "vertical\\x0btab and the non-character \\ufffe"
+    # DEL and the C1 controls are legal in XML 1.0 (only 1.1 restricts them), so they are left alone
+    assert _xml_text("notes", "a \x7f delete") == "a \x7f delete"
+    # the three XML allows are untouched (ET normalises a lone \r to \n on parse, so check the source)
+    assert "tab\there, newline\nhere, return\rhere" in document
+    # and an ordinary value is passed through unchanged, including non-ASCII text
+    assert _xml_text("model_name", "mödell 3 été \U0001f600") == "mödell 3 été \U0001f600"

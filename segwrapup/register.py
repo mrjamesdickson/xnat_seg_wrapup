@@ -13,6 +13,7 @@ older TotalSegmentator container makes for RTStruct::
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import logging
 import os
@@ -20,6 +21,7 @@ import re
 import urllib.error
 import urllib.parse
 import json
+import math
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -122,9 +124,11 @@ def open_session(context: XnatContext, timeout_seconds: float = 60.0) -> bool:
     the run continues with Basic auth per request; publishing never depends on this."""
     object.__setattr__(context, "session_tried", True)
     credentials = base64.b64encode(f"{context.user}:{context.password}".encode()).decode()
-    request = urllib.request.Request(f"{context.host}/data/JSESSION", method="POST",
-                                     headers={"Authorization": f"Basic {credentials}"})
     try:
+        # built inside the guard: a host with no scheme makes Request raise ValueError, which escaped from
+        # here through auth_headers into every best-effort reader (Codex P2, PR #21 round 105)
+        request = urllib.request.Request(f"{context.host}/data/JSESSION", method="POST",
+                                         headers={"Authorization": f"Basic {credentials}"})
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             token = response.read().decode(errors="replace").strip()
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError) as error:
@@ -143,8 +147,8 @@ def close_session(context: XnatContext, timeout_seconds: float = 60.0) -> None:
     the session then expires on the server's idle timeout."""
     if not context.jsession:
         return
-    request = urllib.request.Request(f"{context.host}/data/JSESSION", method="DELETE", headers=auth_headers(context))
     try:
+        request = urllib.request.Request(f"{context.host}/data/JSESSION", method="DELETE", headers=auth_headers(context))
         with urllib.request.urlopen(request, timeout=timeout_seconds):
             pass
         logger.info("XNAT session closed")
@@ -156,27 +160,84 @@ def close_session(context: XnatContext, timeout_seconds: float = 60.0) -> None:
 
 LABEL_MAX = 64
 
+#: What a shortened owner (session or dataset label) keeps when the scan id needs the rest: its digest and
+#: a few characters of its own (:func:`collection_label`).
+OWNER_KEPT = 16
 
-def collection_label(model_name: str, scan: str, when: datetime | None = None, session_label: str = "") -> str:
+
+def collection_label(model_name: str, scan: str, when: datetime | None = None, session_label: str = "", reserve: int = 0) -> str:
     """A label OHIF will accept and a human can read:
     ``<model>_<session label>_scan<id>_<UTC stamp>``.
 
     XNAT experiment labels are unique per *project*, not per session, so the session label is
     part of it: a batch that finishes two runs of one pipeline in the same second (Merlin on
     RSNA0001/RSNA0002, 2026-09-06) otherwise builds the same label twice and the second create
-    is refused with 409. When the whole thing exceeds ``LABEL_MAX`` the model name is trimmed,
-    never the session, scan or stamp that make it unique."""
+    is refused with 409. When the whole thing exceeds ``LABEL_MAX`` the model name is trimmed
+    first and the stamp never; a scan id or session label too long to fit is shortened with a digest
+    of the whole of it (:func:`_shortened`), so two that share the kept prefix still differ.
+    ``reserve`` leaves room for a suffix the caller appends (proc-wrapup's ``_record``): a
+    64-character label plus ``_record`` is 71 and XNAT refuses the record (Codex P2, PR #21)."""
     stamp = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
-    tail = []
-    if session_label:
-        tail.append(_LABEL_SAFE.sub("_", session_label).strip("_"))
-    if scan:
-        tail.append(f"scan{_LABEL_SAFE.sub('_', scan)}")
-    tail.append(stamp)
-    suffix = "_".join(part for part in tail if part)
+    limit = max(LABEL_MAX - max(reserve, 0), 1)
+    scan_part = f"scan{_LABEL_SAFE.sub('_', scan)}" if scan else ""
+    owner = _LABEL_SAFE.sub("_", session_label).strip("_") if session_label else ""
     model = _LABEL_SAFE.sub("_", model_name).strip("_") or "SEG"
-    model = model[:max(LABEL_MAX - len(suffix) - 1, 1)].rstrip("_") or "SEG"
-    return f"{model}_{suffix}"[:LABEL_MAX]
+    # what must survive: the stamp whole (a long dataset label used to push it off the end); then the scan and
+    # the owner, which tell runs in the same second apart, each shortened with a digest of the whole of it
+    # when they do not fit (round 102); the model gives way first and keeps at least its one letter (Codex P2,
+    # PR #21 round 15). The scan used to take all the room it wanted and a long scan id left the owner none,
+    # so two sessions running one model on that scan id in the same second built the same label, which
+    # the project refuses and the ROI registration does not retry (Codex P2, PR #21 round 103): with both
+    # to fit, the owner keeps OWNER_KEPT characters (its digest and a few of its own) and the scan the rest.
+    separators = sum(1 for part in (owner, scan_part) if part) + 1        # <model>_[<owner>_][<scan>_]<stamp>
+    room = max(limit - len(stamp) - separators - 1, 0)                     # for owner and scan; 1 for the model
+    if len(owner) + len(scan_part) > room:
+        if owner and scan_part:
+            scan_part = _shortened(scan_part, min(len(scan_part), max(room - min(len(owner), OWNER_KEPT), 0)))
+            owner = _shortened(owner, max(room - len(scan_part), 0))
+        elif scan_part:
+            scan_part = _shortened(scan_part, room)
+        else:
+            owner = _shortened(owner, room)
+    rest = "_".join(part for part in (owner, scan_part, stamp) if part)
+    model = model[:max(limit - len(rest) - 1, 1)].rstrip("_") or "M"
+    return f"{model}_{rest}"[:limit]
+
+
+def _shortened(text: str, width: int) -> str:
+    """``text`` cut to ``width`` characters in a way that keeps it apart from other texts cut to the
+    same prefix: the tail is replaced by a digest of the whole text. Cutting the prefix alone gave two
+    scans whose long ids share it (series UIDs under one study root, say) the same label in the same
+    second, and the second registration replaced the first scan's collection at the same URL
+    (Codex P2, PR #21 round 102); session labels shortened the same way met a 409 across sessions."""
+    if len(text) <= width:
+        return text
+    digest = hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    if width <= len(digest) + 1:
+        return digest[:width]
+    head = text[:width - len(digest) - 1].rstrip("_")
+    return f"{head}_{digest}" if head else digest
+
+
+def _encodable(value: str, what: str) -> str:
+    """``value`` with anything that cannot be encoded as UTF-8 written out as its escape. XNAT can
+    answer a JSON string holding a lone surrogate (``"\\ud800"``, written with the backslash escaped
+    because a real one in a *docstring* fails to compile on Python 3.13 and later, "surrogates not
+    allowed", and the module could then not be imported at all — this defect's own mirror image, Codex
+    P1, PR #21 round 34; the group-level plugin would have to have stored such a label, but the reader
+    cannot assume it did not): Python decodes it happily and then
+    every *write* of it raises UnicodeEncodeError — the HTML report, the record XML, ``wrapup.json`` —
+    after the run has finished and before the record is published, so a whole run would lose its record
+    over a label (Codex P2, PR #21 round 33). These readers are best effort by contract, so the label
+    comes back readable and diagnosable (``\\ud800``) rather than unwritable. The offending value is
+    never logged: writing it to a log stream raises the same error."""
+    try:
+        value.encode()
+        return value
+    except UnicodeEncodeError:
+        cleaned = value.encode(errors="backslashreplace").decode()
+        logger.warning("the %s cannot be encoded as UTF-8 (it holds an unpaired surrogate); using %r", what, cleaned)
+        return cleaned
 
 
 def fetch_target_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:
@@ -198,27 +259,67 @@ def fetch_dataset_facts(context: XnatContext, timeout_seconds: float = 60.0) -> 
     if not context.dataset:
         return {}
     url = f"{context.host}/data/experiments/{urllib.parse.quote(context.dataset, safe='')}?format=json"
-    request = urllib.request.Request(url, headers=auth_headers(context))
     try:
+        # the request is built inside the guard too: a malformed XNAT_HOST (no scheme) raised ValueError here,
+        # before it, and aborted proc-wrapup before its report and manifest (Codex P2, PR #21 round 105)
+        request = urllib.request.Request(url, headers=auth_headers(context))
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             payload = json.loads(response.read().decode())
         item = payload["items"][0]
         fields = item["data_fields"]
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError) as error:
+        if not isinstance(item, dict) or not isinstance(fields, dict):
+            # valid JSON of the wrong shape (data_fields null or a list) is as unreadable as no
+            # answer; caught here, not as an AttributeError below (Codex P2, PR #21 round 10)
+            raise TypeError(f"data_fields is {type(fields).__name__}, not an object")
+        # XNAT puts the type in the item's ``meta``, not among the data fields; a meta of the wrong
+        # shape only costs the type check, still inside the guarded parse (Codex P2, round 11)
+        meta = item.get("meta")
+        if meta is not None and not isinstance(meta, dict):
+            logger.warning("dataset %s answered a meta of type %s, not an object; its type is not checked", context.dataset, type(meta).__name__)
+            meta = {}
+        xsi = str((meta or {}).get("xsi:type") or "")
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError, KeyError, IndexError, TypeError,
+            RecursionError) as error:
+        # HTTPException: a truncated body (IncompleteRead) is not an OSError (Codex P2, PR #21);
+        # RecursionError: valid JSON nested past the parser's limit, before the record is published (round 27)
         logger.warning("could not read dataset %s (%s); the record names the id and no member count", context.dataset, error)
         return {}
-    facts = {"label": str(fields.get("label") or "").strip()}
+    facts = {"label": _encodable(str(fields.get("label") or "").strip(), f"label of dataset {context.dataset}")}
     count = fields.get("included_count")
     if count not in (None, ""):
         try:
-            facts["included_count"] = int(count)
-        except (TypeError, ValueError):
+            facts["included_count"] = _whole_count(count)
+        except (TypeError, ValueError, OverflowError):
+            # 1e309 decodes as infinity and int() of it raises OverflowError; 2.5 is no member count
+            # either. Best effort: the record names the id and no count (Codex P2, PR #21 round 14)
             logger.warning("dataset %s carries a non-numeric included_count %r; not recorded", context.dataset, count)
-    # XNAT puts the type in the item's ``meta``, not among the data fields.
-    xsi = str((item.get("meta") or {}).get("xsi:type") or "")
     if xsi and xsi != "analysis:analysisDatasetData":
         logger.warning("dataset %s is a %s, not an analysis:analysisDatasetData; the record still cites it", context.dataset, xsi)
     return facts
+
+
+#: ``subject_count`` is an xs:integer stored as a 32-bit column; a larger literal makes XNAT refuse
+#: the otherwise valid record, so the best-effort reader leaves it off (Codex P2, PR #21 round 16).
+COUNT_MAX = 2_147_483_647
+
+
+def _whole_count(value) -> int:
+    """``included_count`` as a non-negative whole number; raises for anything else (bool, a
+    non-integral or non-finite float, text that is not an integer)."""
+    if isinstance(value, bool):
+        raise TypeError("a boolean is not a count")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{value!r} is not a whole number")
+        value = int(value)
+    if isinstance(value, str) and len(value.strip()) > 12:
+        raise ValueError("too many digits for a member count")   # before int(): a 400-digit literal is not a count
+    count = int(value)
+    if count < 0:
+        raise ValueError(f"{count} is negative")
+    if count > COUNT_MAX:
+        raise ValueError(f"{count} exceeds the schema's integer range")
+    return count
 
 
 def fetch_dataset_label(context: XnatContext, timeout_seconds: float = 60.0) -> str:
@@ -231,11 +332,12 @@ def fetch_subject_label(context: XnatContext, timeout_seconds: float = 60.0) -> 
     does not answer, so the record label is still unique."""
     url = (f"{context.host}/data/projects/{urllib.parse.quote(context.project, safe='')}/subjects/"
            f"{urllib.parse.quote(context.subject, safe='')}?format=json")
-    request = urllib.request.Request(url, headers=auth_headers(context))
     try:
+        request = urllib.request.Request(url, headers=auth_headers(context))      # inside the guard (round 105)
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             payload = json.loads(response.read().decode())
-        label = str(payload["items"][0]["data_fields"].get("label") or "").strip()
+        label = _encodable(str(payload["items"][0]["data_fields"].get("label") or "").strip(),
+                           f"label of subject {context.subject}")
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError) as error:
         logger.warning("could not read the label of subject %s (%s); the record label carries the id instead", context.subject, error)
         return context.subject
@@ -262,11 +364,12 @@ def fetch_session_label(context: XnatContext, timeout_seconds: float = 60.0) -> 
     """The session's label (``RSNA0002``) for ``context.session`` (``XNAT_E25251``); empty when
     XNAT does not answer, so callers fall back to the id and still get a unique label."""
     url = f"{context.host}/data/experiments/{urllib.parse.quote(context.session, safe='')}?format=json"
-    request = urllib.request.Request(url, headers=auth_headers(context))
     try:
+        request = urllib.request.Request(url, headers=auth_headers(context))      # inside the guard (round 105)
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             payload = json.loads(response.read().decode())
-        label = str(payload["items"][0]["data_fields"].get("label") or "").strip()
+        label = _encodable(str(payload["items"][0]["data_fields"].get("label") or "").strip(),
+                           f"label of session {context.session}")
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, IndexError, TypeError) as error:
         logger.warning("could not read the label of session %s (%s); the record label carries the id instead", context.session, error)
         return context.session

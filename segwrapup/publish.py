@@ -31,6 +31,7 @@ import http.client
 import json
 import re
 import logging
+import math
 import mimetypes
 import os
 import secrets
@@ -147,20 +148,179 @@ def scope_provenance(context: XnatContext, caller_inputs: dict) -> dict | None:
     return None
 
 
+#: How much of a bounded ``results_json`` may be spent naming what was left off. A run's existing
+#: results can hold thousands of fields, and naming every one made the note itself overrun the cap, so
+#: the document the PUT carried was refused after all (Codex P2, PR #21 round 36).
+TRUNCATED_BUDGET = 4096
+
+
+def _truncated_note(left_off: list[str]) -> list[str]:
+    """``left_off``, or as much of it as fits in :data:`TRUNCATED_BUDGET` followed by a count of the
+    rest. A consumer reads ``PROVENANCE/wrapup.json`` for the whole picture either way."""
+    note: list[str] = []
+    spent = 0
+    for name in left_off:
+        if spent + len(name) + 4 > TRUNCATED_BUDGET:
+            note.append(f"and {len(left_off) - len(note)} more")
+            break
+        note.append(name)
+        spent += len(name) + 4
+    return note
+
+
+#: What a bounded ``results_json`` keeps whatever else has to go: ``trained_model`` is the run's only
+#: forward link to the model it produced, and nothing else holds it (Codex P2, PR #21 round 30).
+RESULTS_KEPT_KEYS = ("trained_model",)
+
+
+def _finite_json(value):
+    """``value`` with every non-finite float replaced by None, and how many were: JSON has no
+    Infinity or NaN, whatever Python's encoder writes by default. Lives here, beside the two
+    serialisers that must not emit those tokens; :mod:`segwrapup.model` imports it."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None, 1
+    if isinstance(value, dict):
+        out, n = {}, 0
+        for k, v in value.items():
+            out[k], m = _finite_json(v)
+            n += m
+        return out, n
+    if isinstance(value, (list, tuple)):
+        out, n = [], 0
+        for v in value:
+            item, m = _finite_json(v)
+            out.append(item)
+            n += m
+        return out, n
+    return value, 0
+
+
+def _view_counts(views) -> dict | None:
+    """``views`` with each role's file list replaced by its count, or None when ``views`` is not a map
+    of roles at all. A count already there is kept: the run's own ``results_json``, reduced once at
+    publish, is reduced again by the link step, and ``len`` of a count raised TypeError, which cost the
+    run its link to the model (Codex P2, PR #21 round 80). A role whose value is neither is left out
+    of the counts and logged; the full mapping is in ``PROVENANCE/wrapup.json``."""
+    if not isinstance(views, dict):
+        return None
+    counts: dict = {}
+    for role, paths in views.items():
+        if isinstance(paths, (list, tuple)):
+            counts[role] = len(paths)
+        elif isinstance(paths, int) and not isinstance(paths, bool):
+            counts[role] = paths
+        else:
+            logger.warning("results_json view %r is a %s, not a file list or a count; it is left out of the counts",
+                           role, type(paths).__name__)
+    return counts
+
+
 def bounded_results_json(summary: dict) -> str:
     """``results_json`` under the schema cap. The per-role file lists are counts (the files
     are enumerable on the record's resources); if the view lists alone still overrun, they
     become counts too and ``truncated`` names what was dropped, so a consumer knows to read
-    ``PROVENANCE/wrapup.json`` for the full mapping."""
-    text = json.dumps(summary)
+    ``PROVENANCE/wrapup.json`` for the full mapping.
+
+    Reducing the views is not enough on its own. The link step re-reads the run's existing
+    ``results_json`` and merges ``trained_model`` into it, and a value it could not parse is kept as
+    raw text (:func:`segwrapup.model._current_results`): the view counts do not touch that, so the
+    document could stay over the cap, XNAT would refuse the whole PUT, and the run would be left
+    without its forward link to the model that was just registered (Codex P2, PR #21 round 30). So
+    whatever still overruns is dropped, largest value first, until the document fits. Everything
+    droppable was written by this run and its full form is in ``PROVENANCE/wrapup.json`` on the same
+    record; ``truncated`` names it.
+
+    Non-finite numbers are replaced by None first, and every dump here is ``allow_nan=False``. Python's
+    decoder accepts ``NaN`` and ``Infinity`` and its encoder writes them straight back, so a measured
+    volume that came out NaN, or a run's own ``results_json`` re-read by the link step, could be stored
+    as a token no strict JSON consumer can read (Codex P2, PR #21 round 31)."""
+    try:
+        summary, replaced = _finite_json(summary)
+    except RecursionError:
+        # Nested past this walk's limit, so the value cannot be checked at all. Carrying on would hand
+        # `json.dumps(allow_nan=False)` a NaN it refuses with a ValueError, out of the link step, whose
+        # contract is that it never raises: proc-wrapup would abort after registering the model and
+        # before writing its manifest (Codex P2, PR #21 round 35). Reduced instead to what must survive,
+        # with the rest named; the full summary is in PROVENANCE/wrapup.json.
+        kept = {key: summary[key] for key in RESULTS_KEPT_KEYS if key in summary}
+        left_off = _truncated_note(sorted(key for key in summary if key not in kept))
+        logger.error("results_json is nested too deep to check for non-finite numbers; keeping %s and leaving %s off "
+                     "(the full summary is in PROVENANCE/wrapup.json)", sorted(kept), left_off)
+        try:
+            return json.dumps({**kept, "truncated": left_off}, allow_nan=False)
+        except (ValueError, RecursionError) as error:
+            # even what is kept cannot be written: say so and store the note alone rather than raise
+            logger.error("nothing of results_json could be serialised (%s); only the note is stored", error)
+            return json.dumps({"truncated": left_off})
+    if replaced:
+        summary = dict(summary, non_finite_values_replaced=replaced)
+        logger.warning("results_json had %d non-finite number(s) (NaN or Infinity, which JSON has no tokens "
+                       "for); they are written as null and counted in non_finite_values_replaced", replaced)
+    text = json.dumps(summary, allow_nan=False)
     if len(text) <= RESULTS_JSON_MAX:
         return text
     reduced = dict(summary)
-    reduced["views"] = {role: len(paths) for role, paths in (summary.get("views") or {}).items()}
-    reduced["truncated"] = ["views"]
-    logger.warning("results_json would be %d characters (cap %d); the view file lists are replaced by counts, "
-                   "the full mapping stays in PROVENANCE/wrapup.json", len(text), RESULTS_JSON_MAX)
-    return json.dumps(reduced)
+    # The link step re-reduces the run's own results_json, which the publish may already have bounded:
+    # what that reduction left off stays named, rather than a fresh note replacing the old one and the
+    # document reading as whole (Codex P2, PR #21 round 80)
+    earlier = summary.get("truncated")
+    dropped: list[str] = [name for name in earlier if isinstance(name, str)] if isinstance(earlier, list) else []
+    views = summary.get("views")
+    if views:
+        counts = _view_counts(views)
+        if counts is None:
+            # not a map of roles, so there is nothing to count: `.items()` on a string or a list raised
+            # AttributeError out of the link step after the model was registered, which the never-raises
+            # contract does not allow (round 80). Left off whole; the mapping is in PROVENANCE/wrapup.json
+            del reduced["views"]
+            logger.warning("results_json views is a %s, not a map of roles, and the document would be %d characters "
+                           "(cap %d); views is left off, the full mapping stays in PROVENANCE/wrapup.json",
+                           type(views).__name__, len(text), RESULTS_JSON_MAX)
+        else:
+            reduced["views"] = counts
+            logger.warning("results_json would be %d characters (cap %d); the view file lists are replaced by counts, "
+                           "the full mapping stays in PROVENANCE/wrapup.json", len(text), RESULTS_JSON_MAX)
+        if "views" not in dropped:
+            dropped.append("views")
+    reduced["truncated"] = _truncated_note(dropped)
+    text = json.dumps(reduced, allow_nan=False)
+    if len(text) > RESULTS_JSON_MAX:
+        # Size every value once and drop the largest first by arithmetic. The loop below re-serialises
+        # the whole document per drop, which is quadratic: a summary carrying thousands of fields — the
+        # case that made the note itself overrun — took a minute of it. The loop stays as the backstop,
+        # since these sizes ignore the note growing as names are added to it.
+        sizes = sorted(((len(json.dumps(value, allow_nan=False)) + len(key) + 6, key)
+                        for key, value in reduced.items()
+                        if key != "truncated" and key not in RESULTS_KEPT_KEYS), reverse=True)
+        remaining, here = len(text), []
+        for size, key in sizes:
+            if remaining <= RESULTS_JSON_MAX:
+                break
+            del reduced[key]
+            here.append(key)
+            remaining -= size
+        if here:
+            dropped.extend(here)
+            reduced["truncated"] = _truncated_note(dropped)
+            text = json.dumps(reduced, allow_nan=False)
+            logger.warning("results_json was %d characters, over the cap of %d; %s left off (they are in "
+                           "PROVENANCE/wrapup.json)", remaining + sum(s for s, k in sizes if k in here),
+                           RESULTS_JSON_MAX, _truncated_note(here))
+    while len(text) > RESULTS_JSON_MAX:
+        removable = [(len(json.dumps(value, allow_nan=False)), key) for key, value in reduced.items()
+                     if key != "truncated" and key not in RESULTS_KEPT_KEYS]
+        if not removable:
+            logger.error("results_json is %d characters with only %s left (cap %d); XNAT will refuse it",
+                         len(text), list(RESULTS_KEPT_KEYS), RESULTS_JSON_MAX)
+            break
+        biggest = max(removable)[1]
+        del reduced[biggest]
+        dropped.append(biggest)
+        reduced["truncated"] = _truncated_note(dropped)
+        logger.warning("results_json is %d characters, still over the cap of %d; %s is left off (it is in "
+                       "PROVENANCE/wrapup.json)", len(text), RESULTS_JSON_MAX, biggest)
+        text = json.dumps(reduced, allow_nan=False)
+    return text
 
 ANALYSIS_NS = "http://xnatworks.io/analysis"
 XNAT_NS = "http://nrg.wustl.edu/xnat"
@@ -219,6 +379,9 @@ class RecordContract:
     container_digest: str = ""
     output_resource_label: str = ""
     supersedes_id: str = ""
+    #: ``model`` for a training card (0.7.1): after the run record, the weights named by the
+    #: card's ``MODEL`` view are registered as an ``analysis:trainedModelData`` (segwrapup.model).
+    produces: str = ""
     resources: dict[str, list[str]] = field(default_factory=lambda: dict(DEFAULT_RESOURCES))
     #: ``XNW_RESOURCE_<ROLE>`` overrides for a fixed role the card sent and the wrapup ignored
     #: (``"REPORT=report.html,raw/sub-*.html"``), so ``wrapup.json`` says what was dropped.
@@ -232,6 +395,7 @@ class RecordContract:
         "XNW_CONTRACT_VERSION": "contract_version", "XNW_ANALYSIS_TYPE": "analysis_type",
         "XNW_CONTAINER_IMAGE": "container_image", "XNW_CONTAINER_DIGEST": "container_digest",
         "XNW_OUTPUT_RESOURCE_LABEL": "output_resource_label", "XNW_SUPERSEDES_ID": "supersedes_id",
+        "XNW_PRODUCES": "produces",
     }
 
     @classmethod
@@ -256,6 +420,7 @@ class RecordContract:
                 if key.startswith("XNW_RESOURCE_") and value.strip():   # XNW_RESOURCE_METRICS="a.json,b.csv"
                     _declare(resources, ignored, _valid_role(key[len("XNW_RESOURCE_"):]),
                              [p.strip() for p in value.split(",") if p.strip()])
+            _check_produces(discrete.get("produces", ""))
             return cls(resources=resources, ignored_overrides=tuple(ignored), **{k: v for k, v in discrete.items()})
         try:
             data = json.loads(raw)
@@ -271,8 +436,10 @@ class RecordContract:
                 if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
                     raise ValueError(f"XNW_CONTRACT resources.{role} must be a list of file patterns")
                 _declare(resources, ignored, _valid_role(str(role)), list(patterns))
+        _check_produces(str(data.get("produces", "") or ""))
         return cls(
             ignored_overrides=tuple(ignored),
+            produces=str(data.get("produces", "") or ""),
             card_id=str(data.get("card_id", "")),
             card_revision=str(data.get("card_revision", "")),
             contract_version=str(data.get("contract_version", "0.1")),
@@ -283,6 +450,11 @@ class RecordContract:
             supersedes_id=str(data.get("supersedes_id", "")),
             resources=resources,
         )
+
+
+def _check_produces(value: str) -> None:
+    if value not in ("", "model"):
+        raise ValueError(f"produces={value!r} is not something a card can produce (only 'model')")
 
 
 def _reserved(path: Path, root: Path) -> bool:
@@ -421,10 +593,34 @@ def upload_format(path: Path) -> str:
     return inferred or "FILE"
 
 
+#: What XML 1.0 will carry: tab, newline, carriage return, then #x20 upwards without the surrogate
+#: block and without the two non-characters #xFFFE/#xFFFF. Everything else — every other C0 control
+#: — is forbidden *in the document*, however well it encodes as UTF-8, so a card field holding one
+#: made XNAT reject the whole document (Codex P2, PR #21 round 77).
+_XML_FORBIDDEN = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+
+
+def _xml_text(name: str, text: str) -> str:
+    """``text`` with every code point XML 1.0 forbids written out as its escape.
+
+    `json.loads` accepts ``"\u0001"`` and `str.encode` encodes it, so a model card saying
+    ``{"model": "bad\u0001"}`` used to travel all the way into the document and XNAT then refused the
+    POST as malformed XML — leaving usable checkpoints unregistered over one character (Codex P2, PR
+    #21 round 77). Like the unpaired-surrogate case (:func:`segwrapup.register._encodable`), the value
+    comes back readable and diagnosable rather than unwritable: the reader is best effort by contract,
+    and a record naming ``bad\\x01`` says what happened, where no record at all does not."""
+    cleaned, replaced = _XML_FORBIDDEN.subn(
+        lambda hit: ("\\x%02x" if ord(hit.group()) < 0x100 else "\\u%04x") % ord(hit.group()), text)
+    if replaced:
+        logger.warning("%s holds %d character(s) XML cannot carry; they are written as their escapes (%r)",
+                       name, replaced, cleaned[:80])
+    return cleaned
+
+
 def _element(name: str, value) -> str:
     if value is None or value == "":
         return ""
-    return f"  <analysis:{name}>{escape(str(value))}</analysis:{name}>\n"
+    return f"  <analysis:{name}>{escape(_xml_text(name, str(value)))}</analysis:{name}>\n"
 
 
 def build_record_xml(context: XnatContext, contract: RecordContract, label: str,
@@ -563,12 +759,15 @@ def _request(context: XnatContext, method: str, url: str, timeout: float) -> int
 def _relabel(xml: str, label: str) -> str:
     """The record document carries its label as an attribute; a retried create must match the URL.
     Every record root is relabelled: a subject or group record retried under the old label would collide again."""
-    return re.sub(r'(<analysis:(?:Session|Subject|Group)Analysis[^>]*?\slabel=")[^"]*(")',
+    # any record root (SessionAnalysis, SubjectAnalysis, GroupAnalysis, TrainedModel): the first
+    # element carrying a label attribute (Codex P2, PR #21: a model retry kept the occupied label)
+    return re.sub(r'(<analysis:[A-Za-z]+[^>]*?\slabel=")[^"]*(")',
                   lambda m: m.group(1) + escape(label) + m.group(2), xml, count=1)
 
 
 def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, list],
-                   timeout_seconds: float = 300.0, output_dir: Path | None = None) -> dict:
+                   timeout_seconds: float = 300.0, output_dir: Path | None = None, xsi_type: str | None = None,
+                   generated_label: bool = False) -> dict:
     """Create the record, then upload each role's files to its ``out`` resource. Raises RuntimeError.
 
     Create-only, enforced twice: a label that already exists on the session is refused before
@@ -580,9 +779,19 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     uploaded and the empty files skipped, for a wrapup that reduces its output afterwards.
     """
     files = _record_files(files, output_dir)
-    xsi_type = xsi_type_for(context)
+    xsi_type = xsi_type or xsi_type_for(context)   # a caller may publish another project asset (a trained model) at dataset scope
     label_url, _ = record_urls(context, label)
     probe = _request(context, "GET", f"{label_url}?format=json", timeout_seconds)
+    if probe == 200 and generated_label:
+        # A label the wrapup stamped itself, taken by another run of the same pipeline on the same
+        # owner within the same second (dataset scope has no per-session namespace): one retry with a
+        # short random suffix, as the 409 path below does (Codex P2, PR #21 round 9). A label the
+        # caller chose is never rewritten.
+        retry = f"{label[:LABEL_MAX - 5]}_{secrets.token_hex(2)}"
+        logger.warning("generated label %s already exists on %s; retrying once as %s", label, context.target, retry)
+        label, xml = retry, _relabel(xml, retry)
+        label_url, _ = record_urls(context, label)
+        probe = _request(context, "GET", f"{label_url}?format=json", timeout_seconds)
     if probe == 200:
         raise RuntimeError(f"label {label} already exists on {context.target}; the record is create-only, "
                            "pass a fresh --record-label or let the run stamp one")
@@ -639,7 +848,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
         raise RuntimeError(f"{error}; {rollback}") from error
     logger.info("analysis record %s published as %s with %d file(s)", label, record_id,
                 sum(len(v) for v in uploaded.values()))
-    return {"xsi_type": xsi_type, "id": record_id, "label": label, "status": status,
+    return {"xsi_type": xsi_type, "id": record_id, "id_is_accession": bool(created_id), "label": label, "status": status,
             "uploaded": uploaded, "skipped_empty": skipped_empty, "url": create_url.split("?")[0],
             "output_paths": output_paths}
 
@@ -648,7 +857,8 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
                         source_dicom_present: bool, unmeasured_masks: int = 0,
                         context: XnatContext | None = None, facts: dict | None = None,
                         default_resources: dict[str, list[str]] | None = None,
-                        derived_root: str | None = None, manifest: dict | None = None) -> dict | None:
+                        derived_root: str | None = None, manifest: dict | None = None,
+                        generated_label: bool = False) -> dict | None:
     """Publish when the card opted in and the context is present. Never raises.
 
     ``derived_root`` is the subdirectory of ``output_dir`` that holds the tool's output tree
@@ -671,9 +881,14 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
     if context is None:
         logger.error("analysis record not published; XNW_CONTRACT is set but the XNAT context is incomplete")
         return {"error": "XNAT context incomplete"}
-    label = (getattr(args, "record_label", "") or "").strip() or collection_label(
+    explicit_label = (getattr(args, "record_label", "") or "").strip()
+    label = explicit_label or collection_label(
         getattr(args, "model", None) or getattr(args, "pipeline", "run"), context.scan or args.scan,
         session_label=fetch_target_label(context))
+    # A label stamped here is a generated one whatever the caller said: the collision retry in
+    # publish_record applies to it as to proc-wrapup's (Codex P2, PR #21 round 10). Only a label
+    # the caller chose is never rewritten.
+    generated_label = generated_label or not explicit_label
     # Everything from file collection onwards is guarded: a bad contract glob (an absolute
     # pattern makes Path.glob raise NotImplementedError) must be recorded, not abort delivery
     # of the masks, report and ROI collection that are already on disk.
@@ -698,12 +913,16 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
         xml = build_record_xml(context, contract, label, report, results, files, source_dicom_present,
                                output_dir=output_dir, unmeasured_masks=unmeasured_masks, facts=facts, views=views,
                                provenance=provenance)
-        outcome = publish_record(context, label, xml, files, output_dir=output_dir)
+        outcome = publish_record(context, label, xml, files, output_dir=output_dir, generated_label=generated_label)
         outcome["skipped_empty"] = sorted(set(outcome.get("skipped_empty") or []) | {f.name for f in empties})
         outcome["output_paths"]["skipped_empty"] = sorted(set(outcome["output_paths"]["skipped_empty"])
                                                           | {upload_name(f.path, output_dir) for f in empties})
         outcome["views"] = views
         outcome["ignored_overrides"] = list(contract.ignored_overrides)
+        outcome["produces"] = contract.produces
+        outcome["contract"] = {"card_id": contract.card_id, "card_revision": contract.card_revision,
+                               "container_image": contract.container_image, "container_digest": contract.container_digest,
+                               "analysis_type": contract.analysis_type}
         return outcome
     except (RuntimeError, ValueError, NotImplementedError, OSError) as error:
         logger.error("analysis record %s not published; files and ROI collection still delivered: %s: %s",

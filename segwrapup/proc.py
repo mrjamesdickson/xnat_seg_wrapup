@@ -29,6 +29,7 @@ import urllib.parse
 from pathlib import Path
 
 from . import __version__
+from .model import register_trained_model
 from .card import card_for_run, write_card_copy
 from .execution import (RAW_DIRNAME, STATUS_FILENAME, chain_from_workflow, copy_raw_output, fetch_parent_logs,
                         own_workflow_id, read_status, run_status_from)
@@ -219,18 +220,27 @@ def run(args: argparse.Namespace) -> int:
                                    "prerequisites": [{"name": q["name"], "record": (q.get("record") or {}).get("ID"),
                                                       "resource": q.get("resource"), "role": q.get("role")} for q in prerequisites],
                                    "upstream_record": next(((q.get("record") or {}).get("ID") for q in prerequisites if q.get("record")), None)}}
-        if not (args.record_label or "").strip():
+        generated_label = not (args.record_label or "").strip()
+        if generated_label:
             # The owner's label: the session's or subject's from XNAT; at dataset scope the one
             # already read with the facts above (no second request; the id when it did not answer).
             owner_label = ((dataset_facts.get("label") or context.dataset) if context and context.scope == "dataset"
                            else fetch_target_label(context) if context else "")
-            args.record_label = collection_label(args.pipeline, args.scan, session_label=owner_label) + "_record"
+            args.record_label = collection_label(args.pipeline, args.scan, session_label=owner_label, reserve=len("_record")) + "_record"
         outcome = publish_if_possible(args, output_dir, report, [], False, context=context, facts=record_facts,
-                                      default_resources=PROC_DEFAULT_RESOURCES, derived_root=RAW_DIRNAME, manifest=manifest)
+                                      default_resources=PROC_DEFAULT_RESOURCES, derived_root=RAW_DIRNAME, manifest=manifest,
+                                      generated_label=generated_label)
         # Local paths of what went up (and of the empty files that could not): for the pointer
         # reduction below, not for the manifest, which already lists the record's names.
         output_paths = (outcome or {}).pop("output_paths", None) or {}
         manifest["analysis_record"] = outcome
+        if (outcome or {}).get("id") and (outcome or {}).get("produces") == "model":
+            # A training card (0.7.1): the weights in DERIVED become a DRAFT trainedModelData
+            # linked both ways to the run. The copy of wrapup.json already on the run record
+            # predates this; the local manifest (and the pointer) carry it.
+            manifest["trained_model"] = register_trained_model(
+                context, output_dir, RAW_DIRNAME, outcome, run_status, outcome.get("views") or {},
+                {**(outcome.get("contract") or {}), "pipeline": args.pipeline}, dataset_facts)
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
         if args.pointer_only and (manifest.get("analysis_record") or {}).get("id"):
             # The record owns the bytes; the output handler gets a one-file pointer resource.

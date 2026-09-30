@@ -592,7 +592,9 @@ def test_a_subject_run_refuses_a_scan_resource_prerequisite(xnat, tmp_path, monk
 def test_record_fetch_refuses_prerequisites_at_dataset_scope(xnat, tmp_path, monkeypatch, caplog):
     """A dataset-scoped run's inputs are the frozen cohort's materialised tree (0.7.0): a card
     that declares prerequisites on a dataset wrapper is stopped at setup with the reason,
-    never silently passed through, and nothing is resolved or recorded."""
+    never silently passed through, and nothing is resolved or recorded. Nor is the dataset copied
+    first: the refusal comes before the pass-through, which spent the time and the space on a large
+    dataset, or failed on a full output, before the reason was reported (Codex P2, PR #21 round 87)."""
     host, handler = xnat
     inp = tmp_path / "in"; inp.mkdir(); (inp / "x.txt").write_text("x")
     out = tmp_path / "out"
@@ -601,8 +603,13 @@ def test_record_fetch_refuses_prerequisites_at_dataset_scope(xnat, tmp_path, mon
     with caplog.at_level(logging.ERROR):
         assert prereq.main(["--input", str(inp), "--output", str(out)]) == 2
     assert "prerequisites are not supported at dataset scope" in caplog.text and "XNAT_D1" in caplog.text
-    assert (out / "x.txt").read_text() == "x" and not (out / "prereq.json").exists()      # pass-through happened, no manifest
+    assert not (out / "x.txt").exists() and not (out / "prereq.json").exists()           # nothing copied, no manifest
     assert not [c for c in handler.calls if c["path"] != "/data/JSESSION"]              # nothing resolved, nothing published
     # a dataset run that declares no prerequisite is the ordinary no-op
     monkeypatch.delenv("XNW_PREREQ_BIDS")
     assert prereq.main(["--input", str(inp), "--output", str(tmp_path / "out2")]) == 0
+    assert (tmp_path / "out2" / "x.txt").read_text() == "x", "the control: that one is passed through"
+    # a declaration that cannot be parsed is refused before the copy too
+    monkeypatch.setenv("XNW_PREREQ_BIDS", "resource=BIDS;scope=galaxy")
+    assert prereq.main(["--input", str(inp), "--output", str(tmp_path / "out3")]) == 2
+    assert not (tmp_path / "out3" / "x.txt").exists()

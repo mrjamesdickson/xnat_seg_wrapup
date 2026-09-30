@@ -5,6 +5,8 @@ test_publish.py) and answers the container list and log endpoints.
 """
 import html
 import json
+import re
+import os
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -84,6 +86,11 @@ class _CS(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_CS.containers).encode(), "application/json")
         elif self.path == "/xapi/commands/77":                       # the registered command carries the card (plan D27)
             self._send(200, json.dumps({"id": 77, "name": "pyradiomics", "version": "0.3.1", "command-metadata": {"card": CARD_BLOCK}}).encode(), "application/json")
+        elif self.path == "/xapi/users/username":                        # the alias token resolves to the real login
+            self._send(200, b"jdickson")
+        elif self.path == "/data/experiments/XNAT_E77777?format=json":        # the run record, re-read before results_json.trained_model is written
+            self._send(200, json.dumps({"items": [{"data_fields": {"ID": "XNAT_E77777", "label": "run_label_x", "project": "PROJ_1",
+                                                                    "results_json": json.dumps({"views": {"MODEL": ["segmentation_spleen.pt"]}, "model": "monailabel-train"})}}]}).encode(), "application/json")
         elif self.path == "/data/experiments/XNAT_E00018?format=json":
             self._send(200, json.dumps({"items": [{"data_fields": {"label": "SESS01"}}]}).encode(), "application/json")
         elif self.path == "/data/experiments/XNAT_D0001?format=json":        # the frozen dataset a dataset-scoped run cites
@@ -116,7 +123,8 @@ class _CS(BaseHTTPRequestHandler):
         self._record(self.rfile.read(length))
         create = (("/assessors/" in self.path and "/out/" not in self.path) or ("/subjects/" in self.path and "/resources/" not in self.path)
                   or (self.path.startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in self.path))
-        self._send(201 if create else 200, b"XNAT_E77777" if create else b"")
+        model_create = create and "/experiments/model_" in self.path
+        self._send(201 if create else 200, b"XNAT_E88888" if model_create else b"XNAT_E77777" if create else b"")
 
     def log_message(self, *args):
         pass
@@ -600,3 +608,806 @@ def test_a_dataset_scoped_run_publishes_a_group_record_citing_the_dataset(cs, tm
     assert manifest["scope"] == "dataset" and manifest["dataset"] == {"id": "XNAT_D0001", "label": "flanker-2sub", "included_count": 2}
     assert manifest["analysis_record"]["xsi_type"] == "analysis:groupAnalysisData" and manifest["card"]["run_scope"] == "dataset"
     assert "flanker-2sub (XNAT_D0001), 2 included" in (out / "report.html").read_text()
+
+
+# ── training cards: produces=model (0.7.1) ────────────────────────────────────
+
+def _training_output(tmp_path, with_card=True):
+    inp = tmp_path / "in"
+    inp.mkdir(parents=True)
+    (inp / "segmentation_spleen.pt").write_bytes(b"WEIGHTS")
+    (inp / "train_stats.json").write_text(json.dumps({"best_metric": 0.91}))
+    if with_card:
+        (inp / "model-card.json").write_text(json.dumps({"model_framework": "monailabel", "model": "segmentation_spleen",
+                                                        "default_checkpoint": "segmentation_spleen.pt", "task_type": "segmentation",
+                                                        "labels": {"spleen": 1}, "train_cases": 3, "train_stats": {"best_metric": 0.91}}))
+    (inp / "status.json").write_text(json.dumps({"exit_code": 0, "workflow_id": "4990"}))
+    return inp
+
+
+def _training_env(monkeypatch, host, extra=None):
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "monailabel-train", "PROC_PIPELINE_VERSION": "0.1.0", "PROC_DATASET_ID": "XNAT_D0001",
+                                "XNW_PRODUCES": "model", "XNW_RESOURCE_MODEL": "*.pt,model-card.json", "XNW_RESOURCE_METRICS": "train_stats.json",
+                                **(extra or {})})
+    monkeypatch.delenv("PROC_SESSION_ID"); monkeypatch.delenv("PROC_SCAN_ID")
+
+
+def manifest_label(out):
+    return json.loads((out / "wrapup.json").read_text())["trained_model"]["label"]
+
+
+def test_a_training_card_registers_a_draft_model_and_links_the_run(cs, tmp_path, monkeypatch):
+    """produces=model: after the group record, the MODEL view's weights become an
+    analysis:trainedModelData project asset in DRAFT (weights on MODEL, the tool's model card on
+    MODEL_CARD, provenance on PROVENANCE), source_dataset_id points back (source_training_id is a foreign
+    key to groupTrainingData in schema plugin 0.2.0 and would 500, as it did live on demo02 2026-09-26; the
+    run id rides in engine_metadata_json.source_run_id), and
+    the run record gets results_json.trained_model (produced_model_id belongs to groupTrainingData
+    only in schema plugin 0.2.0; the query-parameter update created stray records live), so the link pair of DATASET-SCOPE-CARDS-DESIGN §7.2
+    exists without the retired group-analysis-wrapup."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert [c["path"].split("/")[5].split("_")[0] for c in creates] == ["monailabel-train", "model"], "the run record first, then the model"
+    model_xml = creates[1]["body"].decode()
+    assert model_xml.startswith('<?xml version="1.0" encoding="UTF-8"?>\n<analysis:TrainedModel ') and 'project="PROJ_1" label="model_flanker-2sub_' in model_xml
+    for fragment in ("<analysis:model_status>DRAFT</analysis:model_status>",                      "<analysis:source_dataset_id>XNAT_D0001</analysis:source_dataset_id>", "<analysis:model_framework>monailabel</analysis:model_framework>",
+                     "<analysis:default_checkpoint>segmentation_spleen.pt</analysis:default_checkpoint>", "<analysis:model_name>segmentation_spleen</analysis:model_name>",
+                     "<analysis:label_names>spleen:1</analysis:label_names>", "<analysis:num_classes>2</analysis:num_classes>",
+                     "<analysis:best_validation_dice>0.91</analysis:best_validation_dice>", "<analysis:model_resource_label>MODEL</analysis:model_resource_label>",
+                     "<analysis:created_by>jdickson</analysis:created_by>"):
+        assert fragment in model_xml, fragment
+    assert "source_training_id" not in model_xml, "a foreign key to analysis:groupTrainingData; the run is a groupAnalysisData"
+    import re, html
+    meta = json.loads(html.unescape(re.search(r"<analysis:engine_metadata_json>(.*?)</analysis:engine_metadata_json>", model_xml, re.S).group(1)))
+    assert meta["source_run_id"] == "XNAT_E77777" and meta["source_run_type"] == "analysis:groupAnalysisData"
+    uploads = [c["path"].split("?")[0] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/experiments/XNAT_E88888/resources/")]
+    assert uploads == ["/data/experiments/XNAT_E88888/resources/MODEL/files/segmentation_spleen.pt",
+                       "/data/experiments/XNAT_E88888/resources/MODEL_CARD/files/model-card.json",
+                       "/data/experiments/XNAT_E88888/resources/PROVENANCE/files/provenance.json"]
+    links = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/experiments/XNAT_E77777?")]
+    assert len(links) == 1 and links[0]["path"] == "/data/experiments/XNAT_E77777?xsiType=analysis%3AgroupAnalysisData"
+    link_xml = links[0]["body"].decode()
+    assert 'ID="XNAT_E77777" project="PROJ_1" label="run_label_x"' in link_xml and "produced_model_id" not in link_xml
+    merged = json.loads(html.unescape(re.search(r"<analysis:results_json>(.*?)</analysis:results_json>", link_xml, re.S).group(1)))
+    assert merged["trained_model"] == {"id": "XNAT_E88888", "label": manifest_label(out), "xsi_type": "analysis:trainedModelData", "status": "DRAFT"}
+    assert merged["views"] == {"MODEL": ["segmentation_spleen.pt"]} and merged["model"] == "monailabel-train", "what the publish wrote is kept"
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["produces"] == "model" and sorted(manifest["analysis_record"]["views"]["MODEL"]) == ["model-card.json", "segmentation_spleen.pt"]
+    assert manifest["trained_model"] == {"xsi_type": "analysis:trainedModelData", "id": "XNAT_E88888", "label": manifest["trained_model"]["label"],
+                                         "status": "DRAFT", "weights": ["segmentation_spleen.pt"], "model_card": True,
+                                         "source_run_id": "XNAT_E77777", "linked": True}
+    # the weights are still on the run record's DERIVED, untouched: the model asset is a second home, not a move
+    assert "/data/experiments/XNAT_E77777/resources/DERIVED/files/segmentation_spleen.pt" in [c["path"].split("?")[0] for c in handler.calls]
+
+
+def test_produces_model_without_weights_keeps_the_run_record_and_says_so(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _training_output(tmp_path, with_card=False), tmp_path / "out"
+    os.remove(inp / "segmentation_spleen.pt")
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c["path"] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert len(creates) == 1 and "/experiments/model_" not in creates[0], "no model asset without weights; the run record stands"
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777" and manifest["trained_model"] == {"error": "no MODEL view files on DERIVED"}
+    assert not [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/experiments/XNAT_E77777?")]
+
+
+def test_produces_model_on_a_failed_run_registers_nothing(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "status.json").write_text(json.dumps({"exit_code": 1, "workflow_id": "4990"}))
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["run_status"] == "FAILED" and manifest["trained_model"] == {"skipped": "run FAILED"}
+    assert not [c for c in handler.calls if "/experiments/model_" in c["path"] or (c["method"] == "PUT" and c["path"].startswith("/data/experiments/XNAT_E77777?"))]
+
+
+def test_a_model_registration_that_fails_leaves_the_run_record_and_records_the_error(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    _training_env(monkeypatch, host)
+    from segwrapup import model as model_module
+    monkeypatch.setattr(model_module, "publish_record", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("PUT failed: HTTP 500 boom")))
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777"
+    assert manifest["trained_model"]["error"] == "PUT failed: HTTP 500 boom" and manifest["trained_model"]["label"].startswith("model_flanker-2sub_")
+    assert not [c for c in handler.calls if c["method"] == "DELETE" and "/data/experiments/" in c["path"]], "the run record is never rolled back for the model's sake"
+
+
+def test_a_session_scoped_run_never_registers_a_model(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    set_env(monkeypatch, host, {"XNW_PRODUCES": "model", "XNW_RESOURCE_MODEL": "*.pt"})
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["trained_model"]["error"].startswith("produces=model is only defined at dataset scope")
+    assert not [c for c in handler.calls if "/experiments/model_" in c["path"]]
+
+
+def test_nested_model_weights_keep_their_view_relative_names(cs, tmp_path, monkeypatch):
+    """fold-0/best.pt and fold-1/best.pt are two checkpoints; uploading both as MODEL/files/best.pt
+    would let the second overwrite the first, and default_checkpoint would name a path that is not
+    on the resource (Codex P1, PR #21)."""
+    host, handler = cs
+    inp = _training_output(tmp_path)
+    (inp / "segmentation_spleen.pt").unlink()
+    for fold in ("fold-0", "fold-1"):
+        (inp / fold).mkdir()
+        (inp / fold / "best.pt").write_bytes(b"w" + fold.encode())
+    card = json.loads((inp / "model-card.json").read_text()); card["default_checkpoint"] = "fold-0/best.pt"
+    (inp / "model-card.json").write_text(json.dumps(card))
+    _training_env(monkeypatch, host, {"XNW_RESOURCE_MODEL": "**/*.pt,model-card.json"})
+    assert proc.main(["--input", str(inp), "--output", str(tmp_path / "out")]) == 0
+    uploads = sorted(c["path"].split("?")[0] for c in handler.calls if c["method"] == "PUT" and "/experiments/XNAT_E88888/resources/MODEL/" in c["path"])
+    assert uploads == ["/data/experiments/XNAT_E88888/resources/MODEL/files/fold-0/best.pt",
+                       "/data/experiments/XNAT_E88888/resources/MODEL/files/fold-1/best.pt"]
+    manifest = json.loads((tmp_path / "out" / "wrapup.json").read_text())
+    assert manifest["trained_model"]["weights"] == ["fold-0/best.pt", "fold-1/best.pt"]
+    model_xml = next(c["body"].decode() for c in handler.calls if c["method"] == "PUT" and "/experiments/model_" in c["path"])
+    assert "<analysis:default_checkpoint>fold-0/best.pt</analysis:default_checkpoint>" in model_xml
+
+
+def test_a_generated_model_label_names_its_run_so_two_runs_in_one_second_do_not_collide():
+    """Two training cards finishing on the same dataset within a second produced the same
+    model_<dataset>_<stamp>; the second hit the create-only preflight (200) and lost its model
+    (Codex P2, PR #21 round 4). The run id is unique per run."""
+    from datetime import datetime, timezone
+    from segwrapup.model import model_label
+    when = datetime(2026, 9, 26, 22, 15, 38, tzinfo=timezone.utc)
+    a = model_label("nnunet-nnunet_msd_spleen_demo-20260803_121930", when, run_id="XNAT_E26048")
+    b = model_label("nnunet-nnunet_msd_spleen_demo-20260803_121930", when, run_id="XNAT_E26050")
+    assert a != b and a.endswith("_20260926T221538Z_E26048") and b.endswith("_20260926T221538Z_E26050")
+    assert len(a) <= 64 and a.startswith("model_nnunet-nnunet_msd_spleen_demo"), "hyphens are label-safe; the head is trimmed for the tail"
+    assert model_label("ds", when) == "model_ds_20260926T221538Z", "no run id: the old shape"
+    # the run id may be a 64-character fallback label (no id in XNAT's answer): the tail is bounded and stays unique (round 8)
+    long_run = "monailabel-train_flanker-2sub_20260926T221538Z_" + "x" * 20
+    bounded = model_label("nnunet-nnunet_msd_spleen_demo-20260803_121930", when, run_id=long_run)
+    assert len(bounded) <= 64 and bounded.startswith("model_nnunet") and "_20260926T221538Z_" in bounded
+    assert bounded != model_label("nnunet-nnunet_msd_spleen_demo-20260803_121930", when, run_id=long_run[:-1] + "y")
+    assert model_label("ds", when, run_id="") == "model_ds_20260926T221538Z"
+    # only an accession id loses its site prefix: two pipelines' fallback labels on one dataset in one
+    # second differ only before the first underscore, and must give two model labels (round 11)
+    a = model_label("ds", when, run_id="trainerA_ds_20260926T221538Z_record")
+    b = model_label("ds", when, run_id="trainerB_ds_20260926T221538Z_record")
+    assert a != b and "trainerA" in a and "trainerB" in b and len(a) <= 64
+    assert model_label("ds", when, run_id="CENTRAL_E7").endswith("_E7") and model_label("ds", when, run_id="XNAT_E26051").endswith("_E26051")
+    assert model_label("ds", when, run_id="XNAT_E26051x").endswith("_XNAT_E26051x"), "not an accession id: kept whole"
+    # a site prefix with _, - or . is still an accession id (round 18)
+    from segwrapup.model import _ACCESSION_ID
+    for site_id in ("MY_SITE_E123", "my-site.v2_E7", "A_E1"):
+        assert _ACCESSION_ID.match(site_id), site_id
+    assert model_label("ds", when, run_id="MY_SITE_E123").endswith("_E123") and model_label("ds", when, run_id="my-site.v2_E7").endswith("_E7")
+    assert not _ACCESSION_ID.match("_E1") and not _ACCESSION_ID.match("trainerA_ds_20260926T221538Z_record")
+
+
+def test_num_classes_comes_from_the_label_indices_not_the_number_of_names():
+    """{"background": 0, "spleen": 1} is a two-class network, not three (Codex P2, PR #21 round 5)."""
+    from segwrapup.model import num_classes
+    assert num_classes({"background": 0, "spleen": 1}) == 2 and num_classes({"spleen": 1}) == 2 and num_classes({"foreground": 1}) == 2
+    assert num_classes({"spleen": 1, "liver": 2}) == 3 and num_classes({"a": 1, "c": 3}) == 4, "sparse indices count by the highest"
+    assert num_classes({}) is None and num_classes({"spleen": "one"}) is None and num_classes({"x": True}) is None
+    # a JSON number out of range decodes as infinity; NaN and fractions are not indices either (Codex P2, round 7)
+    assert num_classes({"lesion": float("inf"), "spleen": 1}) == 2 and num_classes({"lesion": float("nan")}) is None
+    assert num_classes({"half": 1.5, "two": 2.0}) == 3 and num_classes({"neg": -1}) is None
+    assert num_classes({"huge": 10 ** 400, "spleen": 1}) == 2, "a 400-digit integer is not an index and must not overflow"
+    from segwrapup.model import _best_dice
+    assert _best_dice({"best_metric": 10 ** 400}) is None and _best_dice({"best_metric": 1}) == 1.0 and _best_dice({"best_metric": True}) is None
+    assert _best_dice({"train_stats": {"best_metric": float("nan")}, "best_validation_dice": 0.7}) == 0.7 and _best_dice({"best_metric": float("nan")}) is None, "NaN is no dice"
+    assert _best_dice({"train_stats": {"best_metric": 0.91}}) == 0.91
+    # a finite value outside [0, 1] is a loss or a count under the generic key, not a Dice (round 11)
+    assert _best_dice({"best_metric": 12}) is None and _best_dice({"best_metric": -0.5}) is None and _best_dice({"best_metric": 1.0000001}) is None
+    assert _best_dice({"best_validation_dice": 7, "best_metric": 0.5}) == 0.5, "the out-of-range key is skipped, the next one read"
+    assert _best_dice({"best_metric": 0.0}) == 0.0 and _best_dice({"best_metric": 1}) == 1.0
+    assert num_classes({"top": 65535}) == 65536 and num_classes({"over": 65536}) is None
+    # label_names is built from the same validated indices, so the record cannot advertise a mapping
+    # num_classes refused: `lesion:inf` was an impossible class for a catalog consumer to read
+    # (Codex P2, PR #21 round 31)
+    from segwrapup.model import build_model_xml
+    from segwrapup.register import XnatContext
+    context = XnatContext(host="http://x", user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    xml = build_model_xml(context, "model_x", "XNAT_E77777", {"labels": {"lesion": 1e309, "spleen": 1, "liver": 2.0,
+                                                                        "bad": -1, "huge": 10 ** 400}},
+                          {"pipeline": "monailabel-train"}, ["w.pt"], {"label": "ds"})
+    assert "<analysis:label_names>spleen:1,liver:2</analysis:label_names>" in xml, xml
+    assert "<analysis:num_classes>3</analysis:num_classes>" in xml
+    assert "inf" not in xml and "lesion" not in xml and "huge" not in xml
+    # every index unusable: neither element is written, rather than a mapping of nothing
+    bare = build_model_xml(context, "model_x", "XNAT_E77777", {"labels": {"lesion": 1e309}},
+                           {"pipeline": "monailabel-train"}, ["w.pt"], {"label": "ds"})
+    assert "<analysis:label_names>" not in bare and "<analysis:num_classes>" not in bare
+
+
+def test_default_checkpoint_must_be_an_uploaded_weight():
+    """A stale card value would send consumers to a file the MODEL resource does not hold (Codex P2, PR #21)."""
+    from segwrapup.model import default_checkpoint
+    assert default_checkpoint("best.pt", ["best.pt"]) == "best.pt"
+    assert default_checkpoint("fold-0/best.pt", ["fold-0/best.pt", "fold-1/best.pt"]) == "fold-0/best.pt"
+    assert default_checkpoint("best.pt", ["fold-0/best.pt"]) == "fold-0/best.pt", "by basename when that is unambiguous"
+    assert default_checkpoint("best.ckpt", ["best.pt"]) == "best.pt", "the only weight wins over a stale name"
+    assert default_checkpoint("best.ckpt", ["fold-0/best.pt", "fold-1/best.pt"]) is None, "ambiguous: registered without one"
+    assert default_checkpoint(None, ["a.pt", "b.pt"]) is None and default_checkpoint("", ["only.pt"]) == "only.pt"
+    # a non-string card value is undeclared, not an AttributeError that fails the wrapup after the run was published (Codex P2, round 4)
+    assert default_checkpoint(123, ["only.pt"]) == "only.pt" and default_checkpoint({"path": "x"}, ["a.pt", "b.pt"]) is None
+    assert default_checkpoint(["best.pt"], ["best.pt"]) == "best.pt", "a list is not a string either; the only weight wins"
+
+
+def test_a_missing_path_qualified_default_checkpoint_is_not_remapped_to_another_fold():
+    """`fold-0/best.pt` declared, only `fold-1/best.pt` uploaded: a basename match or the only-weight
+    fallback would make every consumer load the other fold under the card's name (Codex P2, round 22).
+    A bare basename keeps its basename match; an exact path match is still honoured."""
+    from segwrapup.model import default_checkpoint
+    assert default_checkpoint("fold-0/best.pt", ["fold-1/best.pt"]) is None, "the only weight is a different fold"
+    assert default_checkpoint("fold-0/best.pt", ["fold-1/best.pt", "fold-1/final.pt"]) is None
+    assert default_checkpoint("fold-0/best.pt", ["fold-0/best.pt"]) == "fold-0/best.pt"
+    assert default_checkpoint("best.pt", ["fold-1/best.pt"]) == "fold-1/best.pt", "a bare basename still matches by basename"
+    assert default_checkpoint("models/best.pt", ["best.pt"]) is None, "a path is not shortened to its basename either"
+    assert default_checkpoint("fold-0\\best.pt", ["fold-1/best.pt"]) is None, "a Windows-style path is a path, not a basename"
+    assert default_checkpoint("fold-0\\best.pt", ["fold-0/best.pt", "fold-1/best.pt"]) == "fold-0/best.pt", "and names the POSIX path it was uploaded as (round 25)"
+    assert default_checkpoint("fold-0\\best.pt", ["fold-0\\best.pt"]) == "fold-0\\best.pt", "an exact match is still honoured"
+    assert default_checkpoint("models\\best.pt", ["best.pt"]) is None
+    # a card that spells a relative path out names an uploaded weight; read literally it missed and the
+    # model was registered with no default checkpoint for a consumer to select (Codex P2, round 32)
+    assert default_checkpoint("./best.pt", ["best.pt"]) == "best.pt"
+    assert default_checkpoint("fold-0/./best.pt", ["fold-0/best.pt", "fold-1/best.pt"]) == "fold-0/best.pt"
+    assert default_checkpoint(".\\fold-0\\best.pt", ["fold-0/best.pt"]) == "fold-0/best.pt", "and the Windows spelling of one"
+    assert default_checkpoint("fold-0/../fold-1/best.pt", ["fold-1/best.pt"]) == "fold-1/best.pt", "normalised, not followed"
+    # normalising cannot invent a match: nothing is uploaded above the resource root or absolute
+    assert default_checkpoint("../best.pt", ["best.pt"]) is None and default_checkpoint("/best.pt", ["best.pt"]) is None
+    assert default_checkpoint("./best.pt", ["fold-0/best.pt"]) is None, "still a path, not a basename to remap"
+
+
+
+def test_engine_metadata_is_bounded_to_the_schema_cap(caplog):
+    """A detailed model card must not make XNAT refuse the trained-model record (Codex P2, PR #21 round 10):
+    the train_stats lists go first, then train_stats, then everything but the run link."""
+    import logging
+    from segwrapup.model import ENGINE_METADATA_MAX, bounded_engine_metadata
+    link = {"source_run_id": "XNAT_E1", "source_run_type": "analysis:groupAnalysisData"}
+    small = {"app": "radiology", "train_stats": {"best_metric": 0.8, "epochs": 5, "history": [0.1, 0.5, 0.8]}, **link}
+    assert json.loads(bounded_engine_metadata(small)) == small, "under the cap: verbatim"
+    history = [{"epoch": i, "loss": 0.5, "dice": 0.7} for i in range(3000)]
+    detailed = {"app": "radiology", "max_epochs": 3000, "train_stats": {"best_metric": 0.8, "best_epoch": 2999, "history": history,
+                                                                        "per_class": {"spleen": history}}, **link}
+    assert len(json.dumps(detailed)) > ENGINE_METADATA_MAX
+    with caplog.at_level(logging.WARNING):
+        reduced = json.loads(bounded_engine_metadata(detailed))
+    assert reduced["train_stats"] == {"best_metric": 0.8, "best_epoch": 2999} and reduced["truncated"] == ["train_stats"]
+    assert reduced["app"] == "radiology" and reduced["source_run_id"] == "XNAT_E1"
+    assert len(json.dumps(reduced)) <= ENGINE_METADATA_MAX and "reduced to its scalars" in caplog.text
+    # scalars alone over the cap: train_stats goes entirely
+    wide = {**detailed, "train_stats": {f"metric_{i}": i for i in range(9000)}}
+    reduced = json.loads(bounded_engine_metadata(wide))
+    assert "train_stats" not in reduced and reduced["truncated"] == ["train_stats"] and reduced["app"] == "radiology"
+    # the rest over the cap too: only the link survives, and the record says what it lost
+    huge = {"app": "x" * 70000, "base_model": "b", **link}
+    reduced = json.loads(bounded_engine_metadata(huge))
+    assert reduced == {**link, "truncated": ["app", "base_model"]}
+    assert len(json.dumps(reduced)) <= ENGINE_METADATA_MAX
+    # a number that overflowed to infinity, or a NaN, is never written as Infinity/NaN (round 19)
+    text = bounded_engine_metadata({"train_stats": {"best_metric": float("inf"), "loss": [0.5, float("nan")]}, "val_split": 0.2, **link})
+    assert "Infinity" not in text and "NaN" not in text
+    strict = json.loads(text, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    assert strict["train_stats"] == {"best_metric": None, "loss": [0.5, None]} and strict["non_finite_values_replaced"] == 2 and strict["val_split"] == 0.2
+    # nested past the recursion limit: the run link survives, the rest is named as dropped (round 20)
+    deep = {}
+    for _ in range(3000):
+        deep = {"n": deep}
+    text = bounded_engine_metadata({"app": "radiology", "train_stats": deep, **link})
+    assert json.loads(text) == {**link, "truncated": ["app", "train_stats"]}
+
+
+def test_the_root_card_wins_and_an_empty_candidate_does_not_hide_a_usable_one(tmp_path, caplog):
+    """The card the contract means is the one at the DERIVED root. A broad MODEL view can also name
+    `fold-0/model-card.json`, and while round 35 stopped an *empty* nested card hiding the root one, a
+    stale but valid nested card still supplied the registered metadata and was uploaded under the
+    canonical name (Codex P2, PR #21 round 78). The root comes first; a nested candidate is used only
+    when the root card is not usable, which is what keeps round 35's case working."""
+    import logging
+    from segwrapup.model import model_card_path, read_model_card
+    root = tmp_path / "derived"; (root / "fold-0").mkdir(parents=True)
+    names = ["fold-0/model-card.json", "fold-0/best.pt", "model-card.json"]
+    # a stale but perfectly valid nested card: not the one that registers
+    (root / "fold-0" / "model-card.json").write_text(json.dumps({"model": "stale-fold", "labels": {"stale": 1}}))
+    (root / "model-card.json").write_text(json.dumps({"model": "spleen", "labels": {"spleen": 1}}))
+    with caplog.at_level(logging.WARNING):
+        assert model_card_path(root, names) == root / "model-card.json"
+    assert read_model_card(root, names)["model"] == "spleen", "and its metadata is read"
+    assert "model-card.json is the model card; fold-0/model-card.json also match by name" in caplog.text
+    # an empty root card does not leave the model cardless: the nested one is used, and said so (round 35)
+    (root / "model-card.json").write_bytes(b"")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert model_card_path(root, names) == root / "fold-0" / "model-card.json"
+    assert read_model_card(root, names)["model"] == "stale-fold"
+    assert "model-card.json is empty; using fold-0/model-card.json instead" in caplog.text
+    # every candidate empty: no card, as before, and the message names them
+    (root / "fold-0" / "model-card.json").write_bytes(b"")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert model_card_path(root, names) is None and read_model_card(root, names) == {}
+    assert "is empty; the model registers without a card" in caplog.text
+    assert "fold-0/model-card.json" in caplog.text
+    # several usable nested cards and none usable at the root: the first in view order used to describe the
+    # whole multi-fold model and was uploaded under the canonical name. Which one describes it cannot be
+    # told, so none does (Codex P2, PR #21 round 83)
+    (root / "fold-1").mkdir()
+    (root / "fold-0" / "model-card.json").write_text(json.dumps({"model": "fold-0"}))
+    (root / "fold-1" / "model-card.json").write_text(json.dumps({"model": "fold-1"}))
+    folds = ["fold-0/model-card.json", "fold-0/best.pt", "fold-1/model-card.json", "fold-1/best.pt", "model-card.json"]
+    for root_card in (b"", None):   # an empty root card, then none at all
+        if root_card is None:
+            (root / "model-card.json").unlink()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert model_card_path(root, folds) is None and read_model_card(root, folds) == {}, root_card
+        assert "2 nested cards match (fold-0/model-card.json, fold-1/model-card.json)" in caplog.text
+        assert model_card_path(root, list(reversed(folds))) is None, "and view order does not decide it"
+    # one usable nested card beside an empty one is unambiguous, and used
+    (root / "fold-1" / "model-card.json").write_bytes(b"")
+    assert model_card_path(root, folds) == root / "fold-0" / "model-card.json"
+    # the control: a usable root card is the card whatever is nested
+    (root / "fold-1" / "model-card.json").write_text(json.dumps({"model": "fold-1"}))
+    (root / "model-card.json").write_text(json.dumps({"model": "spleen"}))
+    assert model_card_path(root, folds) == root / "model-card.json"
+
+
+def test_an_empty_model_card_is_still_uploaded_and_named(cs, tmp_path, monkeypatch):
+    """`{}` is a valid card with no metadata: the file the MODEL view selected goes on MODEL_CARD and
+    the record names the resource; only the metadata-derived fields are absent (Codex P2, PR #21 round 11)."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "model-card.json").write_text("{}")
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    model_xml = creates[1]["body"].decode()
+    assert "<analysis:model_card_resource_label>MODEL_CARD</analysis:model_card_resource_label>" in model_xml
+    assert "<analysis:label_names>" not in model_xml and "<analysis:best_validation_dice>" not in model_xml
+    uploads = [c["path"].split("?")[0] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/experiments/XNAT_E88888/resources/")]
+    assert "/data/experiments/XNAT_E88888/resources/MODEL_CARD/files/model-card.json" in uploads
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["trained_model"]["model_card"] is True
+    # no card file at all: no MODEL_CARD resource, and the record does not name one
+    from segwrapup.model import model_card_path, read_model_card
+    bare = tmp_path / "bare"; bare.mkdir(); (bare / "segmentation_spleen.pt").write_bytes(b"w")
+    assert model_card_path(bare, ["segmentation_spleen.pt"]) is None and read_model_card(bare, ["segmentation_spleen.pt"]) == {}
+    assert model_card_path(inp, ["segmentation_spleen.pt"]) == inp / "model-card.json", "the DERIVED-root fallback"
+    assert model_card_path(inp, ["model-card.json"]) == inp / "model-card.json"
+    (inp / "model-card.json").write_text("not json")
+    assert read_model_card(inp, ["model-card.json"]) == {} and model_card_path(inp, ["model-card.json"]) is not None, "unreadable: no metadata, but the file is there"
+    # syntactically valid but nested past the parser's recursion limit: no metadata, the file stays (round 24)
+    (inp / "model-card.json").write_text('{"train_stats": ' + "[" * 100000 + "]" * 100000 + "}")
+    assert read_model_card(inp, ["model-card.json"]) == {} and model_card_path(inp, ["model-card.json"]) is not None
+    (inp / "model-card.json").write_bytes(b"")
+    assert model_card_path(inp, ["model-card.json"]) is None, "zero bytes: XNAT would refuse the upload, so no card is advertised (round 12)"
+    # only the exact basename is the card: a look-alike in a broad view is not (round 15)
+    from segwrapup.model import is_model_card
+    (bare / "backup-model-card.json").write_text(json.dumps({"model": "old"}))
+    assert not is_model_card("backup-model-card.json") and is_model_card("fold-0/model-card.json")
+    assert model_card_path(bare, ["backup-model-card.json", "segmentation_spleen.pt"]) is None
+    assert read_model_card(bare, ["backup-model-card.json"]) == {}
+
+
+def test_a_look_alike_card_name_in_the_model_view_is_a_weight_file_not_the_card(cs, tmp_path, monkeypatch):
+    """`backup-model-card.json` sorts before `model-card.json` in a broad MODEL view; it must neither
+    supply the metadata nor be uploaded under the canonical name (Codex P2, PR #21 round 15)."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "backup-model-card.json").write_text(json.dumps({"model": "stale", "labels": {"liver": 1}}))
+    _training_env(monkeypatch, host, {"XNW_RESOURCE_MODEL": "*.pt,*.json"})
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    model_xml = creates[1]["body"].decode()
+    assert "<analysis:model_name>segmentation_spleen</analysis:model_name>" in model_xml and "stale" not in model_xml
+    uploads = sorted(c["path"].split("?")[0] for c in handler.calls if c["method"] == "PUT" and "/resources/MODEL" in c["path"])
+    assert "/data/experiments/XNAT_E88888/resources/MODEL_CARD/files/model-card.json" in uploads
+    assert "/data/experiments/XNAT_E88888/resources/MODEL/files/backup-model-card.json" in uploads, "a view file, so it rides with the weights"
+    assert "/data/experiments/XNAT_E88888/resources/MODEL/files/model-card.json" not in uploads
+
+
+def test_a_card_field_the_xml_cannot_carry_costs_the_run_nothing(cs, tmp_path, monkeypatch):
+    """A lone surrogate in a card field used to build fine and fail at xml.encode(), and the
+    best-effort promise made that an error in the outcome with a written manifest rather than an
+    aborted wrapup (Codex P2, PR #21 round 15) — but the run still lost its model record over one
+    character. XML 1.0 carries no surrogate either, so the same escaping that handles a forbidden
+    control character (round 77) handles this: the document says `\\ud800`, and the model is
+    registered."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "model-card.json").write_text('{"model_framework": "monailabel", "model": "\\ud800", "labels": {"spleen": 1}}')
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777"
+    assert manifest["trained_model"]["id"] == "XNAT_E88888" and not manifest["trained_model"].get("error")
+    creates = [c["path"] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert len(creates) == 2, "the run record and the model asset"
+    posted = [(c.get("body") or b"").decode(errors="replace") for c in handler.calls if c["method"] == "PUT"]
+    model_doc = next(b for b in posted if "analysis:model_status" in b)
+    import xml.etree.ElementTree as ET
+    ET.fromstring(model_doc)                        # the control: the document parses at all
+    assert "\\ud800" in model_doc, "the escape, not the unwritable character"
+
+
+def test_a_zero_byte_model_card_is_not_advertised(cs, tmp_path, monkeypatch):
+    """publish_record skips zero-byte files; the record must not name a MODEL_CARD resource that holds
+    nothing, nor the manifest say model_card: true (Codex P2, PR #21 round 12)."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "model-card.json").write_bytes(b"")
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    model_xml = creates[1]["body"].decode()
+    assert "model_card_resource_label" not in model_xml
+    uploads = [c["path"].split("?")[0] for c in handler.calls if c["method"] == "PUT" and "/resources/MODEL_CARD/" in c["path"]]
+    assert uploads == []
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["trained_model"]["model_card"] is False and manifest["trained_model"]["id"] == "XNAT_E88888"
+
+
+def test_a_zero_byte_checkpoint_is_not_a_weight(cs, tmp_path, monkeypatch):
+    """publish_record skips zero-byte files; a model whose `weights` or default_checkpoint named one
+    would point consumers at a file the MODEL resource does not hold (Codex P2, PR #21 round 26).
+    Empty checkpoints are left off; with none left, no model is registered and the run still is."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "interrupted.pt").write_bytes(b"")
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    model_xml = creates[1]["body"].decode()
+    assert "<analysis:default_checkpoint>segmentation_spleen.pt</analysis:default_checkpoint>" in model_xml
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["trained_model"]["weights"] == ["segmentation_spleen.pt"], "the empty file is not a weight"
+    uploads = sorted(c["path"].split("?")[0].rsplit("/", 1)[-1] for c in handler.calls if c["method"] == "PUT" and "/resources/MODEL/" in c["path"])
+    assert "interrupted.pt" not in uploads and "segmentation_spleen.pt" in uploads
+    # the declared default itself empty and another weight present: the empty file is not a candidate;
+    # the bare-basename rule then hands the only usable weight over, as for any stale basename
+    handler.calls.clear(); out2 = tmp_path / "out2"
+    (inp / "segmentation_spleen.pt").write_bytes(b""); (inp / "interrupted.pt").write_bytes(b"OTHER")
+    assert proc.main(["--input", str(inp), "--output", str(out2)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert "<analysis:default_checkpoint>interrupted.pt</analysis:default_checkpoint>" in creates[1]["body"].decode(), "never the empty file"
+    assert json.loads((out2 / "wrapup.json").read_text())["trained_model"]["weights"] == ["interrupted.pt"]
+    # every checkpoint empty: the run record is published, no model asset, the manifest says why
+    handler.calls.clear(); out3 = tmp_path / "out3"
+    (inp / "interrupted.pt").write_bytes(b"")
+    assert proc.main(["--input", str(inp), "--output", str(out3)]) == 0
+    creates = [c for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert len(creates) == 1, "the run record only; no model asset"
+    error = json.loads((out3 / "wrapup.json").read_text())["trained_model"]["error"]
+    assert "MODEL" in error and ("no usable checkpoint" in error or "no MODEL view files" in error), error
+    from segwrapup.model import register_trained_model
+    from segwrapup.register import XnatContext
+    context = XnatContext(host=host, user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    outcome = register_trained_model(context, inp, None, {"id": "XNAT_E77777", "id_is_accession": True}, "SUCCEEDED",
+                                     {"MODEL": ["segmentation_spleen.pt", "interrupted.pt"]}, {}, {}, 5.0)
+    assert "no usable checkpoint" in outcome["error"] and "interrupted.pt" in outcome["error"], outcome
+
+
+def test_run_data_fields_of_the_wrong_shape_are_a_link_error_not_an_abort(cs, tmp_path, monkeypatch):
+    """A null or list data_fields on the run record must surface as link_error in the outcome
+    (RuntimeError, which register_trained_model handles), not an AttributeError after run and model
+    exist (Codex P2, PR #21 round 11)."""
+    import urllib.request
+    from segwrapup.model import _record_fields
+    from segwrapup.register import XnatContext
+    host, handler = cs
+    context = XnatContext(host=host, user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    real = urllib.request.urlopen
+    class Answer:
+        def __init__(self, body): self.body = body
+        def read(self): return self.body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    for shape in (None, ["a", "b"], "text"):
+        monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None, s=shape: Answer(json.dumps({"items": [{"data_fields": s}]}).encode()))
+        with pytest.raises(RuntimeError, match="data_fields is .*, not an object"):
+            _record_fields(context, "XNAT_E77777", 5.0)
+    # valid JSON nested past the recursion limit is a RuntimeError too, not a RecursionError past the guards (round 28)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(b'{"items": [' + b"[" * 100000 + b"]" * 100000 + b"]}"))
+    with pytest.raises(RuntimeError, match="failed: maximum recursion depth|failed: RecursionError"):
+        _record_fields(context, "XNAT_E77777", 5.0)
+    # the provenance scratch that cannot be made is an outcome, not an abort after the run record (round 28)
+    from segwrapup import model as model_module
+    from segwrapup.model import register_trained_model
+    inp = _training_output(tmp_path)
+    monkeypatch.setattr(urllib.request, "urlopen", real)
+    def no_space(*a, **kw):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(model_module.tempfile, "mkdtemp", no_space)
+    outcome = register_trained_model(context, inp, None, {"id": "XNAT_E77777", "id_is_accession": True}, "SUCCEEDED",
+                                     {"MODEL": ["segmentation_spleen.pt", "model-card.json"]}, {}, {}, 5.0)
+    assert "No space left on device" in outcome["error"] and outcome["label"], outcome
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(json.dumps({"items": [{"data_fields": {"results_json": "{}"}}]}).encode()))
+    assert _record_fields(context, "XNAT_E77777", 5.0) == {"results_json": "{}"}
+    monkeypatch.setattr(urllib.request, "urlopen", real)
+
+
+def test_the_link_step_accepts_json_native_results_fields():
+    """XNAT answers results_json as text, but a dict or a number in its place must not raise TypeError
+    out of the link step after run and model exist (Codex P2, PR #21 round 14)."""
+    from segwrapup.model import _current_results
+    assert _current_results("XNAT_E1", None) == {} and _current_results("XNAT_E1", "") == {}
+    assert _current_results("XNAT_E1", '{"views": {"MODEL": ["a.pt"]}}') == {"views": {"MODEL": ["a.pt"]}}
+    deep = "[" * 100000 + "]" * 100000
+    assert _current_results("XNAT_E1", deep) == {"results_raw": deep}, "nested past the recursion limit: kept raw, not an abort (round 29)"
+    assert _current_results("XNAT_E1", {"views": {}}) == {"views": {}}, "a dict is taken as is"
+    assert _current_results("XNAT_E1", 7) == {"results": 7} and _current_results("XNAT_E1", [1, 2]) == {"results": [1, 2]}
+    assert _current_results("XNAT_E1", "[1, 2]") == {"results": [1, 2]}
+    assert _current_results("XNAT_E1", "{not json") == {"results_raw": "{not json"}
+
+
+def test_the_run_link_is_keyed_on_the_accession_resolved_from_the_lookup(monkeypatch):
+    """publish_record hands back the run's label as its id when XNAT answered no id; the partial XML
+    update is keyed on the accession, so the lookup goes by label under the project and the answer's
+    ID is what the document and the PUT use (Codex P2, PR #21 round 16)."""
+    import urllib.request
+    from segwrapup import model
+    from segwrapup.register import XnatContext
+    context = XnatContext(host="http://x", user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    seen = {}
+    class Answer:
+        def __init__(self, body): self.body = body
+        def read(self): return self.body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def urlopen(req, timeout=None):
+        seen["get"] = req.full_url
+        return Answer(json.dumps({"items": [{"data_fields": {"ID": "XNAT_E77777", "label": "monailabel-train_ds_20260926T221538Z_record", "results_json": "{}"}}]}).encode())
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(model, "_put", lambda ctx, url, body, ctype, timeout: (seen.update(put=url, xml=body.decode()), (200, "XNAT_E77777"))[1])
+    accession = model.note_model_on_run(context, "monailabel-train_ds_20260926T221538Z_record", "XNAT_E88888", "model_x")
+    assert accession == "XNAT_E77777"
+    assert seen["get"] == "http://x/data/projects/PROJ_1/experiments/monailabel-train_ds_20260926T221538Z_record?format=json", "a label is looked up under the project"
+    assert seen["put"].startswith("http://x/data/experiments/XNAT_E77777?") and 'ID="XNAT_E77777"' in seen["xml"]
+    # an accession id is looked up directly, as before
+    assert model.note_model_on_run(context, "XNAT_E77777", "XNAT_E88888", "model_x") == "XNAT_E77777"
+    assert seen["get"] == "http://x/data/experiments/XNAT_E77777?format=json"
+    # no resolvable accession in the answer: a link error, never a document keyed on the label
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(json.dumps({"items": [{"data_fields": {"label": "l", "results_json": "{}"}}]}).encode()))
+    seen.pop("put")
+    with pytest.raises(RuntimeError, match="accession id could not be resolved"):
+        model.note_model_on_run(context, "monailabel-train_ds_20260926T221538Z_record", "XNAT_E88888", "model_x")
+    assert "put" not in seen
+
+
+def test_a_link_step_that_cannot_build_its_document_is_an_outcome_not_an_abort(tmp_path, monkeypatch):
+    """`register_trained_model` never raises by contract: the run record is published and the model may
+    be registered, so a failure in the forward link belongs in the outcome and in wrapup.json. The link
+    guard caught only RuntimeError and UnicodeEncodeError, so a ValueError out of the serialiser aborted
+    proc-wrapup after the model existed and before the manifest was written (Codex P2, PR #21 round 35)."""
+    from segwrapup import model
+    from segwrapup.register import XnatContext
+    context = XnatContext(host="http://x", user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    out = tmp_path / "out"; (out / "raw").mkdir(parents=True)
+    (out / "raw" / "segmentation_spleen.pt").write_bytes(b"W")
+    monkeypatch.setattr(model, "_username", lambda ctx, timeout: "jdickson")
+    monkeypatch.setattr(model, "publish_record", lambda *a, **kw: {"id": "XNAT_E88888", "label": "model_ds_x"})
+    for raised in (ValueError("Out of range float values are not JSON compliant"), RecursionError(), OSError("disk"),
+                   TypeError("not serialisable")):
+        def refuse(*a, **kw):
+            raise raised
+        monkeypatch.setattr(model, "note_model_on_run", refuse)
+        result = model.register_trained_model(context, out, "raw", {"id": "XNAT_E77777", "id_is_accession": True},
+                                              "SUCCEEDED", {"MODEL": ["segmentation_spleen.pt"]},
+                                              {"pipeline": "monailabel-train"}, {"label": "ds"})
+        assert result["id"] == "XNAT_E88888" and result["linked"] is False, result
+        assert type(raised).__name__ in result["link_error"] or str(raised) in result["link_error"], result
+
+
+def test_the_link_document_stays_under_the_cap_when_the_runs_results_cannot_be_parsed(monkeypatch):
+    """The link step re-reads the run'"'"'s ``results_json`` and keeps what it cannot parse as raw text.
+    That value is not reduced by the view counts, so the merged document stayed over the 65,536-character
+    schema cap, XNAT refused the PUT, and the run was left without its forward link to the model that had
+    just been registered (Codex P2, PR #21 round 30)."""
+    import urllib.request
+    from segwrapup import model
+    from segwrapup.publish import RESULTS_JSON_MAX
+    from segwrapup.register import XnatContext
+    context = XnatContext(host="http://x", user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    seen = {}
+    class Answer:
+        def __init__(self, body): self.body = body
+        def read(self): return self.body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    unparseable = "[" * 100000 + "]" * 100000   # valid JSON, nested past the parser'"'"'s limit: kept raw
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(
+        json.dumps({"items": [{"data_fields": {"ID": "XNAT_E77777", "label": "run_x", "results_json": unparseable}}]}).encode()))
+    monkeypatch.setattr(model, "_put", lambda ctx, url, body, ctype, timeout: (seen.update(xml=body.decode()), (200, "XNAT_E77777"))[1])
+    assert model.note_model_on_run(context, "XNAT_E77777", "XNAT_E88888", "model_x") == "XNAT_E77777"
+    written = seen["xml"].split("<analysis:results_json>")[1].split("</analysis:results_json>")[0]
+    results = json.loads(written.replace("&quot;", '"').replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"))
+    assert len(json.dumps(results)) <= RESULTS_JSON_MAX, "the document XNAT is asked to store is within the cap"
+    assert results["trained_model"]["id"] == "XNAT_E88888", "and it carries the forward link, which is the point of the PUT"
+    assert results["truncated"] == ["results_raw"] and "results_raw" not in results
+
+
+def test_a_near_cap_run_whose_views_are_not_file_lists_is_still_linked(monkeypatch):
+    """The link step merges ``trained_model`` into the run's own ``results_json`` and bounds the result.
+    A run already near the cap goes over, and the reduction counted each view's files: a ``views`` that
+    is a string or a list raised AttributeError out of the link step, after the model was registered
+    and past its guard; one the publish had already reduced to counts raised TypeError, and the run lost
+    its link to the model. And a second reduction replaced the publish's note of what it had left off
+    (Codex P2, PR #21 round 80)."""
+    import urllib.request
+    from segwrapup import model
+    from segwrapup.publish import RESULTS_JSON_MAX
+    from segwrapup.register import XnatContext
+    context = XnatContext(host="http://x", user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    link = {"trained_model": {"id": "XNAT_E88888", "label": "model_x", "xsi_type": model.MODEL_XSI_TYPE, "status": "DRAFT"}}
+
+    def near_cap(doc):
+        """`doc` padded so that it fits the cap and the link pushes it 50 characters over."""
+        over = len(json.dumps({**dict(doc, notes=""), **link}))
+        padded = dict(doc, notes="n" * (RESULTS_JSON_MAX + 50 - over))
+        assert len(json.dumps(padded)) <= RESULTS_JSON_MAX < len(json.dumps({**padded, **link}))
+        return padded
+
+    class Answer:
+        def __init__(self, body): self.body = body
+        def read(self): return self.body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    cases = (
+        # views as a string or a list: nothing to count, so it is left off whole and the rest fits
+        ({"views": "MODEL=segmentation_spleen.pt;" * 100, "model": "monailabel-train"}, ["views"], None),
+        ({"views": ["segmentation_spleen.pt"] * 100, "model": "monailabel-train"}, ["views"], None),
+        # views the publish already reduced to counts, with its note: the counts stay, the note keeps what
+        # the publish left off, and the padding is what goes this time
+        ({"views": {"MODEL": 2, "METRICS": 1}, "truncated": ["views", "per_structure"], "model": "monailabel-train"},
+         ["views", "per_structure", "notes"], {"MODEL": 2, "METRICS": 1}),
+    )
+    for current, truncated, views in cases:
+        seen = {}
+        run = near_cap(current)
+        monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(
+            json.dumps({"items": [{"data_fields": {"ID": "XNAT_E77777", "label": "run_x", "results_json": json.dumps(run)}}]}).encode()))
+        monkeypatch.setattr(model, "_put", lambda ctx, url, body, ctype, timeout: (seen.update(xml=body.decode()), (200, "XNAT_E77777"))[1])
+        assert model.note_model_on_run(context, "XNAT_E77777", "XNAT_E88888", "model_x") == "XNAT_E77777"
+        written = seen["xml"].split("<analysis:results_json>")[1].split("</analysis:results_json>")[0]
+        results = json.loads(html.unescape(written))
+        assert len(json.dumps(results)) <= RESULTS_JSON_MAX, current
+        assert results["trained_model"]["id"] == "XNAT_E88888", "the forward link is written"
+        assert results["truncated"] == truncated, results["truncated"]
+        assert results.get("views") == views
+        assert ("notes" in results) == ("notes" not in truncated), "what fits is kept"
+    # control: a run with room for the link is written as it was, plus the link, with no note
+    seen = {}
+    roomy = {"views": {"MODEL": ["segmentation_spleen.pt"]}, "model": "monailabel-train"}
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Answer(
+        json.dumps({"items": [{"data_fields": {"ID": "XNAT_E77777", "label": "run_x", "results_json": json.dumps(roomy)}}]}).encode()))
+    model.note_model_on_run(context, "XNAT_E77777", "XNAT_E88888", "model_x")
+    written = seen["xml"].split("<analysis:results_json>")[1].split("</analysis:results_json>")[0]
+    assert json.loads(html.unescape(written)) == {**roomy, **link}
+
+
+def test_fallback_labels_are_resolved_to_accessions_before_the_model_names_the_run_or_the_run_the_model(tmp_path, monkeypatch):
+    """publish_record hands back a label when XNAT's create answers no id. The model's reverse link
+    (engine_metadata_json.source_run_id, provenance.json) and the run's forward link
+    (results_json.trained_model.id) must both be accessions a consumer can GET (Codex P2, PR #21 round 17)."""
+    from segwrapup import model
+    from segwrapup.register import XnatContext
+    context = XnatContext(host="http://x", user="u", password="p", project="PROJ_1", session="", dataset="XNAT_D0001")
+    out = tmp_path / "out"; (out / "raw").mkdir(parents=True)
+    (out / "raw" / "segmentation_spleen.pt").write_bytes(b"W")
+    lookups, published, links = [], {}, {}
+    def record_fields(ctx, record_id, timeout, by_label=None):
+        lookups.append(record_id)
+        run = {"ID": "XNAT_E77777", "label": "run_lbl_x", "results_json": "{}"}
+        return {"run_lbl_x": run, "XNAT_E77777": run, "model_ds_x": {"ID": "XNAT_E88888", "label": "model_ds_x"}}[record_id]
+    monkeypatch.setattr(model, "_record_fields", record_fields)
+    monkeypatch.setattr(model, "_username", lambda ctx, timeout: "jdickson")
+    monkeypatch.setattr(model, "model_label", lambda dataset_label, when=None, run_id=None: "model_ds_x")
+    def publish_record(ctx, label, xml, files, timeout_seconds=300.0, xsi_type=None):
+        published["xml"] = xml
+        published["provenance"] = json.loads(files["PROVENANCE"][0].path.read_text())
+        return {"id": label, "label": label}   # XNAT answered no id: the label stands in
+    monkeypatch.setattr(model, "publish_record", publish_record)
+    monkeypatch.setattr(model, "_put", lambda ctx, url, body, ctype, timeout: (links.update(url=url, xml=body.decode()), (200, "XNAT_E77777"))[1])
+    result = model.register_trained_model(context, out, "raw", {"id": "run_lbl_x", "label": "run_lbl_x"}, "SUCCEEDED",
+                                          {"MODEL": ["segmentation_spleen.pt"]}, {"pipeline": "monailabel-train"}, {"label": "ds"})
+    assert lookups[0] == "run_lbl_x", "the run is resolved before the model is built"
+    assert '"source_run_id": "XNAT_E77777"' in published["xml"].replace("&quot;", '"') and published["provenance"]["source_run_id"] == "XNAT_E77777"
+    assert "run_lbl_x" not in published["xml"].split("<analysis:engine_metadata_json>")[1].split("</analysis:engine_metadata_json>")[0]
+    assert result["id"] == "XNAT_E88888" and result["source_run_id"] == "XNAT_E77777" and result["linked"] is True
+    assert '"id": "XNAT_E88888"' in links["xml"].replace("&quot;", '"') and links["url"].startswith("http://x/data/experiments/XNAT_E77777?")
+    # a label that looks like an accession is still looked up by label when the create answered no id (round 19)
+    lookups.clear()
+    record_fields_by = {}
+    def record_fields_flagged(ctx, record_id, timeout, by_label=None):
+        record_fields_by[record_id] = by_label
+        lookups.append(record_id)
+        return {"ID": "XNAT_E77777", "label": record_id, "results_json": "{}"} if by_label else {"ID": record_id, "label": "l", "results_json": "{}"}
+    monkeypatch.setattr(model, "_record_fields", record_fields_flagged)
+    result = model.register_trained_model(context, out, "raw", {"id": "MY_SITE_E123", "label": "MY_SITE_E123", "id_is_accession": False}, "SUCCEEDED",
+                                          {"MODEL": ["segmentation_spleen.pt"]}, {"pipeline": "monailabel-train"}, {"label": "ds"})
+    assert record_fields_by["MY_SITE_E123"] is True and result["source_run_id"] == "XNAT_E77777"
+    assert '"source_run_id": "XNAT_E77777"' in published["xml"].replace("&quot;", '"')
+    result = model.register_trained_model(context, out, "raw", {"id": "MY_SITE_E123", "label": "l", "id_is_accession": True}, "SUCCEEDED",
+                                          {"MODEL": ["segmentation_spleen.pt"]}, {"pipeline": "monailabel-train"}, {"label": "ds"})
+    assert result["source_run_id"] == "MY_SITE_E123", "trusted as the create's own answer"
+    assert record_fields_by.get("MY_SITE_E123") is not True, "never looked up by label"
+    # a run label that resolves to nothing: no model is registered at all
+    monkeypatch.setattr(model, "_record_fields", lambda ctx, record_id, timeout, by_label=None: {"label": record_id})
+    result = model.register_trained_model(context, out, "raw", {"id": "run_lbl_y", "label": "run_lbl_y"}, "SUCCEEDED",
+                                          {"MODEL": ["segmentation_spleen.pt"]}, {"pipeline": "monailabel-train"}, {"label": "ds"})
+    assert "accession id could not be resolved" in result["error"]
+
+
+def test_a_card_nested_past_the_recursion_limit_is_a_registration_outcome_not_an_abort(cs, tmp_path, monkeypatch):
+    """build_model_xml runs inside the guarded block now: whatever the card does to the document
+    builder ends as trained_model.error with the manifest written (Codex P2, PR #21 round 20)."""
+    from segwrapup import model
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    _training_env(monkeypatch, host)
+    def exploding(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+    monkeypatch.setattr(model, "build_model_xml", exploding)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777" and "recursion depth" in manifest["trained_model"]["error"]
+    creates = [c["path"] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert len(creates) == 1
+
+
+def test_a_control_character_in_a_card_field_still_registers_the_model(cs, tmp_path, monkeypatch):
+    """The live counterpart of the XML-character fix: a card whose model name holds \\u0001 used to
+    build a document XNAT refuses as malformed, so the checkpoints went unregistered. The escape goes
+    into the record instead and the model is registered (Codex P2, PR #21 round 77)."""
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    (inp / "model-card.json").write_text('{"model_framework": "monailabel", "model": "spleen\\u0001", "labels": {"spleen": 1}}')
+    _training_env(monkeypatch, host)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["trained_model"]["id"] == "XNAT_E88888" and not manifest["trained_model"].get("error")
+    bodies = [(c.get("body") or b"").decode(errors="replace") for c in handler.calls if c["method"] == "PUT"]
+    posted = [b for b in bodies if "analysis:model_status" in b]   # the model document, not the run's
+    assert posted, "the model document was posted"
+    import xml.etree.ElementTree as ET
+    ET.fromstring(posted[0])                    # the control: the document parses at all
+    assert "spleen\\x01" in posted[0], "the escape, not the raw control character"
+
+
+def test_a_view_that_cannot_be_inspected_is_an_outcome_not_an_abort(cs, tmp_path, monkeypatch):
+    """`register_trained_model` never raises: the run record is already published. The checkpoint
+    inspection (`is_file()`/`stat()`) ran outside its guard, so a transiently unavailable output —
+    EIO on a stat — escaped, and proc-wrapup aborted before the manifest and the pointer reduction
+    (Codex P2, PR #21 round 79). The EIO is raised from the real `stat` here, and only once the run
+    record exists, which is exactly when it hurt."""
+    import errno
+    from segwrapup import model
+    host, handler = cs
+    inp, out = _training_output(tmp_path), tmp_path / "out"
+    _training_env(monkeypatch, host)
+    armed = []
+    real_resolve = model.resolve_accession
+    def resolve_then_arm(*a, **kw):          # the call just before the inspection: the run record is published
+        result = real_resolve(*a, **kw)
+        armed.append(True)
+        return result
+    monkeypatch.setattr(model, "resolve_accession", resolve_then_arm)
+    real_stat = Path.stat
+    def failing_stat(self, *a, **kw):
+        if armed and self.name == "segmentation_spleen.pt":
+            raise OSError(errno.EIO, "Input/output error")
+        return real_stat(self, *a, **kw)
+    monkeypatch.setattr(Path, "stat", failing_stat)
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert armed, "the control: the fault was armed after the run record was published"
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777", "the run record stands"
+    error = manifest["trained_model"]["error"]
+    assert "could not be inspected" in error and "Input/output error" in error, error
+    creates = [c["path"] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
+    assert len(creates) == 1, "the run record only; no model asset"
