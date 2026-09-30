@@ -13,6 +13,7 @@ older TotalSegmentator container makes for RTStruct::
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import logging
 import os
@@ -165,10 +166,11 @@ def collection_label(model_name: str, scan: str, when: datetime | None = None, s
     XNAT experiment labels are unique per *project*, not per session, so the session label is
     part of it: a batch that finishes two runs of one pipeline in the same second (Merlin on
     RSNA0001/RSNA0002, 2026-09-06) otherwise builds the same label twice and the second create
-    is refused with 409. When the whole thing exceeds ``LABEL_MAX`` the model name is trimmed,
-    never the session, scan or stamp that make it unique. ``reserve`` leaves room for a suffix the
-    caller appends (proc-wrapup's ``_record``): a 64-character label plus ``_record`` is 71 and XNAT
-    refuses the record (Codex P2, PR #21)."""
+    is refused with 409. When the whole thing exceeds ``LABEL_MAX`` the model name is trimmed
+    first and the stamp never; a scan id or session label too long to fit is shortened with a digest
+    of the whole of it (:func:`_shortened`), so two that share the kept prefix still differ.
+    ``reserve`` leaves room for a suffix the caller appends (proc-wrapup's ``_record``): a
+    64-character label plus ``_record`` is 71 and XNAT refuses the record (Codex P2, PR #21)."""
     stamp = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
     limit = max(LABEL_MAX - max(reserve, 0), 1)
     scan_part = f"scan{_LABEL_SAFE.sub('_', scan)}" if scan else ""
@@ -179,15 +181,30 @@ def collection_label(model_name: str, scan: str, when: datetime | None = None, s
     # "M_" plus the scan and stamp must fit the limit; a very long scan id gives up its tail before
     # the stamp does, and the model keeps at least its one letter (Codex P2, PR #21 round 15)
     if scan_part and len(scan_part) + 1 + len(stamp) + 2 > limit:
-        scan_part = scan_part[:max(limit - len(stamp) - 3, 0)].rstrip("_")
+        scan_part = _shortened(scan_part, max(limit - len(stamp) - 3, 0))
     fixed = "_".join(part for part in (scan_part, stamp) if part)
     room = limit - len(fixed) - 1                         # for "<model>_" at least
     if owner:
-        owner = owner[:max(room - 2, 0)].rstrip("_")     # leave "M_" for the model
+        owner = _shortened(owner, max(room - 2, 0))      # leave "M_" for the model
     room = limit - len("_".join(part for part in (owner, fixed) if part)) - 1
     model = model[:max(room, 1)].rstrip("_") or "M"
     label = "_".join(part for part in (model, owner, fixed) if part)
     return label[:limit]
+
+
+def _shortened(text: str, width: int) -> str:
+    """``text`` cut to ``width`` characters in a way that keeps it apart from other texts cut to the
+    same prefix: the tail is replaced by a digest of the whole text. Cutting the prefix alone gave two
+    scans whose long ids share it (series UIDs under one study root, say) the same label in the same
+    second, and the second registration replaced the first scan's collection at the same URL
+    (Codex P2, PR #21 round 102); session labels shortened the same way met a 409 across sessions."""
+    if len(text) <= width:
+        return text
+    digest = hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    if width <= len(digest) + 1:
+        return digest[:width]
+    head = text[:width - len(digest) - 1].rstrip("_")
+    return f"{head}_{digest}" if head else digest
 
 
 def _encodable(value: str, what: str) -> str:

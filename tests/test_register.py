@@ -226,6 +226,31 @@ def test_collection_label_carries_the_session_and_trims_only_the_model():
     assert len(collection_label("merlin", "s" * 80, when)) <= LABEL_MAX
 
 
+def test_long_scan_ids_and_session_labels_that_share_a_prefix_keep_distinct_labels():
+    """A long scan id was cut to its prefix, so two scans of one session whose ids share it (series UIDs
+    under one study root) got the same label in the same second, and register_collection's overwrite
+    replaced the first scan's collection with the second's (Codex P2, PR #21 round 102). A shortened
+    scan id or session label keeps a digest of the whole of it."""
+    from datetime import datetime, timezone
+    from segwrapup.register import LABEL_MAX, collection_label
+    when = datetime(2026, 9, 30, 3, 5, 47, tzinfo=timezone.utc)
+    root = "1.3.12.2.1107.5.2.43.66037.30000026093003054700000"
+    scans = (root + "11", root + "12")
+    for reserve in (0, len("_record")):
+        a, b = (collection_label("merlin", scan, when, session_label="RSNA0001", reserve=reserve) for scan in scans)
+        assert a != b, (reserve, a)
+        for label in (a, b):
+            assert len(label) <= LABEL_MAX - reserve and label.endswith("_20260930T030547Z"), label
+        # the same scan always shortens the same way, so a label can be rebuilt
+        assert a == collection_label("merlin", scans[0], when, session_label="RSNA0001", reserve=reserve)
+    # two sessions whose long labels share the prefix that fits, in one project and one second
+    sessions = ("RSNA_DEMO_COHORT_" + "X" * 40 + "_0001", "RSNA_DEMO_COHORT_" + "X" * 40 + "_0002")
+    a, b = (collection_label("monailabel-train", "", when, session_label=owner, reserve=len("_record")) for owner in sessions)
+    assert a != b and all(len(label) <= LABEL_MAX - len("_record") for label in (a, b)), (a, b)
+    # the control: ids that fit are untouched
+    assert collection_label("merlin", "2", when, session_label="RSNA0001") == "merlin_RSNA0001_scan2_20260930T030547Z"
+
+
 def test_fetch_session_label_falls_back_to_the_id(caplog):
     from segwrapup.register import XnatContext, fetch_session_label
     context = XnatContext(host="http://127.0.0.1:9", user="u", password="p", project="P", session="XNAT_E1", session_tried=True)
