@@ -158,6 +158,10 @@ def close_session(context: XnatContext, timeout_seconds: float = 60.0) -> None:
 
 LABEL_MAX = 64
 
+#: What a shortened owner (session or dataset label) keeps when the scan id needs the rest: its digest and
+#: a few characters of its own (:func:`collection_label`).
+OWNER_KEPT = 16
+
 
 def collection_label(model_name: str, scan: str, when: datetime | None = None, session_label: str = "", reserve: int = 0) -> str:
     """A label OHIF will accept and a human can read:
@@ -176,20 +180,26 @@ def collection_label(model_name: str, scan: str, when: datetime | None = None, s
     scan_part = f"scan{_LABEL_SAFE.sub('_', scan)}" if scan else ""
     owner = _LABEL_SAFE.sub("_", session_label).strip("_") if session_label else ""
     model = _LABEL_SAFE.sub("_", model_name).strip("_") or "SEG"
-    # what must survive: the stamp and the scan (uniqueness); then the owner, then the model.
-    # A long dataset label used to push the stamp off the end (proc-wrapup dataset scope).
-    # "M_" plus the scan and stamp must fit the limit; a very long scan id gives up its tail before
-    # the stamp does, and the model keeps at least its one letter (Codex P2, PR #21 round 15)
-    if scan_part and len(scan_part) + 1 + len(stamp) + 2 > limit:
-        scan_part = _shortened(scan_part, max(limit - len(stamp) - 3, 0))
-    fixed = "_".join(part for part in (scan_part, stamp) if part)
-    room = limit - len(fixed) - 1                         # for "<model>_" at least
-    if owner:
-        owner = _shortened(owner, max(room - 2, 0))      # leave "M_" for the model
-    room = limit - len("_".join(part for part in (owner, fixed) if part)) - 1
-    model = model[:max(room, 1)].rstrip("_") or "M"
-    label = "_".join(part for part in (model, owner, fixed) if part)
-    return label[:limit]
+    # what must survive: the stamp whole (a long dataset label used to push it off the end); then the scan and
+    # the owner, which tell runs in the same second apart, each shortened with a digest of the whole of it
+    # when they do not fit (round 102); the model gives way first and keeps at least its one letter (Codex P2,
+    # PR #21 round 15). The scan used to take all the room it wanted and a long scan id left the owner none,
+    # so two sessions running one model on that scan id in the same second built the same label, which
+    # the project refuses and the ROI registration does not retry (Codex P2, PR #21 round 103): with both
+    # to fit, the owner keeps OWNER_KEPT characters (its digest and a few of its own) and the scan the rest.
+    separators = sum(1 for part in (owner, scan_part) if part) + 1        # <model>_[<owner>_][<scan>_]<stamp>
+    room = max(limit - len(stamp) - separators - 1, 0)                     # for owner and scan; 1 for the model
+    if len(owner) + len(scan_part) > room:
+        if owner and scan_part:
+            scan_part = _shortened(scan_part, min(len(scan_part), max(room - min(len(owner), OWNER_KEPT), 0)))
+            owner = _shortened(owner, max(room - len(scan_part), 0))
+        elif scan_part:
+            scan_part = _shortened(scan_part, room)
+        else:
+            owner = _shortened(owner, room)
+    rest = "_".join(part for part in (owner, scan_part, stamp) if part)
+    model = model[:max(limit - len(rest) - 1, 1)].rstrip("_") or "M"
+    return f"{model}_{rest}"[:limit]
 
 
 def _shortened(text: str, width: int) -> str:

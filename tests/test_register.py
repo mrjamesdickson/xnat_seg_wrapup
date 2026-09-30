@@ -251,6 +251,29 @@ def test_long_scan_ids_and_session_labels_that_share_a_prefix_keep_distinct_labe
     assert collection_label("merlin", "2", when, session_label="RSNA0001") == "merlin_RSNA0001_scan2_20260930T030547Z"
 
 
+def test_a_long_scan_id_leaves_room_for_the_session_that_tells_runs_apart():
+    """A scan id too long to fit took all the room and the session label was dropped, so two sessions running
+    one model on the same long scan id in the same second built the same label, which the project refuses
+    and the ROI registration does not retry (Codex P2, PR #21 round 103). The session keeps its digest."""
+    from datetime import datetime, timezone
+    from segwrapup.register import LABEL_MAX, collection_label
+    when = datetime(2026, 9, 30, 3, 31, 30, tzinfo=timezone.utc)
+    scan = "1.3.12.2.1107.5.2.43.66037.30000026093003313000000011"
+    for reserve in (0, len("_record")):
+        for sessions in (("RSNA0001", "RSNA0002"),
+                         ("RSNA_DEMO_COHORT_" + "X" * 40 + "_0001", "RSNA_DEMO_COHORT_" + "X" * 40 + "_0002")):
+            a, b = (collection_label("merlin", scan, when, session_label=s, reserve=reserve) for s in sessions)
+            assert a != b, (reserve, a)
+            for label, session in zip((a, b), sessions):
+                assert len(label) <= LABEL_MAX - reserve and label.endswith("_20260930T033130Z"), label
+                assert "_scan1_3_12" in label, "the scan keeps a readable start too"
+                if len(session) <= 16:
+                    assert f"_{session}_" in label, "a short session label is kept whole"
+    # the control: the same scan id and session in different seconds differ by the stamp, as before
+    assert collection_label("merlin", scan, when, session_label="RSNA0001") != collection_label(
+        "merlin", scan, when.replace(second=31), session_label="RSNA0001")
+
+
 def test_fetch_session_label_falls_back_to_the_id(caplog):
     from segwrapup.register import XnatContext, fetch_session_label
     context = XnatContext(host="http://127.0.0.1:9", user="u", password="p", project="P", session="XNAT_E1", session_tried=True)
