@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import re
@@ -25,7 +26,7 @@ from pathlib import Path, PurePosixPath
 from xml.sax.saxutils import escape
 
 from .execution import _get_json
-from .publish import RecordFile, _request, publish_record, record_urls
+from .publish import RecordFile, _request, _xml_text, publish_record, record_urls
 from .register import XnatContext
 
 logger = logging.getLogger(__name__)
@@ -106,11 +107,19 @@ def performer(doc: dict) -> str | None:
     return None
 
 
-def _device(doc: dict, array: str) -> str | None:
-    for item in doc.get("contained") or []:
-        if isinstance(item, dict) and item.get("resourceType") == "Device":
-            return _text(_first(item.get(array)).get("value"))
+def performer_device(doc: dict) -> dict | None:
+    """The contained Device a performer entry references: the model that wrote the report. Any other
+    contained Device (the scanner, say) says nothing about who wrote it (Codex P1, PR #23: the first
+    contained Device made a human's draft with a scanner in it an AI draft)."""
+    for item in doc.get("performer") or []:
+        target = _contained(doc, item.get("reference")) if isinstance(item, dict) else None
+        if target is not None and target.get("resourceType") == "Device":
+            return target
     return None
+
+
+def _device(device: dict | None, array: str) -> str | None:
+    return _text(_first(device.get(array)).get("value")) if device else None
 
 
 def study_instance_uid(doc: dict) -> str | None:
@@ -180,12 +189,13 @@ def parse(doc) -> dict:
     if not report_id:
         raise NotADiagnosticReport("the DiagnosticReport has no id: a rerun could not find the record it already made")
     tags = (doc.get("meta") or {}).get("tag") if isinstance(doc.get("meta"), dict) else None
+    device = performer_device(doc)
     return {"id": report_id, "version_id": _text((doc.get("meta") or {}).get("versionId")) if isinstance(doc.get("meta"), dict) else None,
             "status": _text(doc.get("status")), "category": _coding(_first(doc.get("category")), "code"),
             "code_system": _coding(doc.get("code"), "system"), "code": _coding(doc.get("code"), "code"),
             "code_display": _coding(doc.get("code"), "display"), "issued": _text(doc.get("issued")),
             "effective": _text(doc.get("effectiveDateTime")), "performer": performer(doc),
-            "device_name": _device(doc, "name"), "device_version": _device(doc, "version"),
+            "device_name": _device(device, "name"), "device_version": _device(device, "version"),
             "simulated": any(isinstance(t, dict) and str(t.get("code", "")).lower() == "simulated" for t in tags or []),
             "conclusion": _text(doc.get("conclusion")), "narrative": narrative(doc),
             "study_instance_uid": study_instance_uid(doc), "findings": findings(doc)}
@@ -193,7 +203,8 @@ def parse(doc) -> dict:
 
 def report_kind(parsed: dict) -> str:
     """The poller's rule: a Device author and no human performer is an AI draft; a human performer
-    signs a final report; anything else is a human draft."""
+    signs a final report; anything else is a human draft. The Device is the one a performer
+    references (``performer_device``), not any contained Device."""
     if parsed["performer"] is None and parsed["device_name"] is not None:
         return "AI_DRAFT"
     if parsed["performer"] is not None and (parsed["status"] or "").lower() == "final":
@@ -211,11 +222,30 @@ def _tail(source: str, width: int = 12) -> str:
     return s[:width] or "src"
 
 
+def _label_part(text: str) -> str:
+    return re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9_]+", "_", text or ""))
+
+
+def _short_hash(text: str, width: int) -> str:
+    return hashlib.sha256((text or "").encode("utf-8", "surrogatepass")).hexdigest()[:width]
+
+
 def record_label(session_label: str, source_system: str, report_id: str) -> str:
-    """``<session label>_RPT_<source>_<report id>``, as the poller names its records (DxReportRecordMapper.label)."""
-    raw = f"{session_label}_RPT_{_tail(source_system)}_{report_id}"
-    clean = re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9_]+", "_", raw))
-    return clean[:LABEL_MAX]
+    """``<session label>_RPT_<source>_<report id>``, as the poller names its records (DxReportRecordMapper.label).
+
+    Within the 64-character cap the end of the label, which names the report, is kept whole and the
+    session label is shortened instead, with a hash of the whole of it so two long session labels
+    that share a beginning stay apart. A report id too long for the suffix is replaced by its hash.
+    Cutting the whole label from the right made every report on a session with a 60-character label
+    ``<label>_RPT``, so the existence probe took each new report for one already filed (Codex P1, PR #23)."""
+    suffix = _label_part(f"_RPT_{_tail(source_system)}_{report_id}")
+    if len(suffix) > LABEL_MAX // 2:
+        suffix = _label_part(f"_RPT_{_tail(source_system)}_{_short_hash(report_id, 16)}")
+    session = _label_part(session_label).rstrip("_")
+    room = LABEL_MAX - len(suffix)
+    if len(session) > room:
+        session = session[:room - 7].rstrip("_") + "_" + _short_hash(session_label, 6)
+    return re.sub(r"_+", "_", session + suffix)
 
 
 def _clip(value: str | None, limit: int, what: str) -> str | None:
@@ -232,9 +262,23 @@ def _when(value: str | None, what: str) -> str | None:
     return value
 
 
+def _xml_safe(value, what: str):
+    """Strings with every code point XML 1.0 forbids written as its escape (``publish._xml_text``):
+    ``json.loads`` accepts ``"\\u0001"``, and one such character made the whole create document
+    malformed (Codex P2, PR #23). Done before the caps, so a cap counts what is written."""
+    if isinstance(value, str):
+        return _xml_text(what, value)
+    if isinstance(value, dict):
+        return {k: _xml_safe(v, f"{what} {k}") for k, v in value.items()}
+    if isinstance(value, list):
+        return [_xml_safe(v, what) for v in value]
+    return value
+
+
 def build_values(parsed: dict, raw_json: str, facts: dict, source_system: str, pseudonymization: str) -> dict:
     """Everything the record holds. ``facts`` is the session as XNAT has it (``fetch_session_facts``):
     the record names the archived session and its subject, never what the document says about them."""
+    parsed, raw_json, facts = _xml_safe(parsed, "report"), _xml_safe(raw_json, "raw_json"), _xml_safe(facts, "session")
     category = (parsed["category"] or "RAD").upper()
     status = (parsed["status"] or "unknown").lower()
     if raw_json is not None and len(raw_json) > RAW_JSON_MAX:
@@ -326,8 +370,11 @@ def publish_diagnostic_report(context: XnatContext | None, output_dir: Path, der
             return {"skipped": f"no {declared} in the tool's output"}
         text = path.read_text(encoding="utf-8")
         parsed = parse(json.loads(text))
-    except (OSError, UnicodeDecodeError, ValueError) as error:       # NotADiagnosticReport and JSONDecodeError are ValueErrors
-        logger.error("diagnostic report %s not filed: %s", declared, error)
+    except (OSError, UnicodeDecodeError, ValueError, AttributeError, TypeError, KeyError, IndexError) as error:
+        # NotADiagnosticReport and JSONDecodeError are ValueErrors; a valid JSON document with a malformed
+        # nested value (presentedForm ["oops"], a string where a CodeableConcept goes) fails the parser's
+        # .get() with AttributeError or TypeError, and must not escape after the run record exists (Codex P1, PR #23)
+        logger.error("diagnostic report %s not filed: %s: %s", declared, type(error).__name__, error)
         return {"error": f"{type(error).__name__}: {error}"}
     card_id = contract.get("card_id") or ""
     source_system = f"urn:xnatworks:card:{card_id}" if card_id else "urn:xnatworks:card"
@@ -347,8 +394,9 @@ def publish_diagnostic_report(context: XnatContext | None, output_dir: Path, der
         name = f"diagnosticreport-{re.sub(r'[^A-Za-z0-9_.-]+', '_', parsed['id'])}-v{values['source_version']}.json"
         outcome = publish_record(context, label, xml, {REPORT_ROLE: [RecordFile(path, name)]}, timeout_seconds=timeout_seconds,
                                  xsi_type=XSI_TYPE)
-    except (RuntimeError, urllib.error.URLError, OSError, KeyError, IndexError, TypeError, ValueError) as error:
-        logger.error("diagnostic report %s not filed on session %s; the run record stays: %s", declared, context.session, error)
+    except (RuntimeError, urllib.error.URLError, OSError, KeyError, IndexError, TypeError, ValueError, AttributeError) as error:
+        logger.error("diagnostic report %s not filed on session %s; the run record stays: %s: %s", declared, context.session,
+                     type(error).__name__, error)
         return {"error": f"{type(error).__name__}: {error}"}
     logger.info("diagnostic report filed as %s %s (%s, %d findings)", outcome.get("id"), label, values["report_kind"], len(values["findings"]))
     return {"xsi_type": XSI_TYPE, "id": outcome.get("id"), "label": outcome.get("label") or label, "source_id": parsed["id"],

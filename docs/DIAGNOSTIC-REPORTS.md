@@ -36,9 +36,14 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   digest, the region and the prompts). The label is built from it, and a label that already exists
   is taken as "this report is already filed" (probe 200 → `{"exists": true}`), which is what makes
   a rerun idempotent. A random id would file a fresh record on every rerun.
-- The model is a contained `Device`. A performer that references it is not a person, even with a
-  display (NV-Reason-CT writes `display: "NVIDIA NV-Reason-CT"`). Without that rule the poller's
-  "performer present means human" test would make every card report a `HUMAN_DRAFT`.
+- The model is a contained `Device` **that a performer entry references**. Such a performer is not
+  a person, even with a display, and the record's `device_name`/`device_version` come from that
+  Device. Without the first rule the poller's "performer present means human" test would make
+  every card report a `HUMAN_DRAFT`. Without the second, any contained Device (a scanner, say)
+  would make a human's draft an `AI_DRAFT` (Codex P1, PR #23). This is stricter than the poller
+  as ported, which takes the first contained Device. A vendor report filed by the poller and the
+  same document filed here can differ in `report_kind` only when the report carries a Device that
+  no performer names.
 
 ## What the record holds, and where each value comes from
 
@@ -65,6 +70,20 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   `REPORT` file keeps the full text.
 - **`xs:dateTime` will not take a FHIR date alone** (`2026-10-05`). `issued` and `effective`
   are left off unless they carry a time.
+- **The label keeps its report identity under the 64-character cap.** The poller cuts the whole
+  label from the right, so with a 60-character session label every report on the session became
+  `<label>_RPT` and the existence probe took each new report for one already filed (Codex P1,
+  PR #23). Here the `_RPT_<source>_<id>` end is kept whole, and the session label is shortened,
+  with a 6-character hash of the whole of it so two long labels sharing a beginning stay apart. An
+  id too long for the end is replaced by a 16-character hash. Labels under the cap are the
+  poller's, character for character.
+- **A character XML 1.0 forbids** (`json.loads` accepts `"\u0001"`) is written as its escape
+  (`\x01`), with a warning, by the same `_xml_text` the analysis records use. Otherwise one such
+  character makes the whole create document malformed (Codex P2, PR #23). This is done before
+  the caps, so a cap counts what is written.
+- **A malformed nested value** (`presentedForm: ["oops"]`, a string where a CodeableConcept goes)
+  is an `error` outcome, not an exception. It is caught after the run record exists, so it must not
+  stop `wrapup.json` or the pointer reduction (Codex P1, PR #23).
 - **Labels are unique per project, not per session.** The session label in the prefix keeps
   them apart. A 409 from a race takes the usual one retry with a random suffix, and `_relabel`
   now recognises the `dxreport:` root, so the document's `label` attribute matches the URL it

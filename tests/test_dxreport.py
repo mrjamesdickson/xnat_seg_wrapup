@@ -237,3 +237,73 @@ def test_the_contract_carries_the_declaration_from_env_and_from_json():
     assert RecordContract.from_env({"XNW_CARD_ID": "nv-reason-ct"}).diagnostic_report == ""
     as_json = json.dumps({"card_id": "nv-reason-ct", "diagnostic_report": "reports/dr.json"})
     assert RecordContract.from_env({"XNW_CONTRACT": as_json}).diagnostic_report == "reports/dr.json"
+
+
+# ── Codex round 1 on PR #23 ────────────────────────────────────────────────────
+def test_only_the_device_a_performer_references_makes_an_ai_draft():
+    scanner = {"resourceType": "Device", "id": "scanner", "name": [{"value": "CT scanner"}], "version": [{"value": "VB20"}]}
+    human_with_scanner = card_report(performer=[], contained=[scanner] + card_report()["contained"][1:])
+    parsed = dxreport.parse(human_with_scanner)
+    assert (parsed["device_name"], dxreport.report_kind(parsed)) == (None, "HUMAN_DRAFT"), "a scanner in the report wrote nothing"
+    second = card_report()
+    second["contained"].insert(0, scanner)                          # the model is now the second Device
+    parsed = dxreport.parse(second)
+    assert (parsed["device_name"], parsed["device_version"], dxreport.report_kind(parsed)) == ("NVIDIA NV-Reason-CT", "386b93e", "AI_DRAFT")
+
+
+def test_a_long_session_label_keeps_the_report_identity_in_the_label():
+    long_label = "S" * 60
+    first = dxreport.record_label(long_label, "urn:xnatworks:card:nv-reason-ct", "3f2a9c1d0b7e4a65")
+    second = dxreport.record_label(long_label, "urn:xnatworks:card:nv-reason-ct", "0000000000000001")
+    other_card = dxreport.record_label(long_label, "urn:xnatworks:card:hoppr", "3f2a9c1d0b7e4a65")
+    assert len({first, second, other_card}) == 3 and all(len(x) <= dxreport.LABEL_MAX for x in (first, second, other_card))
+    assert first.endswith("_RPT_nvreasonct_3f2a9c1d0b7e4a65")
+    # two long session labels that share their first 60 characters stay apart
+    assert dxreport.record_label(long_label + "_A", "urn:x:card", "r") != dxreport.record_label(long_label + "_B", "urn:x:card", "r")
+    # a report id too long for the label is replaced by its hash, still distinct and still under the cap
+    a, b = (dxreport.record_label("HB0004_1", "urn:x:card", "x" * 80 + tail) for tail in ("1", "2"))
+    assert a != b and len(a) <= dxreport.LABEL_MAX and a.startswith("HB0004_1_RPT_card_")
+    # the common case is still the poller's label, unchanged
+    assert dxreport.record_label("HB0004_1", "urn:xnatworks:card:nv-reason-ct", "3f2a9c1d0b7e4a65") == "HB0004_1_RPT_nvreasonct_3f2a9c1d0b7e4a65"
+
+
+def test_a_character_xml_cannot_carry_is_written_as_its_escape_and_the_document_still_parses(caplog):
+    doc = card_report(conclusion="Emboli\u0001 present￾")
+    doc["contained"][2]["valueString"] = "Filling\u0002defects"
+    values = dxreport.build_values(dxreport.parse(doc), json.dumps(doc, ensure_ascii=False), FACTS, "urn:xnatworks:card:nv-reason-ct", "n")
+    root = ElementTree.fromstring(dxreport.build_record_xml(values).encode())
+    assert root.find(DX + "conclusion").text == "Emboli\\x01 present\\ufffe"
+    assert root.find(DX + "findings")[0].find(DX + "value_string").text == "Filling\\x02defects"
+    assert "XML cannot carry" in caplog.text
+
+
+@pytest.mark.parametrize("broken, outcome", [
+    ({"presentedForm": ["oops"]}, "AttributeError"),
+    ({"result": [{"reference": "#finding-1"}], "contained": [{"resourceType": "Observation", "id": "finding-1", "code": "Lungs"}]},
+     "AttributeError"),
+    ({"performer": ["not a reference"], "contained": ["not a resource"]}, "filed"),      # tolerated: no device, no findings
+    ({"meta": {"versionId": "1", "tag": "simulated"}}, "filed"),                          # a tag that is not a list is no tag
+    ({"category": "RAD"}, "filed"),                                                       # no coding: the default category
+])
+def test_a_malformed_nested_value_is_an_outcome_not_an_abort(tmp_path, xnat, broken, outcome, caplog):
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path, card_report(**broken)), "raw", "diagnostic_report.json",
+                                             "SUCCEEDED", CONTRACT)
+    if outcome == "filed":
+        assert out["id"] == "XNAT_E99999"
+    else:
+        assert out["error"].startswith(outcome) and xnat["published"] == [] and "not filed" in caplog.text
+
+
+def test_the_nv_reason_ct_cards_own_document_files_as_an_ai_draft_with_every_finding():
+    """What the NV-Reason-CT card 0.6.0 driver writes for the RSNA demo CTPA fixture (container-workshop
+    wrappers/nv-reason-ct/image, run on its test fixtures): the contract between the card and this module."""
+    doc = json.loads((Path(__file__).parent / "fixtures" / "nv-reason-ct-0.6.0-diagnostic-report.json").read_text())
+    parsed = dxreport.parse(doc)
+    values = dxreport.build_values(parsed, json.dumps(doc), FACTS, "urn:xnatworks:card:nv-reason-ct", "n")
+    assert (values["report_kind"], values["report_status"], values["category"], values["code"]) == ("AI_DRAFT", "preliminary", "RAD", "68604-8")
+    assert values["device_name"] == "NVIDIA NV-Reason-CT" and values["device_version"] == "386b93e034983f6c1fc841a43833a1b6a0cd9c13"
+    assert values["label"] == "HB0004_1_RPT_nvreasonct_" + doc["id"]
+    assert len(values["findings"]) == 13 and values["findings"][-1]["display"] == "Direct question"
+    assert values["conclusion"].startswith("1. Probable pulmonary emboli.") and "Research and education use only" in values["conclusion"]
+    assert values["narrative"].startswith("TECHNIQUE: IV contrast CT.") and "</think>" not in values["narrative"]
+    ElementTree.fromstring(dxreport.build_record_xml(values).encode())

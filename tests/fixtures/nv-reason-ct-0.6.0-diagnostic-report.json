@@ -1,0 +1,290 @@
+{
+  "resourceType": "DiagnosticReport",
+  "id": "ca5eb7145fceac76",
+  "meta": {
+    "versionId": "1",
+    "tag": [
+      {
+        "system": "https://huggingface.co/nvidia/NV-Reason-CT",
+        "code": "research-use-only",
+        "display": "Research and education use only; not for clinical diagnosis or treatment decisions (NVIDIA model card). Unreviewed model output, not a medical device."
+      }
+    ]
+  },
+  "contained": [
+    {
+      "resourceType": "Device",
+      "id": "model",
+      "name": [
+        {
+          "value": "NVIDIA NV-Reason-CT",
+          "type": "user-friendly-name"
+        }
+      ],
+      "version": [
+        {
+          "value": "386b93e034983f6c1fc841a43833a1b6a0cd9c13"
+        }
+      ],
+      "url": "https://huggingface.co/nvidia/NV-Reason-CT",
+      "note": [
+        {
+          "text": "Research and education use only; not for clinical diagnosis or treatment decisions (NVIDIA model card). Unreviewed model output, not a medical device."
+        }
+      ]
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-1",
+      "status": "preliminary",
+      "code": {
+        "text": "Medical devices"
+      },
+      "valueString": "None present.",
+      "device": {
+        "reference": "#model"
+      }
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-2",
+      "status": "preliminary",
+      "code": {
+        "text": "Lungs and airways"
+      },
+      "valueString": "Bilateral lung infiltrates and scarring. Large right upper lung cavity. Central airways are patent.",
+      "device": {
+        "reference": "#model"
+      }
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-3",
+      "status": "preliminary",
+      "code": {
+        "text": "Pleura"
+      },
+      "valueString": "No pleural effusion or pneumothorax.",
+      "device": {
+        "reference": "#model"
+      }
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-4",
+      "status": "preliminary",
+      "code": {
+        "text": "Mediastinum and hila"
+      },
+      "valueString": "No mediastinal or hilar lymphadenopathy or mass.",
+      "device": {
+        "reference": "#model"
+      }
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-5",
+      "status": "preliminary",
+      "code": {
+        "text": "Heart and pericardium"
+      },
+      "valueString": "Normal heart size. No pericardial effusion.",
+      "device": {
+        "reference": "#model"
+      }
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-6",
+      "status": "preliminary",
+      "code": {
+        "text": "Great vessels"
+      },
+      "valueString": "Probable filling defects in multiple pulmonary arteries compatible with pulmonary emboli. Main pulmonary artery is normal in caliber. Left innominate vein is not visualized, probably chronically thrombosed. Normal caliber thoracic aorta.",
+      "device": {
+        "reference": "#model"
+      }
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-7",
+      "status": "preliminary",
+      "code": {
+        "text": "Esophagus"
+      },
+      "valueString": "No esophageal abnormality.",
+      "device": {
+        "reference": "#model"
+      }
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-8",
+      "status": "preliminary",
+      "code": {
+        "text": "Chest wall and breast"
+      },
+      "valueString": "No chest wall or breast mass.",
+      "device": {
+        "reference": "#model"
+      }
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-9",
+      "status": "preliminary",
+      "code": {
+        "text": "Bones"
+      },
+      "valueString": "No suspicious thoracic osseous lesion or acute fracture.",
+      "device": {
+        "reference": "#model"
+      }
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-10",
+      "status": "preliminary",
+      "code": {
+        "coding": [
+          {
+            "display": "Pulmonary fibrotic sequela"
+          }
+        ],
+        "text": "Summary label the model gave the scan"
+      },
+      "valueString": "Present",
+      "device": {
+        "reference": "#model"
+      }
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-11",
+      "status": "preliminary",
+      "code": {
+        "coding": [
+          {
+            "display": "Pulmonary embolism"
+          }
+        ],
+        "text": "Summary label the model gave the scan"
+      },
+      "valueString": "Present",
+      "device": {
+        "reference": "#model"
+      }
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-12",
+      "status": "preliminary",
+      "code": {
+        "coding": [
+          {
+            "display": "Thoracic vascular abnormality"
+          }
+        ],
+        "text": "Summary label the model gave the scan"
+      },
+      "valueString": "Present",
+      "device": {
+        "reference": "#model"
+      }
+    },
+    {
+      "resourceType": "Observation",
+      "id": "finding-13",
+      "status": "preliminary",
+      "code": {
+        "coding": [
+          {
+            "display": "Direct question"
+          }
+        ],
+        "text": "Is a pulmonary embolism present in this CT?"
+      },
+      "valueString": "Yes",
+      "device": {
+        "reference": "#model"
+      }
+    }
+  ],
+  "status": "preliminary",
+  "category": [
+    {
+      "coding": [
+        {
+          "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+          "code": "RAD",
+          "display": "Radiology"
+        }
+      ]
+    }
+  ],
+  "code": {
+    "coding": [
+      {
+        "system": "http://loinc.org",
+        "code": "68604-8",
+        "display": "Radiology Diagnostic study note"
+      }
+    ]
+  },
+  "issued": "2026-10-05T14:35:05Z",
+  "performer": [
+    {
+      "reference": "#model"
+    }
+  ],
+  "result": [
+    {
+      "reference": "#finding-1"
+    },
+    {
+      "reference": "#finding-2"
+    },
+    {
+      "reference": "#finding-3"
+    },
+    {
+      "reference": "#finding-4"
+    },
+    {
+      "reference": "#finding-5"
+    },
+    {
+      "reference": "#finding-6"
+    },
+    {
+      "reference": "#finding-7"
+    },
+    {
+      "reference": "#finding-8"
+    },
+    {
+      "reference": "#finding-9"
+    },
+    {
+      "reference": "#finding-10"
+    },
+    {
+      "reference": "#finding-11"
+    },
+    {
+      "reference": "#finding-12"
+    },
+    {
+      "reference": "#finding-13"
+    }
+  ],
+  "conclusion": "1. Probable pulmonary emboli.\n2. Bilateral lung infiltrates and scarring with large right upper lung cavity.\n3. Left innominate vein is not visualized, probably chronically thrombosed.\nResearch and education use only; not for clinical diagnosis or treatment decisions (NVIDIA model card). Unreviewed model output, not a medical device.",
+  "presentedForm": [
+    {
+      "contentType": "text/plain; charset=utf-8",
+      "language": "en",
+      "title": "NVIDIA NV-Reason-CT output, verbatim but for its reasoning: \"write a structured chest CT report\"",
+      "data": "VEVDSE5JUVVFOiBJViBjb250cmFzdCBDVC4KCkZJTkRJTkdTOgpNZWRpY2FsIGRldmljZXM6IE5vbmUgcHJlc2VudC4KCkNIRVNUOgpMdW5ncyBhbmQgYWlyd2F5czogQmlsYXRlcmFsIGx1bmcgaW5maWx0cmF0ZXMgYW5kIHNjYXJyaW5nLiBMYXJnZSByaWdodCB1cHBlciBsdW5nIGNhdml0eS4gQ2VudHJhbCBhaXJ3YXlzIGFyZSBwYXRlbnQuClBsZXVyYTogTm8gcGxldXJhbCBlZmZ1c2lvbiBvciBwbmV1bW90aG9yYXguCk1lZGlhc3RpbnVtIGFuZCBoaWxhOiBObyBtZWRpYXN0aW5hbCBvciBoaWxhciBseW1waGFkZW5vcGF0aHkgb3IgbWFzcy4KSGVhcnQgYW5kIHBlcmljYXJkaXVtOiBOb3JtYWwgaGVhcnQgc2l6ZS4gTm8gcGVyaWNhcmRpYWwgZWZmdXNpb24uCkdyZWF0IHZlc3NlbHM6IFByb2JhYmxlIGZpbGxpbmcgZGVmZWN0cyBpbiBtdWx0aXBsZSBwdWxtb25hcnkgYXJ0ZXJpZXMgY29tcGF0aWJsZSB3aXRoIHB1bG1vbmFyeSBlbWJvbGkuIE1haW4gcHVsbW9uYXJ5IGFydGVyeSBpcyBub3JtYWwgaW4gY2FsaWJlci4gTGVmdCBpbm5vbWluYXRlIHZlaW4gaXMgbm90IHZpc3VhbGl6ZWQsIHByb2JhYmx5IGNocm9uaWNhbGx5IHRocm9tYm9zZWQuIE5vcm1hbCBjYWxpYmVyIHRob3JhY2ljIGFvcnRhLgpFc29waGFndXM6IE5vIGVzb3BoYWdlYWwgYWJub3JtYWxpdHkuCkNoZXN0IHdhbGwgYW5kIGJyZWFzdDogTm8gY2hlc3Qgd2FsbCBvciBicmVhc3QgbWFzcy4KQm9uZXM6IE5vIHN1c3BpY2lvdXMgdGhvcmFjaWMgb3NzZW91cyBsZXNpb24gb3IgYWN1dGUgZnJhY3R1cmUuCgpJTVBSRVNTSU9OOgoKMS4gUHJvYmFibGUgcHVsbW9uYXJ5IGVtYm9saS4KMi4gQmlsYXRlcmFsIGx1bmcgaW5maWx0cmF0ZXMgYW5kIHNjYXJyaW5nIHdpdGggbGFyZ2UgcmlnaHQgdXBwZXIgbHVuZyBjYXZpdHkuCjMuIExlZnQgaW5ub21pbmF0ZSB2ZWluIGlzIG5vdCB2aXN1YWxpemVkLCBwcm9iYWJseSBjaHJvbmljYWxseSB0aHJvbWJvc2VkLg=="
+    }
+  ]
+}

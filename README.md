@@ -416,8 +416,9 @@ record the FHIR report poller makes for a report a vendor sends, so a card's dra
 vendor's report sit side by side on the session page and read the same way.
 
 The record is labelled `<session label>_RPT_<card>_<report id>`, the poller's naming, for
-example `HB0004_1_RPT_nvreasonct_3f2a9c1d0b7e4a65`. Its `source_system` is
-`urn:xnatworks:card:<card id>`. Its `report_kind` is `AI_DRAFT` when the performer is the
+example `HB0004_1_RPT_nvreasonct_3f2a9c1d0b7e4a65`. A label over 64 characters keeps that end
+and shortens the session label. Its `source_system` is
+`urn:xnatworks:card:<card id>`. Its `report_kind` is `AI_DRAFT` when a performer references a
 contained `Device` (the model) and no person is named. The record names the archived session:
 its project, its accession, its `UID` as the study instance UID, its modality, and the subject's
 label as the pseudonym. It does not take any of these from what the document says about itself.

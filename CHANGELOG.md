@@ -17,6 +17,9 @@ report", "it would be a great demo piece").
   schema would refuse are clamped or cut. `segwrapup/dxreport.py`;
   `RecordContract.diagnostic_report`; `docs/DIAGNOSTIC-REPORTS.md`.
 - The relabel retry on a 409 recognises a `dxreport:` root element as well as `analysis:`.
+- Review fixes (Codex, PR #23). Only the Device a performer references makes an AI draft. A long
+  session label is shortened, not the report id. Characters XML 1.0 forbids are escaped. A
+  malformed nested value is an outcome, not an exception.
 - Image tags 0.7.2 (seg-wrapup, proc-wrapup, record-fetch).
 
 ## 0.7.1 (2026-09-26)

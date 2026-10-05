@@ -1471,3 +1471,16 @@ def test_a_failed_run_files_no_report(cs, tmp_path, monkeypatch):
     manifest = json.loads((out / "wrapup.json").read_text())
     assert manifest["analysis_record"]["id"] == "XNAT_E77777" and manifest["diagnostic_report"] == {"skipped": "run FAILED"}
     assert not [c for c in handler.calls if "_RPT_" in c["path"]]
+
+
+def test_a_malformed_report_costs_only_the_report_record(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _report_output(tmp_path), tmp_path / "out"
+    doc = json.loads((inp / "diagnostic_report.json").read_text())
+    (inp / "diagnostic_report.json").write_text(json.dumps({**doc, "presentedForm": ["oops"]}))
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "PyRadiomics", "XNW_DIAGNOSTIC_REPORT": "diagnostic_report.json"})
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777"
+    assert manifest["diagnostic_report"]["error"].startswith("AttributeError")
+    assert not [c for c in handler.calls if c["method"] == "PUT" and "_RPT_" in c["path"]]
