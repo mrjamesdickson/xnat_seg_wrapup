@@ -87,7 +87,15 @@ def _contained(doc: dict, reference) -> dict | None:
 
 
 def _number(value) -> float | None:
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    """A JSON number as a float; None for anything else, and for an integer too large for one (JSON
+    allows thousands of digits, ``float()`` raises OverflowError on them: Codex P1, PR #23)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except OverflowError:
+        logger.warning("a number of %d digits is too large for the record; left off", len(str(value)))
+        return None
 
 
 def performer(doc: dict) -> str | None:
@@ -195,6 +203,7 @@ def parse(doc) -> dict:
             "code_system": _coding(doc.get("code"), "system"), "code": _coding(doc.get("code"), "code"),
             "code_display": _coding(doc.get("code"), "display"), "issued": _text(doc.get("issued")),
             "effective": _text(doc.get("effectiveDateTime")), "performer": performer(doc),
+            "device_author": device is not None,
             "device_name": _device(device, "name"), "device_version": _device(device, "version"),
             "simulated": any(isinstance(t, dict) and str(t.get("code", "")).lower() == "simulated" for t in tags or []),
             "conclusion": _text(doc.get("conclusion")), "narrative": narrative(doc),
@@ -205,7 +214,8 @@ def report_kind(parsed: dict) -> str:
     """The poller's rule: a Device author and no human performer is an AI draft; a human performer
     signs a final report; anything else is a human draft. The Device is the one a performer
     references (``performer_device``), not any contained Device."""
-    if parsed["performer"] is None and parsed["device_name"] is not None:
+    # a referenced Device is the author whether or not it carries a name, which FHIR leaves optional (Codex P2, PR #23)
+    if parsed["performer"] is None and parsed.get("device_author", parsed["device_name"] is not None):
         return "AI_DRAFT"
     if parsed["performer"] is not None and (parsed["status"] or "").lower() == "final":
         return "FINAL_SIGNED"
@@ -238,7 +248,12 @@ def record_label(session_label: str, source_system: str, report_id: str) -> str:
     that share a beginning stay apart. A report id too long for the suffix is replaced by its hash.
     Cutting the whole label from the right made every report on a session with a 60-character label
     ``<label>_RPT``, so the existence probe took each new report for one already filed (Codex P1, PR #23)."""
-    suffix = _label_part(f"_RPT_{_tail(source_system)}_{report_id}")
+    # an id the label can carry as it is (letters and digits) is carried as it is; any other is
+    # rewritten by _label_part, where "a-b" and "a.b" both become "a_b", so a hash of the real id goes
+    # beside it and two reports never share a label (Codex P1, PR #23)
+    id_part = report_id if re.fullmatch(r"[A-Za-z0-9]+", report_id or "") else \
+        f"{_label_part(report_id).strip('_')[:16]}_{_short_hash(report_id, 8)}".lstrip("_")
+    suffix = _label_part(f"_RPT_{_tail(source_system)}_{id_part}")
     if len(suffix) > LABEL_MAX // 2:
         suffix = _label_part(f"_RPT_{_tail(source_system)}_{_short_hash(report_id, 16)}")
     session = _label_part(session_label).rstrip("_")
@@ -370,7 +385,7 @@ def publish_diagnostic_report(context: XnatContext | None, output_dir: Path, der
             return {"skipped": f"no {declared} in the tool's output"}
         text = path.read_text(encoding="utf-8")
         parsed = parse(json.loads(text))
-    except (OSError, UnicodeDecodeError, ValueError, AttributeError, TypeError, KeyError, IndexError) as error:
+    except (OSError, UnicodeDecodeError, ValueError, AttributeError, TypeError, KeyError, IndexError, ArithmeticError) as error:
         # NotADiagnosticReport and JSONDecodeError are ValueErrors; a valid JSON document with a malformed
         # nested value (presentedForm ["oops"], a string where a CodeableConcept goes) fails the parser's
         # .get() with AttributeError or TypeError, and must not escape after the run record exists (Codex P1, PR #23)
@@ -387,14 +402,22 @@ def publish_diagnostic_report(context: XnatContext | None, output_dir: Path, der
         label_url, _ = record_urls(context, label)
         probe = _request(context, "GET", f"{label_url}?format=json", min(timeout_seconds, 60.0))
         if probe == 200:
-            # the report id is the card's, deterministic for the same inputs: the same report is already filed
+            # the report id is the card's, deterministic for the same inputs: the same report is already
+            # filed. Only if the record there says so: a label is a lossy spelling of the identity, and a
+            # different report under it is a collision to report, not a report to drop (Codex P1, PR #23)
+            there = _get_json(context, f"{label_url}?format=json", min(timeout_seconds, 60.0))["items"][0]["data_fields"]
+            if (there.get("source_id"), there.get("source_system")) != (parsed["id"], source_system):
+                logger.error("label %s on session %s holds report %r from %r, not %r from %r; not filed", label, context.session,
+                             there.get("source_id"), there.get("source_system"), parsed["id"], source_system)
+                return {"error": f"label {label} is taken by report {there.get('source_id')!r} from {there.get('source_system')!r}"}
             logger.info("diagnostic report %s already on session %s; not filed twice", label, context.session)
             return {"xsi_type": XSI_TYPE, "label": label, "exists": True, "source_id": parsed["id"]}
         xml = build_record_xml(values)
         name = f"diagnosticreport-{re.sub(r'[^A-Za-z0-9_.-]+', '_', parsed['id'])}-v{values['source_version']}.json"
         outcome = publish_record(context, label, xml, {REPORT_ROLE: [RecordFile(path, name)]}, timeout_seconds=timeout_seconds,
                                  xsi_type=XSI_TYPE)
-    except (RuntimeError, urllib.error.URLError, OSError, KeyError, IndexError, TypeError, ValueError, AttributeError) as error:
+    except (RuntimeError, urllib.error.URLError, OSError, KeyError, IndexError, TypeError, ValueError, AttributeError,
+            ArithmeticError) as error:
         logger.error("diagnostic report %s not filed on session %s; the run record stays: %s: %s", declared, context.session,
                      type(error).__name__, error)
         return {"error": f"{type(error).__name__}: {error}"}

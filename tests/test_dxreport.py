@@ -1,6 +1,7 @@
 """Diagnostic report records (0.7.2): a card's FHIR R5 DiagnosticReport filed as a dxreport:sessionReportData."""
 import base64
 import json
+import re
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
@@ -165,9 +166,12 @@ def written(tmp_path, doc=None):
 
 @pytest.fixture
 def xnat(monkeypatch):
-    calls = {"published": [], "probe": 404}
+    calls = {"published": [], "probe": 404,
+             # what a record already under the label says about itself, read when the probe finds one
+             "there": {"source_id": "3f2a9c1d0b7e4a65", "source_system": "urn:xnatworks:card:nv-reason-ct"}}
     monkeypatch.setattr(dxreport, "fetch_session_facts", lambda ctx, timeout: dict(FACTS))
     monkeypatch.setattr(dxreport, "_request", lambda ctx, method, url, timeout: calls["probe"])
+    monkeypatch.setattr(dxreport, "_get_json", lambda ctx, url, timeout: {"items": [{"data_fields": calls["there"]}]})
 
     def publish(ctx, label, xml, files, timeout_seconds=300.0, xsi_type=None):
         calls["published"].append({"label": label, "xml": xml, "files": files, "xsi_type": xsi_type})
@@ -307,3 +311,40 @@ def test_the_nv_reason_ct_cards_own_document_files_as_an_ai_draft_with_every_fin
     assert values["conclusion"].startswith("1. Probable pulmonary emboli.") and "Research and education use only" in values["conclusion"]
     assert values["narrative"].startswith("TECHNIQUE: IV contrast CT.") and "</think>" not in values["narrative"]
     ElementTree.fromstring(dxreport.build_record_xml(values).encode())
+
+
+
+# ── Codex round 2 on PR #23 ────────────────────────────────────────────────────
+def test_a_number_too_large_for_a_float_is_left_off_not_raised(tmp_path, xnat, caplog):
+    doc = card_report()
+    doc["contained"][2]["valueQuantity"] = {"value": 10 ** 400, "unit": "mL"}
+    assert dxreport._number(10 ** 400) is None and dxreport._number(12) == 12.0 and dxreport._number(True) is None
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path, doc), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out["id"] == "XNAT_E99999" and "too large" in caplog.text
+
+
+def test_report_ids_the_label_cannot_spell_as_they_are_stay_distinct():
+    labels = {rid: dxreport.record_label("HB0004_1", "urn:xnatworks:card:nv-reason-ct", rid) for rid in ("a-b", "a.b", "a_b", "ab")}
+    assert len(set(labels.values())) == 4, labels
+    assert labels["ab"] == "HB0004_1_RPT_nvreasonct_ab", "letters and digits are carried as they are"
+    assert labels["a-b"].startswith("HB0004_1_RPT_nvreasonct_a_b_") and len(labels["a-b"]) == len("HB0004_1_RPT_nvreasonct_a_b_") + 8
+    # a UUID's readable prefix and hash would make the end over half the label: the id is hashed whole instead
+    uuids = [dxreport.record_label("HB0004_1", "urn:x:card", u) for u in ("3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                                                                          "3fa85f64-5717-4562-b3fc-2c963f66afa7")]
+    assert uuids[0] != uuids[1] and all(re.fullmatch(r"HB0004_1_RPT_card_[0-9a-f]{16}", u) for u in uuids), uuids
+
+
+def test_an_unnamed_device_the_performer_references_is_still_the_author():
+    doc = card_report()
+    del doc["contained"][0]["name"]
+    parsed = dxreport.parse(doc)
+    assert parsed["device_name"] is None and dxreport.report_kind(parsed) == "AI_DRAFT"
+
+
+def test_a_label_holding_another_report_is_a_collision_not_already_filed(tmp_path, xnat, caplog):
+    xnat["probe"] = 200
+    xnat["there"] = {"source_id": "something-else", "source_system": "urn:xnatworks:card:nv-reason-ct"}
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out == {"error": "label HB0004_1_RPT_nvreasonct_3f2a9c1d0b7e4a65 is taken by report 'something-else' from "
+                            "'urn:xnatworks:card:nv-reason-ct'"}
+    assert xnat["published"] == [] and "not filed" in caplog.text

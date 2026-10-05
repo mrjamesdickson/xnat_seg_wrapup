@@ -75,8 +75,19 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   `<label>_RPT` and the existence probe took each new report for one already filed (Codex P1,
   PR #23). Here the `_RPT_<source>_<id>` end is kept whole, and the session label is shortened,
   with a 6-character hash of the whole of it so two long labels sharing a beginning stay apart. An
-  id too long for the end is replaced by a 16-character hash. Labels under the cap are the
-  poller's, character for character.
+  id too long for the end is replaced by a 16-character hash. An id the label cannot spell as it is
+  (anything but letters and digits: `a-b` and `a.b` would both be `a_b`) gets an 8-character hash
+  of the real id beside its readable form. Card ids, which are hex, give the poller's label
+  character for character.
+- **A label is a lossy spelling of the identity, so the existence probe reads the record it
+  finds.** A 200 is "already filed" only when that record's `source_id` and `source_system` are
+  this report's. Any other record there is a collision, reported as an `error`, never a report
+  silently dropped (Codex P1, PR #23).
+- **A Device the performer references is the author whether or not it is named.** FHIR leaves
+  `Device.name` optional, so the AI test is "a performer references a contained Device", not "the
+  record has a device name" (Codex P2, PR #23).
+- **JSON numbers can be too large for a float** (thousands of digits). Such a value is left off the
+  finding with a warning instead of raising `OverflowError` (Codex P1, PR #23).
 - **A character XML 1.0 forbids** (`json.loads` accepts `"\u0001"`) is written as its escape
   (`\x01`), with a warning, by the same `_xml_text` the analysis records use. Otherwise one such
   character makes the whole create document malformed (Codex P2, PR #23). This is done before
