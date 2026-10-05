@@ -191,15 +191,26 @@ def study_instance_uid(doc: dict) -> str | None:
 
 
 def narrative(doc: dict) -> str | None:
-    """The first base64 ``presentedForm`` attachment, decoded; else the resource's own XHTML text, untagged."""
-    for form in doc.get("presentedForm") or []:
+    """The first ``presentedForm`` attachment that is text, decoded; else the resource's own XHTML text,
+    untagged. ``presentedForm`` repeats and may hold any type (FHIR R5 suggests a PDF): an attachment
+    that is not text, or not base64 UTF-8, is passed over for the next one and the XHTML, not taken
+    as the end of the narrative (Codex P2, PR #23)."""
+    for index, form in enumerate(doc.get("presentedForm") or []):
         data = _text((form or {}).get("data"))
-        if data:
-            try:
-                return base64.b64decode(data, validate=True).decode("utf-8")
-            except (binascii.Error, ValueError) as error:
-                logger.warning("presentedForm is not base64 UTF-8 text (%s); the record keeps no narrative from it", error)
-                return None
+        if not data:
+            continue
+        media, _, parameters = (_text((form or {}).get("contentType")) or "").partition(";")
+        media = media.strip().lower()
+        if media and not media.startswith("text/"):
+            logger.info("presentedForm %d is %s, not text; looking further for the narrative", index, media)
+            continue
+        charset = re.search(r"charset\s*=\s*\"?([A-Za-z0-9._-]+)", parameters, re.I)
+        encoding = charset.group(1) if charset else "utf-8"
+        try:
+            return base64.b64decode(data, validate=True).decode(encoding)
+        except (binascii.Error, ValueError, LookupError) as error:
+            # LookupError: a charset Python does not know
+            logger.warning("presentedForm %d is not base64 %s text (%s); looking further for the narrative", index, encoding, error)
     div = _text((doc.get("text") or {}).get("div")) if isinstance(doc.get("text"), dict) else None
     # tags out, then entities decoded: "Heart &amp; lungs" is "Heart & lungs", and the record XML escapes it
     # once itself (Codex P2, PR #23: it read "&amp;amp;")

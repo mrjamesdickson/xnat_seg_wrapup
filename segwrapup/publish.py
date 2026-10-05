@@ -820,6 +820,15 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
         label = retry
         label_url, _ = record_urls(context, label)
         status, text = _put(context, f"{label_url}?inbody=true", _relabel(xml, retry).encode(), "application/xml", timeout_seconds)
+    if status == 200 and not retry_on_conflict:
+        # XNAT answers a create 201 and an update of an existing label 200 (ExptAssessmentResource:
+        # existing == null ? SUCCESS_CREATED : SUCCESS_OK). For a caller whose label is its identity, a 200
+        # means another run filed the same label after both probes and this PUT updated its record:
+        # nothing is uploaded and nothing rolled back, or a failed upload's rollback would delete the
+        # record the other run filed (Codex P2, PR #23). The caller reads the record under the label.
+        logger.warning("create of %s on %s was answered as an update (HTTP 200): another run filed it first", label, context.target)
+        raise RuntimeError(f"label {label} already exists on {context.target}; the create was answered as an update "
+                           "(HTTP 200, not 201), so another run filed it first")
     created_id = created_record_id(text)
     record_id = created_id or label
     record_url, files_base = record_urls(context, record_id, by_id=bool(created_id))

@@ -58,7 +58,7 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
 | `source_system` | `urn:xnatworks:card:<card id>` (the card id, `nv-reason-ct`, is in the label) |
 | `source_id`, `source_version` | the report's `id`, `meta.versionId` (default `1`) |
 | `report_kind` | `AI_DRAFT` / `FINAL_SIGNED` / `HUMAN_DRAFT` (the poller's rule, with the Device exception above) |
-| `conclusion`, `narrative` | `conclusion`. The first base64 `presentedForm`, else the untagged `text.div` |
+| `conclusion`, `narrative` | `conclusion`. The first `presentedForm` that is text and decodes (base64, in its declared charset, else UTF-8; a PDF or an undecodable one is passed over: Codex P2, PR #23), else the untagged `text.div` |
 | `findings` | the contained `Observation`s `result` references; every contained one only when the report has no `result` at all (a `result` naming external observations, by reference or by `identifier` alone, means the contained ones only support: Codex P2, PR #23): code, display, valueString or first note, valueQuantity, a component named confidence or instance number, bodySite |
 | `pseudonymization` | a sentence saying the card wrote the report inside XNAT from the archived session |
 | `raw_json` | the document, when it is under 200,000 characters |
@@ -119,8 +119,12 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   ... already exists") is the same case. `publish_record(retry_on_conflict=False)` hands
   the 409 back, and the record under the label is read as on a probe: the same report is
   `exists`, another is a collision (Codex P2, PR #23). A race on the same session is narrower.
-  There XNAT answers the second PUT as an update of the record the first just made, which the
-  create-only publisher cannot rule out.
+  There XNAT answers the second PUT as an update of the record the first just made: 200 where a
+  create is 201 (`ExptAssessmentResource`). With `retry_on_conflict=False` the publisher reads a
+  200 as "already filed": it uploads nothing and rolls nothing back, since a rollback DELETE after a
+  failed upload would remove the record the other run filed (Codex P2, PR #23). The limit: the PUT
+  has already rewritten that record's fields with this run's values. For the same report these
+  are the same but for `issued`, and XNAT offers no conditional create to prevent it.
 - **JSON numbers can be too large for a float** (thousands of digits). Such a value is left off the
   finding with a warning instead of raising `OverflowError` (Codex P1, PR #23).
 - **A character XML 1.0 forbids** (`json.loads` accepts `"\u0001"`) is written as its escape

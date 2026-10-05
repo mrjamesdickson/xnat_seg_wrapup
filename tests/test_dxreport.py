@@ -99,6 +99,30 @@ def test_a_bad_attachment_costs_the_narrative_only(caplog):
     assert "not base64" in caplog.text
 
 
+def _form(content_type, payload: bytes) -> dict:
+    return {"contentType": content_type, "data": base64.b64encode(payload).decode()}
+
+
+def test_a_pdf_or_undecodable_attachment_is_passed_over_for_the_next_text(caplog):
+    """Codex P2, PR #23: a PDF first in presentedForm left the narrative empty."""
+    pdf = _form("application/pdf", b"%PDF-1.7\n\xe2\xe3\xcf\xd3")
+    not_utf8 = _form("text/plain", "caf\xe9".encode("latin-1"))
+    unknown_charset = _form("text/plain; charset=x-nonesuch", b"text")
+    text = _form("text/plain; charset=utf-8", REPORT_TEXT.encode())
+    assert dxreport.parse(card_report(presentedForm=[pdf, not_utf8, unknown_charset, text]))["narrative"] == REPORT_TEXT
+    # a declared charset is honoured
+    latin = _form('text/plain; charset="ISO-8859-1"', "caf\xe9".encode("latin-1"))
+    assert dxreport.parse(card_report(presentedForm=[latin, text]))["narrative"] == "caf\xe9"
+    # nothing textual among the attachments: the XHTML narrative is the fallback
+    div = {"div": "<div><p>Lungs clear.</p></div>"}
+    assert dxreport.parse(card_report(presentedForm=[pdf, {"data": "@@"}], text=div))["narrative"] == "Lungs clear."
+    # control: the first text attachment is still the one taken
+    other = _form("text/plain", b"Other text.")
+    assert dxreport.parse(card_report(presentedForm=[text, other]))["narrative"] == REPORT_TEXT
+    # an attachment with no contentType is tried as text, as before
+    assert dxreport.parse(card_report(presentedForm=[{"data": base64.b64encode(b"Untyped.").decode()}]))["narrative"] == "Untyped."
+
+
 # ── the record ─────────────────────────────────────────────────────────────────
 def test_the_label_is_the_pollers():
     assert dxreport.record_label("HB0004_1", "urn:xnatworks:card:nv-reason-ct", "3f2a9c1d0b7e4a65") == "HB0004_1_RPT_nv-reason-ct_3f2a9c1d0b7e4a65"
