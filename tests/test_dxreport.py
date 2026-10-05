@@ -506,3 +506,31 @@ def test_external_results_keep_contained_supporting_observations_out():
     # control: with no result element at all, the contained observations are the findings
     del doc["result"]
     assert len(dxreport.parse(doc)["findings"]) == 2
+
+
+# ── Codex round 7 on PR #23 ────────────────────────────────────────────────────
+@pytest.mark.parametrize("performer, contained, expected", [
+    ({"reference": "Practitioner/123"}, None, "Practitioner/123"),
+    ({"reference": "#org"}, {"resourceType": "Organization", "id": "org", "name": "Radiology Partners"}, "Radiology Partners"),
+    ({"reference": "#org"}, {"resourceType": "Organization", "id": "org"}, "#org"),
+    ({"reference": "#dr"}, {"resourceType": "Practitioner", "id": "dr", "name": [{"given": ["Ada", "M"], "family": "Lovelace"}]}, "Ada M Lovelace"),
+    ({"reference": "#team"}, {"resourceType": "CareTeam", "id": "team", "name": "Night reads"}, "Night reads"),
+    ({"reference": "#role"}, {"resourceType": "PractitionerRole", "id": "role", "practitioner": {"display": "Dr Role"}}, "Dr Role"),
+    ({"identifier": {"system": "urn:npi", "value": "1234567890"}}, None, "1234567890"),
+])
+def test_a_performer_without_a_display_still_signs_the_report(performer, contained, expected):
+    doc = hoppr_shaped(performer=[performer], status="final")
+    if contained:
+        doc["contained"].append(contained)
+    parsed = dxreport.parse(doc)
+    assert parsed["performer"] == expected
+    assert dxreport.report_kind(parsed) == "FINAL_SIGNED", "a signed report whose findings name the model is still signed"
+
+
+@pytest.mark.parametrize("performer", [
+    {"reference": "Device/9"}, {"reference": "https://fhir.example/Device/9/_history/2"},
+    {"type": "Device", "identifier": {"value": "scanner-1"}}, {"reference": "#model"}, {"reference": "#nobody"}, {}])
+def test_a_device_or_a_dangling_performer_names_nobody(performer):
+    parsed = dxreport.parse(hoppr_shaped(performer=[performer], status="final"))
+    assert parsed["performer"] is None
+    assert dxreport.report_kind(parsed) == "AI_DRAFT"

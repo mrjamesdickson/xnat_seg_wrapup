@@ -97,6 +97,14 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   finds.** A 200 is "already filed" only when that record's `source_id` and `source_system` are
   this report's. Any other record there is a collision, reported as an `error`, never a report
   silently dropped (Codex P1, PR #23).
+- **A performer signs whether or not it is named.** FHIR leaves `Reference.display` optional, so a
+  final report whose performer is `{"reference": "Practitioner/123"}` is `FINAL_SIGNED`, and the
+  record's `performer` is the best name there is: the display, else a contained Practitioner's
+  HumanName (text, else given and family), Organization's or CareTeam's name, or a
+  PractitionerRole's practitioner display, else the reference itself, else the identifier's value.
+  A Device performer, contained or by URL or by `type`, and a `#` reference to nothing contained
+  name nobody (Codex P2, PR #23). The poller as ported reads the display only, so the same signed
+  report without a display reads as a draft there.
 - **A Device the findings or a performer name is the author whether or not it is named.** FHIR
   leaves `Device.name` optional, so the AI test is "a contained Device is pointed at", not "the
   record has a device name" (Codex P2, PR #23).

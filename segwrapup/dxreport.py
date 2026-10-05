@@ -111,21 +111,47 @@ def _number(value) -> float | None:
     return number
 
 
+#: A Device named by URL rather than contained: ``Device/9``, ``https://fhir.example/Device/9/_history/2``.
+DEVICE_URL = re.compile(r"(^|/)Device/[^/]+(/_history/[^/]+)?$")
+
+
+def _performer_name(resource: dict) -> str | None:
+    """A contained performer's name: a Practitioner's first HumanName (its text, else its given and
+    family names), an Organization's or CareTeam's name, or the practitioner a PractitionerRole displays."""
+    name = resource.get("name")
+    if isinstance(name, list):
+        human = _first(name)
+        given = human.get("given") if isinstance(human.get("given"), list) else []
+        return _text(human.get("text")) or _text(" ".join(filter(None, (_text(part) for part in given + [human.get("family")]))))
+    if name is not None:
+        return _text(name)
+    practitioner = resource.get("practitioner")
+    return _text(practitioner.get("display")) if isinstance(practitioner, dict) else None
+
+
 def performer(doc: dict) -> str | None:
-    """The human performer's name. A performer that resolves to a contained Device is a model, not a
-    person, whatever its display says (FHIR R5 does not allow one there, but a document may still
-    carry it)."""
+    """Who performed the report: the first performer's name, else the reference that identifies them.
+    A performer is present whether or not it is named: FHIR leaves ``Reference.display`` optional, and a
+    signed report referencing ``Practitioner/123`` is still signed (Codex P2, PR #23). A performer that
+    is a Device, contained or by URL, is a model, not a person, whatever its display says (FHIR R5 does
+    not allow one there, but a document may still carry it), and a ``#`` reference to nothing contained
+    names nobody."""
     for item in doc.get("performer") or []:
         if not isinstance(item, dict):
             continue
-        target = _contained(doc, item.get("reference"))
-        if target is not None and target.get("resourceType") == "Device":
+        reference = _text(item.get("reference"))
+        target = _contained(doc, reference)
+        if _text(item.get("type")) == "Device" or (target is not None and target.get("resourceType") == "Device") \
+                or (reference is not None and DEVICE_URL.search(reference)):
             continue
-        display = _text(item.get("display"))
-        if display:
-            return display
-        if target is not None and target.get("resourceType") == "Practitioner":
-            return _text(_first(target.get("name")).get("text"))
+        if reference is not None and reference.startswith("#") and target is None:
+            logger.warning("performer %s references nothing the report contains; it names nobody", reference)
+            continue
+        identifier = item.get("identifier")
+        name = _text(item.get("display")) or (_performer_name(target) if target is not None else None)
+        found = name or reference or (_text(identifier.get("value")) if isinstance(identifier, dict) else None)
+        if found:
+            return found
     return None
 
 
