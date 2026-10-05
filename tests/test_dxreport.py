@@ -534,3 +534,22 @@ def test_a_device_or_a_dangling_performer_names_nobody(performer):
     parsed = dxreport.parse(hoppr_shaped(performer=[performer], status="final"))
     assert parsed["performer"] is None
     assert dxreport.report_kind(parsed) == "AI_DRAFT"
+
+
+# ── Codex round 8 on PR #23 ────────────────────────────────────────────────────
+@pytest.mark.parametrize("result", [
+    [{"identifier": {"system": "urn:lab", "value": "obs-123"}}],
+    [{"type": "Observation", "display": "measured elsewhere"}],
+    ["not a reference"],
+])
+def test_a_result_that_names_no_contained_observation_still_disables_the_fallback(result):
+    parsed = dxreport.parse(hoppr_shaped(result=result))
+    assert parsed["findings"] == [], "the findings are elsewhere; the contained ones only support"
+    assert (parsed["device_name"], dxreport.report_kind(parsed)) == (None, "HUMAN_DRAFT"), "no finding names the model"
+
+
+def test_an_identifier_result_beside_a_contained_one_keeps_only_the_contained_one():
+    doc = hoppr_shaped(result=[{"identifier": {"value": "obs-123"}}, {"reference": "#finding-2"}])
+    parsed = dxreport.parse(doc)
+    assert [f["display"] for f in parsed["findings"]] == ["Direct question"]
+    assert dxreport.report_kind(parsed) == "AI_DRAFT", "the finding it references names the model"
