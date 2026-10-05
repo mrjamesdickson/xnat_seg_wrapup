@@ -22,7 +22,10 @@ report", "it would be a great demo piece").
   malformed nested value is an outcome, not an exception. Round 2: a number too large for a float is left
   off; an id the label cannot spell as it is gets a hash beside it; a label already holding a
   different report is a collision, not "already filed"; an unnamed Device the performer
-  references still makes an AI draft.
+  references still makes an AI draft. Round 3: a truncated XNAT answer and a document
+  nested past the recursion limit are outcomes; session labels that rewrite alike get a hash;
+  hyphens stay in labels. Every value is held to its column (255 characters for a plain string,
+  single-precision floats, 32-bit ints), and the REPORT file name cannot carry a separator.
 - Image tags 0.7.2 (seg-wrapup, proc-wrapup, record-fetch).
 
 ## 0.7.1 (2026-09-26)

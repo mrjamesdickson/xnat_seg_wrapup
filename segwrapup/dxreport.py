@@ -17,8 +17,10 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import http.client
 import json
 import logging
+import math
 import re
 import urllib.error
 import urllib.parse
@@ -50,6 +52,11 @@ FINDING_TEXT_MAX = 4000
 CONCLUSION_MAX = 8000
 NARRATIVE_MAX = 100000
 RAW_JSON_MAX = 200000
+#: A plain xs:string element is a varchar(255) column in XNAT: one value over it fails the whole create.
+STRING_MAX = 255
+#: xs:float is a single-precision column and xs:int a 32-bit one: a value outside them fails the create too.
+FLOAT_MAX = 3.4028234663852886e38
+INT_RANGE = (-2 ** 31, 2 ** 31 - 1)
 #: xs:dateTime as FHIR writes an instant or dateTime with a time part; a date alone is not one.
 DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?$")
 
@@ -92,10 +99,15 @@ def _number(value) -> float | None:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
     try:
-        return float(value)
+        number = float(value)
     except OverflowError:
         logger.warning("a number of %d digits is too large for the record; left off", len(str(value)))
         return None
+    # json.loads accepts NaN and Infinity, and xs:float is single precision: neither fits the column
+    if not math.isfinite(number) or abs(number) > FLOAT_MAX:
+        logger.warning("the number %r does not fit the record's single-precision column; left off", number)
+        return None
+    return number
 
 
 def performer(doc: dict) -> str | None:
@@ -171,7 +183,9 @@ def finding(observation: dict) -> dict:
         if "confidence" in label:
             confidence = _number(component_quantity.get("value"))
         elif "instance number" in label:
-            instance_number = component.get("valueInteger") if isinstance(component.get("valueInteger"), int) else None
+            value = component.get("valueInteger")
+            instance_number = value if isinstance(value, int) and not isinstance(value, bool) \
+                and INT_RANGE[0] <= value <= INT_RANGE[1] else None
         elif value_number is None and component_quantity:
             value_number, unit = _number(component_quantity.get("value")), _text(component_quantity.get("unit"))
     return {"code_system": _text(coding.get("system")), "code": _text(coding.get("code")), "display": display,
@@ -233,7 +247,16 @@ def _tail(source: str, width: int = 12) -> str:
 
 
 def _label_part(text: str) -> str:
-    return re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9_]+", "_", text or ""))
+    """``text`` in the characters an XNAT label takes (letters, digits, ``_`` and ``-``), runs of ``_`` as one."""
+    return re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9_-]+", "_", text or ""))
+
+
+def _spelled(text: str, width: int = 8) -> str:
+    """``text`` as a label part that stays distinct: as it is when the label can carry it unchanged,
+    else its rewritten form with a hash of the original, since ``SUB.01`` and ``SUB_01`` both
+    rewrite to ``SUB_01`` (Codex P1/P2, PR #23)."""
+    clean = _label_part(text)
+    return clean if clean == (text or "") else f"{clean.strip('_')}_{_short_hash(text, width)}".lstrip("_")
 
 
 def _short_hash(text: str, width: int) -> str:
@@ -248,19 +271,17 @@ def record_label(session_label: str, source_system: str, report_id: str) -> str:
     that share a beginning stay apart. A report id too long for the suffix is replaced by its hash.
     Cutting the whole label from the right made every report on a session with a 60-character label
     ``<label>_RPT``, so the existence probe took each new report for one already filed (Codex P1, PR #23)."""
-    # an id the label can carry as it is (letters and digits) is carried as it is; any other is
-    # rewritten by _label_part, where "a-b" and "a.b" both become "a_b", so a hash of the real id goes
-    # beside it and two reports never share a label (Codex P1, PR #23)
-    id_part = report_id if re.fullmatch(r"[A-Za-z0-9]+", report_id or "") else \
-        f"{_label_part(report_id).strip('_')[:16]}_{_short_hash(report_id, 8)}".lstrip("_")
-    suffix = _label_part(f"_RPT_{_tail(source_system)}_{id_part}")
+    # the id and the session label as the label can carry them unchanged, else rewritten with a hash of
+    # the original beside them: "a-b"/"a.b" and "SUB.01"/"SUB_01" rewrite alike, and two reports or two
+    # sessions must never share a label (Codex P1 and P2, PR #23)
+    suffix = f"_RPT_{_tail(source_system)}_{_spelled(report_id)}"
     if len(suffix) > LABEL_MAX // 2:
-        suffix = _label_part(f"_RPT_{_tail(source_system)}_{_short_hash(report_id, 16)}")
-    session = _label_part(session_label).rstrip("_")
+        suffix = f"_RPT_{_tail(source_system)}_{_short_hash(report_id, 16)}"
+    session = _spelled(session_label, 6).rstrip("_")
     room = LABEL_MAX - len(suffix)
     if len(session) > room:
-        session = session[:room - 7].rstrip("_") + "_" + _short_hash(session_label, 6)
-    return re.sub(r"_+", "_", session + suffix)
+        session = _label_part(session_label)[:room - 7].rstrip("_") + "_" + _short_hash(session_label, 6)
+    return session + suffix
 
 
 def _clip(value: str | None, limit: int, what: str) -> str | None:
@@ -300,16 +321,19 @@ def build_values(parsed: dict, raw_json: str, facts: dict, source_system: str, p
         logger.warning("the DiagnosticReport is %d characters, over the record's raw_json cap of %d; the record leaves raw_json "
                        "empty and the document stays whole in the REPORT resource", len(raw_json), RAW_JSON_MAX)
         raw_json = None
-    rows = [{k: (_clip(v, FINDING_TEXT_MAX, f"finding {k}") if k in ("text", "value_string") else v) for k, v in row.items()}
+    rows = [{k: (_clip(v, FINDING_TEXT_MAX, f"finding {k}") if k in ("text", "value_string")
+                 else _clip(v, STRING_MAX, f"finding {k}") if isinstance(v, str) else v) for k, v in row.items()}
             for row in parsed["findings"]]
+    short = {k: _clip(parsed[k], STRING_MAX, k) for k in ("code_system", "code", "code_display", "version_id", "performer",
+                                                           "device_name", "device_version", "id")}
     return {"project": facts["project"], "session_id": facts["id"],
             "label": record_label(facts["label"], source_system, parsed["id"]),
-            "category": category if category in CATEGORIES else "OTH", "code_system": parsed["code_system"], "code": parsed["code"],
-            "code_display": parsed["code_display"], "report_status": status if status in STATUSES else "unknown",
-            "report_kind": report_kind(parsed), "source_system": source_system, "source_format": SOURCE_FORMAT,
-            "source_id": parsed["id"], "source_version": parsed["version_id"] or "1",
+            "category": category if category in CATEGORIES else "OTH", "code_system": short["code_system"], "code": short["code"],
+            "code_display": short["code_display"], "report_status": status if status in STATUSES else "unknown",
+            "report_kind": report_kind(parsed), "source_system": _clip(source_system, STRING_MAX, "source_system"),
+            "source_format": SOURCE_FORMAT, "source_id": short["id"], "source_version": short["version_id"] or "1",
             "issued": _when(parsed["issued"], "issued"), "effective": _when(parsed["effective"], "effectiveDateTime"),
-            "performer": parsed["performer"], "device_name": parsed["device_name"], "device_version": parsed["device_version"],
+            "performer": short["performer"], "device_name": short["device_name"], "device_version": short["device_version"],
             "simulated": parsed["simulated"], "pseudonym": facts.get("subject_label"),
             "conclusion": _clip(parsed["conclusion"], CONCLUSION_MAX, "conclusion"),
             "narrative": _clip(parsed["narrative"], NARRATIVE_MAX, "narrative"), "findings": rows,
@@ -385,7 +409,9 @@ def publish_diagnostic_report(context: XnatContext | None, output_dir: Path, der
             return {"skipped": f"no {declared} in the tool's output"}
         text = path.read_text(encoding="utf-8")
         parsed = parse(json.loads(text))
-    except (OSError, UnicodeDecodeError, ValueError, AttributeError, TypeError, KeyError, IndexError, ArithmeticError) as error:
+    except (OSError, UnicodeDecodeError, ValueError, AttributeError, TypeError, KeyError, IndexError, ArithmeticError,
+            RecursionError) as error:
+        # RecursionError: json.loads on a valid but extremely deeply nested document (Codex P2, PR #23)
         # NotADiagnosticReport and JSONDecodeError are ValueErrors; a valid JSON document with a malformed
         # nested value (presentedForm ["oops"], a string where a CodeableConcept goes) fails the parser's
         # .get() with AttributeError or TypeError, and must not escape after the run record exists (Codex P1, PR #23)
@@ -406,18 +432,22 @@ def publish_diagnostic_report(context: XnatContext | None, output_dir: Path, der
             # filed. Only if the record there says so: a label is a lossy spelling of the identity, and a
             # different report under it is a collision to report, not a report to drop (Codex P1, PR #23)
             there = _get_json(context, f"{label_url}?format=json", min(timeout_seconds, 60.0))["items"][0]["data_fields"]
-            if (there.get("source_id"), there.get("source_system")) != (parsed["id"], source_system):
+            # compared as the record holds them (cut to the column), not as the document spells them
+            if (there.get("source_id"), there.get("source_system")) != (values["source_id"], values["source_system"]):
                 logger.error("label %s on session %s holds report %r from %r, not %r from %r; not filed", label, context.session,
-                             there.get("source_id"), there.get("source_system"), parsed["id"], source_system)
+                             there.get("source_id"), there.get("source_system"), values["source_id"], values["source_system"])
                 return {"error": f"label {label} is taken by report {there.get('source_id')!r} from {there.get('source_system')!r}"}
             logger.info("diagnostic report %s already on session %s; not filed twice", label, context.session)
             return {"xsi_type": XSI_TYPE, "label": label, "exists": True, "source_id": parsed["id"]}
         xml = build_record_xml(values)
-        name = f"diagnosticreport-{re.sub(r'[^A-Za-z0-9_.-]+', '_', parsed['id'])}-v{values['source_version']}.json"
+        # both parts sanitised: the name is a path on the record, so a versionId of "1/../x" must not make it one
+        name = "diagnosticreport-%s-v%s.json" % tuple(re.sub(r"[^A-Za-z0-9_.-]+", "_", part).strip(".") or "_"
+                                                      for part in (parsed["id"], values["source_version"]))
         outcome = publish_record(context, label, xml, {REPORT_ROLE: [RecordFile(path, name)]}, timeout_seconds=timeout_seconds,
                                  xsi_type=XSI_TYPE)
-    except (RuntimeError, urllib.error.URLError, OSError, KeyError, IndexError, TypeError, ValueError, AttributeError,
-            ArithmeticError) as error:
+    except (RuntimeError, urllib.error.URLError, http.client.HTTPException, OSError, KeyError, IndexError, TypeError, ValueError,
+            AttributeError, ArithmeticError) as error:
+        # http.client.HTTPException: a truncated XNAT answer raises IncompleteRead, which is not an OSError (Codex P1, PR #23)
         logger.error("diagnostic report %s not filed on session %s; the run record stays: %s: %s", declared, context.session,
                      type(error).__name__, error)
         return {"error": f"{type(error).__name__}: {error}"}

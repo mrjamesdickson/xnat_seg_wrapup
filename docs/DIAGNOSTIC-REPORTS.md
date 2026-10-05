@@ -68,6 +68,17 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   are always ours. Text over a cap (4,000 per finding text and value, 8,000 conclusion, 100,000
   narrative) is cut with a warning, and `raw_json` over 200,000 is left off, because the
   `REPORT` file keeps the full text.
+- **Every plain `xs:string` element is a `varchar(255)` column** in XNAT, `xs:float` is single
+  precision and `xs:int` is 32-bit, and one value outside its column fails the whole create. Codes,
+  displays, units, body sites, the performer, the device, the version and the id are cut to 255
+  characters. A number that is NaN, infinite or beyond single precision, and an instance number
+  beyond 32 bits, are left off, each with a warning. The existence probe compares the id as the
+  record holds it, so a cut id still finds its own record.
+- **The `REPORT` file name is a name, not a path.** The id and `meta.versionId` are both
+  sanitised, so a versionId of `1/../x` cannot put a separator into it.
+- **Session labels get the same treatment as ids**: a label XNAT can carry as it is (letters,
+  digits, `_`, `-`) is used as it is, and any other gets a hash beside its rewritten form, so
+  `SUB.01` and `SUB_01` stay apart (Codex P2, PR #23).
 - **`xs:dateTime` will not take a FHIR date alone** (`2026-10-05`). `issued` and `effective`
   are left off unless they carry a time.
 - **The label keeps its report identity under the 64-character cap.** The poller cuts the whole
@@ -93,7 +104,9 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   character makes the whole create document malformed (Codex P2, PR #23). This is done before
   the caps, so a cap counts what is written.
 - **A malformed nested value** (`presentedForm: ["oops"]`, a string where a CodeableConcept goes)
-  is an `error` outcome, not an exception. It is caught after the run record exists, so it must not
+  is an `error` outcome, not an exception. So are a document nested past Python's recursion limit
+  (`RecursionError` from `json.loads`) and a truncated XNAT answer (`http.client.IncompleteRead`,
+  which is not an `OSError`). It is caught after the run record exists, so it must not
   stop `wrapup.json` or the pointer reduction (Codex P1, PR #23).
 - **Labels are unique per project, not per session.** The session label in the prefix keeps
   them apart. A 409 from a race takes the usual one retry with a random suffix, and `_relabel`

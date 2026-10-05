@@ -327,7 +327,8 @@ def test_report_ids_the_label_cannot_spell_as_they_are_stay_distinct():
     labels = {rid: dxreport.record_label("HB0004_1", "urn:xnatworks:card:nv-reason-ct", rid) for rid in ("a-b", "a.b", "a_b", "ab")}
     assert len(set(labels.values())) == 4, labels
     assert labels["ab"] == "HB0004_1_RPT_nvreasonct_ab", "letters and digits are carried as they are"
-    assert labels["a-b"].startswith("HB0004_1_RPT_nvreasonct_a_b_") and len(labels["a-b"]) == len("HB0004_1_RPT_nvreasonct_a_b_") + 8
+    assert labels["a-b"] == "HB0004_1_RPT_nvreasonct_a-b", "a hyphen is a label character: carried as it is"
+    assert re.fullmatch(r"HB0004_1_RPT_nvreasonct_a_b_[0-9a-f]{8}", labels["a.b"]), "rewritten, with a hash of the real id"
     # a UUID's readable prefix and hash would make the end over half the label: the id is hashed whole instead
     uuids = [dxreport.record_label("HB0004_1", "urn:x:card", u) for u in ("3fa85f64-5717-4562-b3fc-2c963f66afa6",
                                                                           "3fa85f64-5717-4562-b3fc-2c963f66afa7")]
@@ -348,3 +349,62 @@ def test_a_label_holding_another_report_is_a_collision_not_already_filed(tmp_pat
     assert out == {"error": "label HB0004_1_RPT_nvreasonct_3f2a9c1d0b7e4a65 is taken by report 'something-else' from "
                             "'urn:xnatworks:card:nv-reason-ct'"}
     assert xnat["published"] == [] and "not filed" in caplog.text
+
+
+
+# ── Codex round 3 on PR #23 ────────────────────────────────────────────────────
+def test_session_labels_that_rewrite_alike_stay_apart():
+    labels = [dxreport.record_label(session, "urn:x:card", "r1") for session in ("SUB-01", "SUB.01", "SUB_01", "SUB 01")]
+    assert len(set(labels)) == 4, labels
+    assert labels[0] == "SUB-01_RPT_card_r1" and labels[2] == "SUB_01_RPT_card_r1", "labels XNAT takes as they are stay as they are"
+    assert all(len(label) <= dxreport.LABEL_MAX and re.fullmatch(r"[A-Za-z0-9_-]+", label) for label in labels), labels
+
+
+def test_a_truncated_xnat_answer_is_an_outcome_not_an_abort(tmp_path, xnat, monkeypatch, caplog):
+    import http.client
+
+    def truncated(ctx, timeout):
+        raise http.client.IncompleteRead(b"partial", 4096)
+    monkeypatch.setattr(dxreport, "fetch_session_facts", truncated)
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out["error"].startswith("IncompleteRead") and xnat["published"] == [] and "not filed" in caplog.text
+
+
+def test_a_document_nested_past_the_recursion_limit_is_an_outcome_not_an_abort(tmp_path, xnat, caplog):
+    path = tmp_path / "raw"
+    path.mkdir()
+    deep = "[" * 200000 + "]" * 200000
+    (path / "diagnostic_report.json").write_text('{"resourceType": "DiagnosticReport", "id": "x", "extra": %s}' % deep)
+    out = dxreport.publish_diagnostic_report(context(), tmp_path, "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out["error"].startswith("RecursionError") and xnat["published"] == []
+
+
+# ── local review before round 4 ────────────────────────────────────────────────
+def test_values_fit_the_columns_xnat_makes_from_the_schema():
+    doc = card_report(code={"coding": [{"system": "s" * 300, "code": "c" * 300, "display": "d" * 300}]}, id="r" * 300)
+    doc["contained"][2]["code"] = {"text": "h" * 300}
+    doc["contained"][2]["valueQuantity"] = {"value": float("nan")}
+    doc["contained"][2]["component"] = [{"code": {"text": "Confidence"}, "valueQuantity": {"value": 1e39}},
+                                        {"code": {"text": "Instance number"}, "valueInteger": 2 ** 40}]
+    values = dxreport.build_values(dxreport.parse(doc), "{}", FACTS, "urn:xnatworks:card:nv-reason-ct", "n")
+    assert {len(values[k]) for k in ("code_system", "code", "code_display", "source_id")} == {dxreport.STRING_MAX}
+    row = values["findings"][0]
+    assert len(row["display"]) == dxreport.STRING_MAX
+    assert (row["value_number"], row["confidence"], row["instance_number"]) == (None, None, None), "NaN, over float32, over int32"
+    root = ElementTree.fromstring(dxreport.build_record_xml(values).encode())
+    assert root.find(DX + "findings")[0].find(DX + "value_number") is None
+
+
+def test_the_report_file_name_is_a_name_not_a_path(tmp_path, xnat):
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path, card_report(meta={"versionId": "1/../../x"})), "raw",
+                                             "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out["file"] == "diagnosticreport-3f2a9c1d0b7e4a65-v1_.._.._x.json", "one name: no separator survives"
+
+
+def test_an_id_longer_than_the_column_still_finds_its_own_record(tmp_path, xnat):
+    long_id = "a" * 300
+    xnat["probe"] = 200
+    xnat["there"] = {"source_id": "a" * dxreport.STRING_MAX, "source_system": "urn:xnatworks:card:nv-reason-ct"}
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path, card_report(id=long_id)), "raw", "diagnostic_report.json",
+                                             "SUCCEEDED", CONTRACT)
+    assert out["exists"] is True
