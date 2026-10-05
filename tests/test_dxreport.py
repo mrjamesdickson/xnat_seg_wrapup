@@ -494,3 +494,15 @@ def test_the_publishers_taken_label_message_is_the_one_the_race_handler_reads(mo
     with pytest.raises(RuntimeError) as raised:
         publish.publish_record(context(), "HB0004_1_RPT_x_y", "<x/>", {}, xsi_type=dxreport.XSI_TYPE, retry_on_conflict=False)
     assert "label HB0004_1_RPT_x_y already exists" in str(raised.value)
+
+
+
+# ── Codex round 6 on PR #23 ────────────────────────────────────────────────────
+def test_external_results_keep_contained_supporting_observations_out():
+    doc = hoppr_shaped(result=[{"reference": "Observation/123"}])
+    parsed = dxreport.parse(doc)
+    assert parsed["findings"] == [], "the findings are elsewhere; the contained ones only support"
+    assert (parsed["device_name"], dxreport.report_kind(parsed)) == (None, "HUMAN_DRAFT"), "no finding names the model"
+    # control: with no result element at all, the contained observations are the findings
+    del doc["result"]
+    assert len(dxreport.parse(doc)["findings"]) == 2

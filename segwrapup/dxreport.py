@@ -208,12 +208,14 @@ def finding(observation: dict) -> dict:
 
 
 def _observations(doc: dict) -> list[dict]:
-    """The Observations the report's ``result`` references; every contained Observation when it references none."""
-    observations = [o for o in (_contained(doc, (r or {}).get("reference")) for r in doc.get("result") or [])
-                    if o is not None and o.get("resourceType") == "Observation"]
-    if not observations:
-        observations = [o for o in doc.get("contained") or [] if isinstance(o, dict) and o.get("resourceType") == "Observation"]
-    return observations
+    """The contained Observations the report's ``result`` references; every contained Observation only when
+    the report has no ``result`` at all. A report whose results are external (``Observation/123``) keeps
+    none: a contained supporting Observation is not one of its findings, and must not make it an AI draft
+    through its ``device`` (Codex P2, PR #23)."""
+    results = [r for r in doc.get("result") or [] if isinstance(r, dict) and r.get("reference")]
+    if results:
+        return [o for o in (_contained(doc, r["reference"]) for r in results) if o is not None and o.get("resourceType") == "Observation"]
+    return [o for o in doc.get("contained") or [] if isinstance(o, dict) and o.get("resourceType") == "Observation"]
 
 
 def findings(doc: dict) -> list[dict]:

@@ -28,7 +28,8 @@ report", "it would be a great demo piece").
   unspellable); a create race re-reads the label instead of retrying under a random one
   (`publish_record(retry_on_conflict=False)`); and, with container-workshop PR #65, the AI author is
   the Device the findings name, where FHIR R5 puts it, not a Device performer. Round 5: an XHTML narrative's entities are decoded once; a race
-  seen by the publisher's own probe is read like a 409. Every value is held to its column (255 characters for a plain string,
+  seen by the publisher's own probe is read like a 409. Round 6: the fallback to every contained
+  Observation applies only to a report with no `result` at all. Every value is held to its column (255 characters for a plain string,
   single-precision floats, 32-bit ints), and the REPORT file name cannot carry a separator.
 - Image tags 0.7.2 (seg-wrapup, proc-wrapup, record-fetch).
 
