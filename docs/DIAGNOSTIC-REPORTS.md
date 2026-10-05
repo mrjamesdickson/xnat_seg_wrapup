@@ -133,9 +133,12 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   which is not an `OSError`). It is caught after the run record exists, so it must not
   stop `wrapup.json` or the pointer reduction (Codex P1, PR #23).
 - **Labels are unique per project, not per session.** The session label in the prefix keeps
-  them apart. A 409 from a race takes the usual one retry with a random suffix, and `_relabel`
-  now recognises the `dxreport:` root, so the document's `label` attribute matches the URL it
-  is PUT to.
+  them apart. A 409 on create is not retried under a random suffix: the report is published with
+  `publish_record(retry_on_conflict=False)`, and a 409 (or the publisher's own probe finding the
+  label taken) re-reads the record at the canonical label. The same report there is "already
+  filed" (`exists`); any other is a collision (`error`). See "A create race is not retried under
+  a random label" above. `_relabel` recognises the `dxreport:` root for the other callers of
+  `publish_record`, which still retry once.
 - **The run record comes first and is never rolled back** for the report's sake. A report that
   fails to file is an outcome under `wrapup.json` `diagnostic_report` (`skipped`, `exists` or
   `error`). The copy of `wrapup.json` already uploaded to the run record predates the report,

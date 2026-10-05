@@ -16,7 +16,8 @@ report", "it would be a great demo piece").
   never raises, and every outcome is in `wrapup.json` under `diagnostic_report`. Values the
   schema would refuse are clamped or cut. `segwrapup/dxreport.py`;
   `RecordContract.diagnostic_report`; `docs/DIAGNOSTIC-REPORTS.md`.
-- The relabel retry on a 409 recognises a `dxreport:` root element as well as `analysis:`.
+- The relabel retry on a 409 recognises a `dxreport:` root element as well as `analysis:`. A diagnostic report
+  itself is never relabelled: it is created with `retry_on_conflict=False`, and a 409 re-reads the canonical label.
 - Review fixes (Codex, PR #23). Only the Device a performer references makes an AI draft. A long
   session label is shortened, not the report id. Characters XML 1.0 forbids are escaped. A
   malformed nested value is an outcome, not an exception. Round 2: a number too large for a float is left

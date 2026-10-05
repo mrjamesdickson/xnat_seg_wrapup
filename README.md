@@ -235,7 +235,9 @@ only; not a medical device.
 ROI collections and records are XNAT experiments, whose labels are unique per project. The
 default label is `<pipeline>_<session label>_scan<id>_<UTC stamp>` (since 0.4.1; the session
 id when its label cannot be read), so two sessions' runs of one pipeline finishing in the same
-second cannot collide. A record's create that meets a 409 is retried once with a random suffix;
+second cannot collide. A record's create that meets a 409 is retried once with a random suffix
+(not a diagnostic report's: its label is its identity, so a 409 re-reads it; see
+"Diagnostic reports" under proc-wrapup);
 an ROI collection is registered with `overwrite=true` and not retried, so its label has to be
 distinct already. Labels are at most 64 characters: the pipeline name gives way first, and a scan
 id or session label too long to fit keeps its start and ends in eight hex digits of a digest of
