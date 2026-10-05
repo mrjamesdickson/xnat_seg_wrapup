@@ -176,6 +176,9 @@ def xnat(monkeypatch):
     def publish(ctx, label, xml, files, timeout_seconds=300.0, xsi_type=None, retry_on_conflict=True):
         if calls.get("conflict"):
             raise RuntimeError("PUT %s failed: HTTP 409 Conflict" % label)
+        if calls.get("inner_probe_taken"):           # publish_record's own message for a label its probe finds
+            raise RuntimeError(f"label {label} already exists on session {ctx.session}; the record is create-only, "
+                               "pass a fresh --record-label or let the run stamp one")
         calls["published"].append({"label": label, "xml": xml, "files": files, "xsi_type": xsi_type,
                                    "retry_on_conflict": retry_on_conflict})
         return {"id": "XNAT_E99999", "label": label}
@@ -462,3 +465,32 @@ def test_a_create_race_on_the_same_report_is_already_filed_and_on_another_a_coll
 def test_the_report_is_created_without_the_random_suffix_retry(tmp_path, xnat):
     dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
     assert xnat["published"][0]["retry_on_conflict"] is False
+
+
+
+# ── Codex round 5 on PR #23 ────────────────────────────────────────────────────
+def test_an_xhtml_narrative_is_text_with_its_entities_decoded_once():
+    parsed = dxreport.parse(card_report(presentedForm=[], text={"div": "<div><p>Heart &amp; lungs &lt;normal&gt;</p></div>"}))
+    assert parsed["narrative"] == "Heart & lungs <normal>"
+    values = dxreport.build_values(parsed, "{}", FACTS, "urn:x:card", "n")
+    root = ElementTree.fromstring(dxreport.build_record_xml(values).encode())
+    assert root.find(DX + "narrative").text == "Heart & lungs <normal>"
+
+
+def test_a_race_seen_by_the_publishers_own_probe_is_read_like_a_409(tmp_path, xnat):
+    xnat["inner_probe_taken"] = True
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out["exists"] is True and out["label"] == "HB0004_1_RPT_nv-reason-ct_3f2a9c1d0b7e4a65"
+    xnat["there"] = {"source_id": "other", "source_system": "urn:xnatworks:card:nv-reason-ct"}
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out["error"].startswith("label HB0004_1_RPT_nv-reason-ct_3f2a9c1d0b7e4a65 is taken by report 'other'")
+
+
+def test_the_publishers_taken_label_message_is_the_one_the_race_handler_reads(monkeypatch):
+    """The race handler matches publish_record's own words; this pins them so a reworded message cannot
+    silently turn an already-filed report into an error."""
+    from segwrapup import publish
+    monkeypatch.setattr(publish, "_request", lambda ctx, method, url, timeout: 200)
+    with pytest.raises(RuntimeError) as raised:
+        publish.publish_record(context(), "HB0004_1_RPT_x_y", "<x/>", {}, xsi_type=dxreport.XSI_TYPE, retry_on_conflict=False)
+    assert "label HB0004_1_RPT_x_y already exists" in str(raised.value)

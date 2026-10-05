@@ -107,7 +107,8 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   `nvreasonct`.
 - **A create race is not retried under a random label.** Two wrapups filing the same report at once
   both see the label free. The second create gets a 409, and the generic publisher would retry
-  under a random suffix and file the report twice. `publish_record(retry_on_conflict=False)` hands
+  under a random suffix and file the report twice. A race the publisher's own probe sees ("label
+  ... already exists") is the same case. `publish_record(retry_on_conflict=False)` hands
   the 409 back, and the record under the label is read as on a probe: the same report is
   `exists`, another is a collision (Codex P2, PR #23). A race on the same session is narrower.
   There XNAT answers the second PUT as an update of the record the first just made, which the

@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import html
 import http.client
 import json
 import logging
@@ -174,7 +175,9 @@ def narrative(doc: dict) -> str | None:
                 logger.warning("presentedForm is not base64 UTF-8 text (%s); the record keeps no narrative from it", error)
                 return None
     div = _text((doc.get("text") or {}).get("div")) if isinstance(doc.get("text"), dict) else None
-    return re.sub(r"<[^>]+>", " ", div).strip() if div else None
+    # tags out, then entities decoded: "Heart &amp; lungs" is "Heart & lungs", and the record XML escapes it
+    # once itself (Codex P2, PR #23: it read "&amp;amp;")
+    return html.unescape(re.sub(r"<[^>]+>", " ", div)).strip() if div else None
 
 
 def finding(observation: dict) -> dict:
@@ -483,11 +486,12 @@ def publish_diagnostic_report(context: XnatContext | None, output_dir: Path, der
             outcome = publish_record(context, label, xml, {REPORT_ROLE: [RecordFile(path, name)]}, timeout_seconds=timeout_seconds,
                                      xsi_type=XSI_TYPE, retry_on_conflict=False)
         except RuntimeError as error:
-            if "HTTP 409" not in str(error):
+            # another wrapup filed a report under this label after the probe above: publish_record's own
+            # probe sees it ("already exists") or its create gets a 409. Either way the record there is
+            # read: the same report (a concurrent rerun) is already filed, anything else is a collision.
+            # Never a second record under a random label (Codex P2 x2, PR #23)
+            if "HTTP 409" not in str(error) and f"label {label} already exists" not in str(error):
                 raise
-            # another wrapup filed a report under this label between the probe and the create: the
-            # same report (a concurrent rerun) is already filed; anything else is a collision. Never a
-            # second record under a random label (Codex P2, PR #23)
             return _existing(context, label_url, label, values, timeout_seconds, race=True)
     except (RuntimeError, urllib.error.URLError, http.client.HTTPException, OSError, KeyError, IndexError, TypeError, ValueError,
             AttributeError, ArithmeticError) as error:
