@@ -382,6 +382,9 @@ class RecordContract:
     #: ``model`` for a training card (0.7.1): after the run record, the weights named by the
     #: card's ``MODEL`` view are registered as an ``analysis:trainedModelData`` (segwrapup.model).
     produces: str = ""
+    #: The tool's FHIR R5 DiagnosticReport, a path inside its output (0.7.2): after the run record it is
+    #: filed as a ``dxreport:sessionReportData`` on the session (segwrapup.dxreport).
+    diagnostic_report: str = ""
     resources: dict[str, list[str]] = field(default_factory=lambda: dict(DEFAULT_RESOURCES))
     #: ``XNW_RESOURCE_<ROLE>`` overrides for a fixed role the card sent and the wrapup ignored
     #: (``"REPORT=report.html,raw/sub-*.html"``), so ``wrapup.json`` says what was dropped.
@@ -395,7 +398,7 @@ class RecordContract:
         "XNW_CONTRACT_VERSION": "contract_version", "XNW_ANALYSIS_TYPE": "analysis_type",
         "XNW_CONTAINER_IMAGE": "container_image", "XNW_CONTAINER_DIGEST": "container_digest",
         "XNW_OUTPUT_RESOURCE_LABEL": "output_resource_label", "XNW_SUPERSEDES_ID": "supersedes_id",
-        "XNW_PRODUCES": "produces",
+        "XNW_PRODUCES": "produces", "XNW_DIAGNOSTIC_REPORT": "diagnostic_report",
     }
 
     @classmethod
@@ -440,6 +443,7 @@ class RecordContract:
         return cls(
             ignored_overrides=tuple(ignored),
             produces=str(data.get("produces", "") or ""),
+            diagnostic_report=str(data.get("diagnostic_report", "") or ""),
             card_id=str(data.get("card_id", "")),
             card_revision=str(data.get("card_revision", "")),
             contract_version=str(data.get("contract_version", "0.1")),
@@ -761,7 +765,8 @@ def _relabel(xml: str, label: str) -> str:
     Every record root is relabelled: a subject or group record retried under the old label would collide again."""
     # any record root (SessionAnalysis, SubjectAnalysis, GroupAnalysis, TrainedModel): the first
     # element carrying a label attribute (Codex P2, PR #21: a model retry kept the occupied label)
-    return re.sub(r'(<analysis:[A-Za-z]+[^>]*?\slabel=")[^"]*(")',
+    # a diagnostic report's root is dxreport:SessionReport (0.7.2)
+    return re.sub(r'(<(?:analysis|dxreport):[A-Za-z]+[^>]*?\slabel=")[^"]*(")',
                   lambda m: m.group(1) + escape(label) + m.group(2), xml, count=1)
 
 
@@ -920,6 +925,7 @@ def publish_if_possible(args, output_dir: Path, report: dict, results: list[dict
         outcome["views"] = views
         outcome["ignored_overrides"] = list(contract.ignored_overrides)
         outcome["produces"] = contract.produces
+        outcome["diagnostic_report"] = contract.diagnostic_report
         outcome["contract"] = {"card_id": contract.card_id, "card_revision": contract.card_revision,
                                "container_image": contract.container_image, "container_digest": contract.container_digest,
                                "analysis_type": contract.analysis_type}

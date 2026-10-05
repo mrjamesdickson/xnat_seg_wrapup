@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.2 (2026-10-05)
+
+Cards can file a diagnostic report (James, 2026-10-05: "I thought nv-reason-ct 0.5.0 created a
+report", "it would be a great demo piece").
+
+- **`diagnosticReport`.** A results block may name a FHIR R5 `DiagnosticReport` the tool writes
+  (`XNW_DIAGNOSTIC_REPORT=<path inside the tool's output>`). At session scope, after the run
+  record of a run that succeeded, proc-wrapup files it as a `dxreport:sessionReportData` on the
+  session: the datatype and mapping of the FHIR report poller (`DiagnosticReportParser`,
+  `DxReportRecordMapper`), with the label `<session>_RPT_<card>_<report id>`, `source_system`
+  `urn:xnatworks:card:<card id>`, `AI_DRAFT` when the performer is the contained Device, the
+  session's own accession, UID, modality and subject label, the findings the report references,
+  and the document itself on `REPORT`. It is create-only: an existing label is left alone. It
+  never raises, and every outcome is in `wrapup.json` under `diagnostic_report`. Values the
+  schema would refuse are clamped or cut. `segwrapup/dxreport.py`;
+  `RecordContract.diagnostic_report`; `docs/DIAGNOSTIC-REPORTS.md`.
+- The relabel retry on a 409 recognises a `dxreport:` root element as well as `analysis:`.
+- Image tags 0.7.2 (seg-wrapup, proc-wrapup, record-fetch).
+
 ## 0.7.1 (2026-09-26)
 
 Training cards register their model (the link pair of

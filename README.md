@@ -99,7 +99,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.7.1"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.7.2"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -212,8 +212,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.7.1 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.7.1
+docker build -t xnatworks/seg-wrapup:0.7.2 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.7.2
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
@@ -298,7 +298,7 @@ session, where the reviewer looks. A FAILED record never satisfies a prerequisit
 A subject-scoped wrapper (plan D26: `<app>-subject` beside `<app>-session`) mounts the project
 archive through a derived Project input, because a Subject has no directory of its own. Its
 records mount is a second Project input carrying `via-setup-command
-xnatworks/record-fetch:0.7.1:record-fetch-subject`, which is `record-fetch --no-passthrough`
+xnatworks/record-fetch:0.7.2:record-fetch-subject`, which is `record-fetch --no-passthrough`
 (`commands/record-fetch-subject.json`, the same image): the prerequisites are resolved on every
 session of the subject and written to `prereq/<name>/<session label>/`, and nothing is passed
 through, since passing the archive through would copy it. Register it beside `record-fetch`
@@ -404,3 +404,41 @@ back the run record when the model registration fails. The copy of `wrapup.json`
 the run record predates the registration; the local manifest and the pointer carry it.
 `segwrapup/model.py`; the design that asked for it is
 `xnat_monailabel_plugin/docs/MONAI_TRAINING_FROM_DATASET_DESIGN.md`.
+
+### Diagnostic reports: `diagnosticReport` (0.7.2)
+
+A session-scoped card whose tool writes a FHIR R5 `DiagnosticReport` names the file in its
+results block (`"diagnosticReport": "diagnostic_report.json"`, which the workshop turns into
+`XNW_DIAGNOSTIC_REPORT=diagnostic_report.json` on the command; the path is relative to the
+tool's output). After the run record is published, proc-wrapup files the report on the session
+as a `dxreport:sessionReportData`, the datatype of `xnat-dxreport-schema-plugin`. That is the
+record the FHIR report poller makes for a report a vendor sends, so a card's draft and a
+vendor's report sit side by side on the session page and read the same way.
+
+The record is labelled `<session label>_RPT_<card>_<report id>`, the poller's naming, for
+example `HB0004_1_RPT_nvreasonct_3f2a9c1d0b7e4a65`. Its `source_system` is
+`urn:xnatworks:card:<card id>`. Its `report_kind` is `AI_DRAFT` when the performer is the
+contained `Device` (the model) and no person is named. The record names the archived session:
+its project, its accession, its `UID` as the study instance UID, its modality, and the subject's
+label as the pseudonym. It does not take any of these from what the document says about itself.
+The findings come from the `Observation`s the report's `result` references, the conclusion and
+narrative from the report, and the document itself, whole, goes on the record's `REPORT`
+resource as `diagnosticreport-<id>-v<version>.json`. `wrapup.json` carries the outcome under
+`diagnostic_report`.
+
+A worked example, the NV-Reason-CT card (0.6.0 and later): its tool answers a question about a
+chest CT and writes `diagnostic_report.json`, with the model's report text as a base64
+`presentedForm`, each organ section and the direct answer as an `Observation`, and the model
+as a contained `Device`. The session then shows the run record (`analysis:sessionAnalysisData`)
+and, beside it, `HB0004_1_RPT_nvreasonct_<id>` with the conclusion, the findings and
+`AI_DRAFT`.
+
+What it does not do: file a report from a run that did not succeed, from a subject- or
+dataset-scoped run, or when the tool wrote no file at the declared path (each is recorded
+under `diagnostic_report`, and the run record stands regardless). It does not file the same
+report twice. The report id is the card's, so a card that derives it from its inputs gets one
+record per distinct report, and a rerun that produces the same report finds it and stops. It
+does not sign, finalise or send the report anywhere. A person reviews an AI draft, outside
+this wrapup. A value the schema would refuse is clamped (an unknown status becomes `unknown`,
+an unknown category `OTH`) or cut to the schema's cap, with the full text kept in the `REPORT`
+file. `segwrapup/dxreport.py`; design in `docs/DIAGNOSTIC-REPORTS.md`.
