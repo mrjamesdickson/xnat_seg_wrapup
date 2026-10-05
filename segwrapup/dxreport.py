@@ -111,8 +111,9 @@ def _number(value) -> float | None:
 
 
 def performer(doc: dict) -> str | None:
-    """The human performer's name. A performer that resolves to a contained Device is the model, not
-    a person, whatever its display says: it makes the report an AI draft, not a human one."""
+    """The human performer's name. A performer that resolves to a contained Device is a model, not a
+    person, whatever its display says (FHIR R5 does not allow one there, but a document may still
+    carry it)."""
     for item in doc.get("performer") or []:
         if not isinstance(item, dict):
             continue
@@ -127,10 +128,19 @@ def performer(doc: dict) -> str | None:
     return None
 
 
-def performer_device(doc: dict) -> dict | None:
-    """The contained Device a performer entry references: the model that wrote the report. Any other
-    contained Device (the scanner, say) says nothing about who wrote it (Codex P1, PR #23: the first
-    contained Device made a human's draft with a scanner in it an AI draft)."""
+def author_device(doc: dict) -> dict | None:
+    """The contained Device that wrote the report: the one the findings name as their ``device``,
+    which is where FHIR R5 puts a model (a report's ``performer`` takes only people and
+    organisations; HOPPR's report and the NV-Reason-CT card's are shaped so), else, tolerated, one a
+    performer entry references. A contained Device nothing points at (the scanner, say) says
+    nothing about who wrote the report (Codex P1, PR #23: the first contained Device made a human's
+    draft with a scanner in it an AI draft; Codex P2, container-workshop PR #65: Device is not a
+    permitted performer)."""
+    for observation in _observations(doc):
+        device = observation.get("device")
+        target = _contained(doc, device.get("reference")) if isinstance(device, dict) else None
+        if target is not None and target.get("resourceType") == "Device":
+            return target
     for item in doc.get("performer") or []:
         target = _contained(doc, item.get("reference")) if isinstance(item, dict) else None
         if target is not None and target.get("resourceType") == "Device":
@@ -194,13 +204,17 @@ def finding(observation: dict) -> dict:
             "body_site": _coding(observation.get("bodySite"), "display"), "instance_number": instance_number}
 
 
-def findings(doc: dict) -> list[dict]:
+def _observations(doc: dict) -> list[dict]:
     """The Observations the report's ``result`` references; every contained Observation when it references none."""
     observations = [o for o in (_contained(doc, (r or {}).get("reference")) for r in doc.get("result") or [])
                     if o is not None and o.get("resourceType") == "Observation"]
     if not observations:
         observations = [o for o in doc.get("contained") or [] if isinstance(o, dict) and o.get("resourceType") == "Observation"]
-    return [finding(o) for o in observations]
+    return observations
+
+
+def findings(doc: dict) -> list[dict]:
+    return [finding(o) for o in _observations(doc)]
 
 
 def parse(doc) -> dict:
@@ -211,7 +225,7 @@ def parse(doc) -> dict:
     if not report_id:
         raise NotADiagnosticReport("the DiagnosticReport has no id: a rerun could not find the record it already made")
     tags = (doc.get("meta") or {}).get("tag") if isinstance(doc.get("meta"), dict) else None
-    device = performer_device(doc)
+    device = author_device(doc)
     return {"id": report_id, "version_id": _text((doc.get("meta") or {}).get("versionId")) if isinstance(doc.get("meta"), dict) else None,
             "status": _text(doc.get("status")), "category": _coding(_first(doc.get("category")), "code"),
             "code_system": _coding(doc.get("code"), "system"), "code": _coding(doc.get("code"), "code"),
@@ -226,8 +240,8 @@ def parse(doc) -> dict:
 
 def report_kind(parsed: dict) -> str:
     """The poller's rule: a Device author and no human performer is an AI draft; a human performer
-    signs a final report; anything else is a human draft. The Device is the one a performer
-    references (``performer_device``), not any contained Device."""
+    signs a final report; anything else is a human draft. The Device is the one the findings or a
+    performer point at (``author_device``), not any contained Device."""
     # a referenced Device is the author whether or not it carries a name, which FHIR leaves optional (Codex P2, PR #23)
     if parsed["performer"] is None and parsed.get("device_author", parsed["device_name"] is not None):
         return "AI_DRAFT"
@@ -236,14 +250,29 @@ def report_kind(parsed: dict) -> str:
     return "HUMAN_DRAFT"
 
 
-def _tail(source: str, width: int = 12) -> str:
-    """The last path segment of a URL or URN, alphanumerics only: ``urn:xnatworks:card:nv-reason-ct`` -> ``nvreasonct``."""
+SOURCE_PART_MAX = 16
+#: The longest end the label keeps whole: ``_RPT_`` + a card id of 16 + ``_`` + a 16-hex report id is 38,
+#: and at least 24 characters are left for the session label.
+SUFFIX_MAX = 40
+
+
+def _tail(source: str) -> str:
+    """The last path segment of a URL or URN: ``urn:xnatworks:card:nv-reason-ct`` -> ``nv-reason-ct``."""
     s = re.sub(r"[/:]+$", "", source or "")
     cut = max(s.rfind("/"), s.rfind(":"))
-    if 0 <= cut < len(s) - 1:
-        s = s[cut + 1:]
-    s = re.sub(r"[^A-Za-z0-9]+", "", s)
-    return s[:width] or "src"
+    return (s[cut + 1:] if 0 <= cut < len(s) - 1 else s) or "src"
+
+
+def _source_part(source_system: str) -> str:
+    """The card in the label: its id as it is when the label can carry it and it is short, else
+    shortened with a hash of the whole source. The poller keeps the first 12 alphanumerics, which made
+    cards ``a-b`` and ``ab`` (or two sharing 12 characters) one label, and the second card's report a
+    collision it could never file (Codex P2, PR #23). The tail is unique among card sources
+    (``urn:xnatworks:card:<card id>``), which is all this module files."""
+    part = _spelled(_tail(source_system), 6)
+    if len(part) > SOURCE_PART_MAX:
+        part = _label_part(_tail(source_system))[:SOURCE_PART_MAX - 7].strip("_") + "_" + _short_hash(source_system, 6)
+    return part
 
 
 def _label_part(text: str) -> str:
@@ -274,9 +303,10 @@ def record_label(session_label: str, source_system: str, report_id: str) -> str:
     # the id and the session label as the label can carry them unchanged, else rewritten with a hash of
     # the original beside them: "a-b"/"a.b" and "SUB.01"/"SUB_01" rewrite alike, and two reports or two
     # sessions must never share a label (Codex P1 and P2, PR #23)
-    suffix = f"_RPT_{_tail(source_system)}_{_spelled(report_id)}"
-    if len(suffix) > LABEL_MAX // 2:
-        suffix = f"_RPT_{_tail(source_system)}_{_short_hash(report_id, 16)}"
+    source = _source_part(source_system)
+    suffix = f"_RPT_{source}_{_spelled(report_id)}"
+    if len(suffix) > SUFFIX_MAX:
+        suffix = f"_RPT_{source}_{_short_hash(report_id, 16)}"
     session = _spelled(session_label, 6).rstrip("_")
     room = LABEL_MAX - len(suffix)
     if len(session) > room:
@@ -392,6 +422,22 @@ def declared_path(output_dir: Path, derived_root: str | None, declared: str) -> 
     return root.joinpath(*relative.parts)
 
 
+def _existing(context: XnatContext, label_url: str, label: str, values: dict, timeout_seconds: float, race: bool = False) -> dict:
+    """The outcome when the label is already taken. The report id is the card's, deterministic for the
+    same inputs, so the same report is already filed, but only if the record there says so: a label
+    is a lossy spelling of the identity, and a different report under it is a collision to report, not
+    a report to drop (Codex P1, PR #23). Compared as the record holds them (cut to the column). Raises
+    what the read raises."""
+    there = _get_json(context, f"{label_url}?format=json", min(timeout_seconds, 60.0))["items"][0]["data_fields"]
+    if (there.get("source_id"), there.get("source_system")) != (values["source_id"], values["source_system"]):
+        logger.error("label %s on session %s holds report %r from %r, not %r from %r; not filed", label, context.session,
+                     there.get("source_id"), there.get("source_system"), values["source_id"], values["source_system"])
+        return {"error": f"label {label} is taken by report {there.get('source_id')!r} from {there.get('source_system')!r}"}
+    logger.info("diagnostic report %s already on session %s%s; not filed twice", label, context.session,
+                " (filed by a concurrent run)" if race else "")
+    return {"xsi_type": XSI_TYPE, "label": label, "exists": True, "source_id": values["source_id"]}
+
+
 def publish_diagnostic_report(context: XnatContext | None, output_dir: Path, derived_root: str | None, declared: str,
                               run_status: str, contract: dict, timeout_seconds: float = 300.0) -> dict:
     """File the tool's DiagnosticReport as a ``dxreport:sessionReportData`` on the session. Never raises."""
@@ -428,23 +474,21 @@ def publish_diagnostic_report(context: XnatContext | None, output_dir: Path, der
         label_url, _ = record_urls(context, label)
         probe = _request(context, "GET", f"{label_url}?format=json", min(timeout_seconds, 60.0))
         if probe == 200:
-            # the report id is the card's, deterministic for the same inputs: the same report is already
-            # filed. Only if the record there says so: a label is a lossy spelling of the identity, and a
-            # different report under it is a collision to report, not a report to drop (Codex P1, PR #23)
-            there = _get_json(context, f"{label_url}?format=json", min(timeout_seconds, 60.0))["items"][0]["data_fields"]
-            # compared as the record holds them (cut to the column), not as the document spells them
-            if (there.get("source_id"), there.get("source_system")) != (values["source_id"], values["source_system"]):
-                logger.error("label %s on session %s holds report %r from %r, not %r from %r; not filed", label, context.session,
-                             there.get("source_id"), there.get("source_system"), values["source_id"], values["source_system"])
-                return {"error": f"label {label} is taken by report {there.get('source_id')!r} from {there.get('source_system')!r}"}
-            logger.info("diagnostic report %s already on session %s; not filed twice", label, context.session)
-            return {"xsi_type": XSI_TYPE, "label": label, "exists": True, "source_id": parsed["id"]}
+            return _existing(context, label_url, label, values, timeout_seconds)
         xml = build_record_xml(values)
         # both parts sanitised: the name is a path on the record, so a versionId of "1/../x" must not make it one
         name = "diagnosticreport-%s-v%s.json" % tuple(re.sub(r"[^A-Za-z0-9_.-]+", "_", part).strip(".") or "_"
                                                       for part in (parsed["id"], values["source_version"]))
-        outcome = publish_record(context, label, xml, {REPORT_ROLE: [RecordFile(path, name)]}, timeout_seconds=timeout_seconds,
-                                 xsi_type=XSI_TYPE)
+        try:
+            outcome = publish_record(context, label, xml, {REPORT_ROLE: [RecordFile(path, name)]}, timeout_seconds=timeout_seconds,
+                                     xsi_type=XSI_TYPE, retry_on_conflict=False)
+        except RuntimeError as error:
+            if "HTTP 409" not in str(error):
+                raise
+            # another wrapup filed a report under this label between the probe and the create: the
+            # same report (a concurrent rerun) is already filed; anything else is a collision. Never a
+            # second record under a random label (Codex P2, PR #23)
+            return _existing(context, label_url, label, values, timeout_seconds, race=True)
     except (RuntimeError, urllib.error.URLError, http.client.HTTPException, OSError, KeyError, IndexError, TypeError, ValueError,
             AttributeError, ArithmeticError) as error:
         # http.client.HTTPException: a truncated XNAT answer raises IncompleteRead, which is not an OSError (Codex P1, PR #23)

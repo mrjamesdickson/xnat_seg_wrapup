@@ -101,7 +101,7 @@ def test_a_bad_attachment_costs_the_narrative_only(caplog):
 
 # ── the record ─────────────────────────────────────────────────────────────────
 def test_the_label_is_the_pollers():
-    assert dxreport.record_label("HB0004_1", "urn:xnatworks:card:nv-reason-ct", "3f2a9c1d0b7e4a65") == "HB0004_1_RPT_nvreasonct_3f2a9c1d0b7e4a65"
+    assert dxreport.record_label("HB0004_1", "urn:xnatworks:card:nv-reason-ct", "3f2a9c1d0b7e4a65") == "HB0004_1_RPT_nv-reason-ct_3f2a9c1d0b7e4a65"
     assert dxreport.record_label("S", "https://fhir.example.org/fhir/", "r1") == "S_RPT_fhir_r1"
     assert len(dxreport.record_label("L" * 60, "urn:x:card", "id")) == dxreport.LABEL_MAX
 
@@ -134,7 +134,7 @@ def test_the_xml_parses_follows_the_xsd_sequence_and_escapes_the_text():
     doc = card_report(conclusion='Emboli <large> & "saddle"')
     values = dxreport.build_values(dxreport.parse(doc), json.dumps(doc), FACTS, "urn:xnatworks:card:nv-reason-ct", "None needed")
     root = ElementTree.fromstring(dxreport.build_record_xml(values).encode())
-    assert root.tag == DX + "SessionReport" and root.get("label") == "HB0004_1_RPT_nvreasonct_3f2a9c1d0b7e4a65" and root.get("project") == "RSNA_DEMO"
+    assert root.tag == DX + "SessionReport" and root.get("label") == "HB0004_1_RPT_nv-reason-ct_3f2a9c1d0b7e4a65" and root.get("project") == "RSNA_DEMO"
     names = [child.tag.split("}")[1] for child in root]
     assert names == [n for n in XSD_ORDER if n in names], "elements in the XSD's sequence order"
     assert root.find(DX + "conclusion").text == 'Emboli <large> & "saddle"'
@@ -173,8 +173,11 @@ def xnat(monkeypatch):
     monkeypatch.setattr(dxreport, "_request", lambda ctx, method, url, timeout: calls["probe"])
     monkeypatch.setattr(dxreport, "_get_json", lambda ctx, url, timeout: {"items": [{"data_fields": calls["there"]}]})
 
-    def publish(ctx, label, xml, files, timeout_seconds=300.0, xsi_type=None):
-        calls["published"].append({"label": label, "xml": xml, "files": files, "xsi_type": xsi_type})
+    def publish(ctx, label, xml, files, timeout_seconds=300.0, xsi_type=None, retry_on_conflict=True):
+        if calls.get("conflict"):
+            raise RuntimeError("PUT %s failed: HTTP 409 Conflict" % label)
+        calls["published"].append({"label": label, "xml": xml, "files": files, "xsi_type": xsi_type,
+                                   "retry_on_conflict": retry_on_conflict})
         return {"id": "XNAT_E99999", "label": label}
     monkeypatch.setattr(dxreport, "publish_record", publish)
     return calls
@@ -185,7 +188,7 @@ CONTRACT = {"card_id": "nv-reason-ct", "card_revision": "0.6.0"}
 
 def test_a_succeeded_session_run_files_the_report_with_the_document_on_report(tmp_path, xnat):
     out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
-    assert out == {"xsi_type": "dxreport:sessionReportData", "id": "XNAT_E99999", "label": "HB0004_1_RPT_nvreasonct_3f2a9c1d0b7e4a65",
+    assert out == {"xsi_type": "dxreport:sessionReportData", "id": "XNAT_E99999", "label": "HB0004_1_RPT_nv-reason-ct_3f2a9c1d0b7e4a65",
                    "source_id": "3f2a9c1d0b7e4a65", "report_kind": "AI_DRAFT", "findings": 2, "file": "diagnosticreport-3f2a9c1d0b7e4a65-v1.json"}
     (call,) = xnat["published"]
     assert call["xsi_type"] == "dxreport:sessionReportData"
@@ -231,8 +234,8 @@ def test_a_bad_document_or_a_failed_create_is_an_outcome_not_an_abort(tmp_path, 
 def test_a_409_retry_relabels_the_report_root_so_the_document_matches_the_url():
     from segwrapup.publish import _relabel
     values = dxreport.build_values(dxreport.parse(card_report()), "{}", FACTS, "urn:xnatworks:card:nv-reason-ct", "n")
-    root = ElementTree.fromstring(_relabel(dxreport.build_record_xml(values), "HB0004_1_RPT_nvreasonct_3f2a_9c1d").encode())
-    assert root.get("label") == "HB0004_1_RPT_nvreasonct_3f2a_9c1d"
+    root = ElementTree.fromstring(_relabel(dxreport.build_record_xml(values), "HB0004_1_RPT_nv-reason-ct_3f2a_9c1d").encode())
+    assert root.get("label") == "HB0004_1_RPT_nv-reason-ct_3f2a_9c1d"
 
 
 def test_the_contract_carries_the_declaration_from_env_and_from_json():
@@ -261,14 +264,14 @@ def test_a_long_session_label_keeps_the_report_identity_in_the_label():
     second = dxreport.record_label(long_label, "urn:xnatworks:card:nv-reason-ct", "0000000000000001")
     other_card = dxreport.record_label(long_label, "urn:xnatworks:card:hoppr", "3f2a9c1d0b7e4a65")
     assert len({first, second, other_card}) == 3 and all(len(x) <= dxreport.LABEL_MAX for x in (first, second, other_card))
-    assert first.endswith("_RPT_nvreasonct_3f2a9c1d0b7e4a65")
+    assert first.endswith("_RPT_nv-reason-ct_3f2a9c1d0b7e4a65")
     # two long session labels that share their first 60 characters stay apart
     assert dxreport.record_label(long_label + "_A", "urn:x:card", "r") != dxreport.record_label(long_label + "_B", "urn:x:card", "r")
     # a report id too long for the label is replaced by its hash, still distinct and still under the cap
     a, b = (dxreport.record_label("HB0004_1", "urn:x:card", "x" * 80 + tail) for tail in ("1", "2"))
     assert a != b and len(a) <= dxreport.LABEL_MAX and a.startswith("HB0004_1_RPT_card_")
     # the common case is still the poller's label, unchanged
-    assert dxreport.record_label("HB0004_1", "urn:xnatworks:card:nv-reason-ct", "3f2a9c1d0b7e4a65") == "HB0004_1_RPT_nvreasonct_3f2a9c1d0b7e4a65"
+    assert dxreport.record_label("HB0004_1", "urn:xnatworks:card:nv-reason-ct", "3f2a9c1d0b7e4a65") == "HB0004_1_RPT_nv-reason-ct_3f2a9c1d0b7e4a65"
 
 
 def test_a_character_xml_cannot_carry_is_written_as_its_escape_and_the_document_still_parses(caplog):
@@ -306,7 +309,7 @@ def test_the_nv_reason_ct_cards_own_document_files_as_an_ai_draft_with_every_fin
     values = dxreport.build_values(parsed, json.dumps(doc), FACTS, "urn:xnatworks:card:nv-reason-ct", "n")
     assert (values["report_kind"], values["report_status"], values["category"], values["code"]) == ("AI_DRAFT", "preliminary", "RAD", "68604-8")
     assert values["device_name"] == "NVIDIA NV-Reason-CT" and values["device_version"] == "386b93e034983f6c1fc841a43833a1b6a0cd9c13"
-    assert values["label"] == "HB0004_1_RPT_nvreasonct_" + doc["id"]
+    assert values["label"] == "HB0004_1_RPT_nv-reason-ct_" + doc["id"]
     assert len(values["findings"]) == 13 and values["findings"][-1]["display"] == "Direct question"
     assert values["conclusion"].startswith("1. Probable pulmonary emboli.") and "Research and education use only" in values["conclusion"]
     assert values["narrative"].startswith("TECHNIQUE: IV contrast CT.") and "</think>" not in values["narrative"]
@@ -326,9 +329,9 @@ def test_a_number_too_large_for_a_float_is_left_off_not_raised(tmp_path, xnat, c
 def test_report_ids_the_label_cannot_spell_as_they_are_stay_distinct():
     labels = {rid: dxreport.record_label("HB0004_1", "urn:xnatworks:card:nv-reason-ct", rid) for rid in ("a-b", "a.b", "a_b", "ab")}
     assert len(set(labels.values())) == 4, labels
-    assert labels["ab"] == "HB0004_1_RPT_nvreasonct_ab", "letters and digits are carried as they are"
-    assert labels["a-b"] == "HB0004_1_RPT_nvreasonct_a-b", "a hyphen is a label character: carried as it is"
-    assert re.fullmatch(r"HB0004_1_RPT_nvreasonct_a_b_[0-9a-f]{8}", labels["a.b"]), "rewritten, with a hash of the real id"
+    assert labels["ab"] == "HB0004_1_RPT_nv-reason-ct_ab", "letters and digits are carried as they are"
+    assert labels["a-b"] == "HB0004_1_RPT_nv-reason-ct_a-b", "a hyphen is a label character: carried as it is"
+    assert re.fullmatch(r"HB0004_1_RPT_nv-reason-ct_a_b_[0-9a-f]{8}", labels["a.b"]), "rewritten, with a hash of the real id"
     # a UUID's readable prefix and hash would make the end over half the label: the id is hashed whole instead
     uuids = [dxreport.record_label("HB0004_1", "urn:x:card", u) for u in ("3fa85f64-5717-4562-b3fc-2c963f66afa6",
                                                                           "3fa85f64-5717-4562-b3fc-2c963f66afa7")]
@@ -346,7 +349,7 @@ def test_a_label_holding_another_report_is_a_collision_not_already_filed(tmp_pat
     xnat["probe"] = 200
     xnat["there"] = {"source_id": "something-else", "source_system": "urn:xnatworks:card:nv-reason-ct"}
     out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
-    assert out == {"error": "label HB0004_1_RPT_nvreasonct_3f2a9c1d0b7e4a65 is taken by report 'something-else' from "
+    assert out == {"error": "label HB0004_1_RPT_nv-reason-ct_3f2a9c1d0b7e4a65 is taken by report 'something-else' from "
                             "'urn:xnatworks:card:nv-reason-ct'"}
     assert xnat["published"] == [] and "not filed" in caplog.text
 
@@ -408,3 +411,54 @@ def test_an_id_longer_than_the_column_still_finds_its_own_record(tmp_path, xnat)
     out = dxreport.publish_diagnostic_report(context(), written(tmp_path, card_report(id=long_id)), "raw", "diagnostic_report.json",
                                              "SUCCEEDED", CONTRACT)
     assert out["exists"] is True
+
+
+
+# ── Codex round 4 on PR #23, and container-workshop PR #65 (Device is no performer) ──
+def hoppr_shaped(**overrides):
+    """A report shaped as HOPPR's and the NV-Reason-CT card's (0.6.0): no performer, the model a contained
+    Device that every finding names as its ``device``, which is where FHIR R5 puts it."""
+    doc = card_report(**overrides)
+    if "performer" not in overrides:
+        doc.pop("performer")
+    for item in doc["contained"]:
+        if item["resourceType"] == "Observation":
+            item["device"] = {"reference": "#model"}
+    return doc
+
+
+def test_the_device_the_findings_name_is_the_author_without_a_performer():
+    parsed = dxreport.parse(hoppr_shaped())
+    assert (parsed["performer"], parsed["device_name"], dxreport.report_kind(parsed)) == (None, "NVIDIA NV-Reason-CT", "AI_DRAFT")
+    # control: the same document with its findings naming no device and no performer is a human draft
+    doc = hoppr_shaped()
+    for item in doc["contained"]:
+        item.pop("device", None)
+    assert dxreport.report_kind(dxreport.parse(doc)) == "HUMAN_DRAFT"
+    # a human performer beside the model's findings: the person signs, the model is still named
+    signed = dxreport.parse(hoppr_shaped(performer=[{"display": "Dr Example"}], status="final"))
+    assert (dxreport.report_kind(signed), signed["device_name"]) == ("FINAL_SIGNED", "NVIDIA NV-Reason-CT")
+
+
+def test_distinct_cards_never_share_a_label():
+    labels = {card: dxreport.record_label("HB0004_1", "urn:xnatworks:card:" + card, "r1")
+              for card in ("a-b", "ab", "a.b", "very-long-card-name-one", "very-long-card-name-two")}
+    assert len(set(labels.values())) == 5, labels
+    assert labels["a-b"] == "HB0004_1_RPT_a-b_r1" and labels["ab"] == "HB0004_1_RPT_ab_r1"
+    assert all(len(label) <= dxreport.LABEL_MAX for label in labels.values())
+
+
+def test_a_create_race_on_the_same_report_is_already_filed_and_on_another_a_collision(tmp_path, xnat):
+    xnat["conflict"] = True
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out == {"xsi_type": "dxreport:sessionReportData", "label": "HB0004_1_RPT_nv-reason-ct_3f2a9c1d0b7e4a65", "exists": True,
+                   "source_id": "3f2a9c1d0b7e4a65"}
+    xnat["there"] = {"source_id": "other", "source_system": "urn:xnatworks:card:nv-reason-ct"}
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out["error"].startswith("label HB0004_1_RPT_nv-reason-ct_3f2a9c1d0b7e4a65 is taken by report 'other'")
+    assert xnat["published"] == []
+
+
+def test_the_report_is_created_without_the_random_suffix_retry(tmp_path, xnat):
+    dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert xnat["published"][0]["retry_on_conflict"] is False

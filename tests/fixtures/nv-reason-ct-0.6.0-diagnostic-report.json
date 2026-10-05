@@ -1,6 +1,6 @@
 {
   "resourceType": "DiagnosticReport",
-  "id": "ca5eb7145fceac76",
+  "id": "a9a921877f062b0d",
   "meta": {
     "versionId": "1",
     "tag": [
@@ -231,12 +231,7 @@
       }
     ]
   },
-  "issued": "2026-10-05T14:35:05Z",
-  "performer": [
-    {
-      "reference": "#model"
-    }
-  ],
+  "issued": "2026-10-05T15:12:00Z",
   "result": [
     {
       "reference": "#finding-1"

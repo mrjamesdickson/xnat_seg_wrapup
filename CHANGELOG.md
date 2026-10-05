@@ -10,7 +10,7 @@ report", "it would be a great demo piece").
   record of a run that succeeded, proc-wrapup files it as a `dxreport:sessionReportData` on the
   session: the datatype and mapping of the FHIR report poller (`DiagnosticReportParser`,
   `DxReportRecordMapper`), with the label `<session>_RPT_<card>_<report id>`, `source_system`
-  `urn:xnatworks:card:<card id>`, `AI_DRAFT` when the performer is the contained Device, the
+  `urn:xnatworks:card:<card id>`, `AI_DRAFT` when the findings name a contained Device as their source, the
   session's own accession, UID, modality and subject label, the findings the report references,
   and the document itself on `REPORT`. It is create-only: an existing label is left alone. It
   never raises, and every outcome is in `wrapup.json` under `diagnostic_report`. Values the
@@ -24,7 +24,10 @@ report", "it would be a great demo piece").
   different report is a collision, not "already filed"; an unnamed Device the performer
   references still makes an AI draft. Round 3: a truncated XNAT answer and a document
   nested past the recursion limit are outcomes; session labels that rewrite alike get a hash;
-  hyphens stay in labels. Every value is held to its column (255 characters for a plain string,
+  hyphens stay in labels. Round 4: the card id is in the label as it is (hashed when long or
+  unspellable); a create race re-reads the label instead of retrying under a random one
+  (`publish_record(retry_on_conflict=False)`); and, with container-workshop PR #65, the AI author is
+  the Device the findings name, where FHIR R5 puts it, not a Device performer. Every value is held to its column (255 characters for a plain string,
   single-precision floats, 32-bit ints), and the REPORT file name cannot carry a separator.
 - Image tags 0.7.2 (seg-wrapup, proc-wrapup, record-fetch).
 

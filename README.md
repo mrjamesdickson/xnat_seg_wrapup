@@ -416,10 +416,10 @@ record the FHIR report poller makes for a report a vendor sends, so a card's dra
 vendor's report sit side by side on the session page and read the same way.
 
 The record is labelled `<session label>_RPT_<card>_<report id>`, the poller's naming, for
-example `HB0004_1_RPT_nvreasonct_3f2a9c1d0b7e4a65`. A label over 64 characters keeps that end
+example `HB0004_1_RPT_nv-reason-ct_3f2a9c1d0b7e4a65`. A label over 64 characters keeps that end
 and shortens the session label. Its `source_system` is
-`urn:xnatworks:card:<card id>`. Its `report_kind` is `AI_DRAFT` when a performer references a
-contained `Device` (the model) and no person is named. The record names the archived session:
+`urn:xnatworks:card:<card id>`. Its `report_kind` is `AI_DRAFT` when the findings name a
+contained `Device` (the model) as their source and no person is named. The record names the archived session:
 its project, its accession, its `UID` as the study instance UID, its modality, and the subject's
 label as the pseudonym. It does not take any of these from what the document says about itself.
 The findings come from the `Observation`s the report's `result` references, the conclusion and
@@ -430,8 +430,8 @@ resource as `diagnosticreport-<id>-v<version>.json`. `wrapup.json` carries the o
 A worked example, the NV-Reason-CT card (0.6.0 and later): its tool answers a question about a
 chest CT and writes `diagnostic_report.json`, with the model's report text as a base64
 `presentedForm`, each organ section and the direct answer as an `Observation`, and the model
-as a contained `Device`. The session then shows the run record (`analysis:sessionAnalysisData`)
-and, beside it, `HB0004_1_RPT_nvreasonct_<id>` with the conclusion, the findings and
+as a contained `Device` that every finding names. The session then shows the run record
+(`analysis:sessionAnalysisData`) and, beside it, `HB0004_1_RPT_nv-reason-ct_<id>` with the conclusion, the findings and
 `AI_DRAFT`.
 
 What it does not do: file a report from a run that did not succeed, from a subject- or

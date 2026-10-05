@@ -817,6 +817,21 @@ def test_create_409_twice_is_reported_not_looped(xnat, tmp_path):
     assert len([c for c in handler.calls if c["method"] == "PUT"]) == 2
 
 
+
+def test_create_409_without_a_retry_is_raised_for_a_caller_whose_label_is_its_identity(xnat, tmp_path):
+    """A diagnostic report's label is its identity (segwrapup.dxreport): a random suffix would file the
+    same report twice, so that caller takes the 409 itself (Codex P2, PR #23)."""
+    from segwrapup import publish
+    host, handler = xnat
+    handler.conflict_labels = {"S_RPT_card_r1"}
+    out = tmp_path / "out"; out.mkdir(); (out / "report.html").write_text("<p>r</p>")
+    context = XnatContext(host=host, user="u", password="p", project="P", session="XNAT_E00018", scan="2")
+    xml = '<dxreport:SessionReport xmlns:dxreport="x" project="P" label="S_RPT_card_r1"></dxreport:SessionReport>'
+    with pytest.raises(RuntimeError, match="HTTP 409"):
+        publish.publish_record(context, "S_RPT_card_r1", xml, {"REPORT": [out / "report.html"]}, output_dir=out,
+                               xsi_type="dxreport:sessionReportData", retry_on_conflict=False)
+    assert len([c for c in handler.calls if c["method"] == "PUT"]) == 1, "no second create under another label"
+
 # ── subject scope (0.6.2) ───────────────────────────────────────────────────────
 
 def _subject_context(host):

@@ -36,14 +36,17 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   digest, the region and the prompts). The label is built from it, and a label that already exists
   is taken as "this report is already filed" (probe 200 → `{"exists": true}`), which is what makes
   a rerun idempotent. A random id would file a fresh record on every rerun.
-- The model is a contained `Device` **that a performer entry references**. Such a performer is not
-  a person, even with a display, and the record's `device_name`/`device_version` come from that
-  Device. Without the first rule the poller's "performer present means human" test would make
-  every card report a `HUMAN_DRAFT`. Without the second, any contained Device (a scanner, say)
-  would make a human's draft an `AI_DRAFT` (Codex P1, PR #23). This is stricter than the poller
-  as ported, which takes the first contained Device. A vendor report filed by the poller and the
-  same document filed here can differ in `report_kind` only when the report carries a Device that
-  no performer names.
+- The model is a contained `Device` **that the findings name as their `device`**, with no performer
+  for it. FHIR R5 allows only people and organisations as a report's `performer` (Codex P2,
+  container-workshop PR #65), and HOPPR's report has this shape. A Device a performer entry
+  references is tolerated as the author too, and such a performer is not a person even with a
+  display. The record's `device_name`/`device_version` come from that Device. A contained Device
+  that nothing points at (a scanner, say) does not make a human's draft an `AI_DRAFT` (Codex P1,
+  PR #23). This is stricter than the poller as ported, which takes the first contained Device. A
+  vendor report filed by the poller and the same document filed here can differ in `report_kind`
+  only when the report carries a Device that neither a finding nor a performer names. The limit:
+  a finding whose `device` is the scanner (FHIR allows that for a measurement) reads as the
+  model's.
 
 ## What the record holds, and where each value comes from
 
@@ -52,7 +55,7 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
 | project, `imageSession_ID`, label prefix | the archived session (`GET /data/experiments/<id>`), never the document |
 | `study_instance_uid`, `modality` | the session's `UID` and `modality`. The document's own `ImagingStudy` UID is the fallback only |
 | `pseudonym` | the subject's label (`GET /data/subjects/<id>`), as the poller records it |
-| `source_system` | `urn:xnatworks:card:<card id>` (its tail, `nvreasonct`, is in the label) |
+| `source_system` | `urn:xnatworks:card:<card id>` (the card id, `nv-reason-ct`, is in the label) |
 | `source_id`, `source_version` | the report's `id`, `meta.versionId` (default `1`) |
 | `report_kind` | `AI_DRAFT` / `FINAL_SIGNED` / `HUMAN_DRAFT` (the poller's rule, with the Device exception above) |
 | `conclusion`, `narrative` | `conclusion`. The first base64 `presentedForm`, else the untagged `text.div` |
@@ -94,9 +97,21 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   finds.** A 200 is "already filed" only when that record's `source_id` and `source_system` are
   this report's. Any other record there is a collision, reported as an `error`, never a report
   silently dropped (Codex P1, PR #23).
-- **A Device the performer references is the author whether or not it is named.** FHIR leaves
-  `Device.name` optional, so the AI test is "a performer references a contained Device", not "the
+- **A Device the findings or a performer name is the author whether or not it is named.** FHIR
+  leaves `Device.name` optional, so the AI test is "a contained Device is pointed at", not "the
   record has a device name" (Codex P2, PR #23).
+- **The card is in the label as it is**, not as the poller's first 12 alphanumerics: `a-b` and `ab`
+  were one label, and the second card's report a collision it could never file (Codex P2, PR #23).
+  A card id over 16 characters, or one the label cannot spell, is shortened with a hash of the
+  source. So the label reads `HB0004_1_RPT_nv-reason-ct_<id>`, where the poller would write
+  `nvreasonct`.
+- **A create race is not retried under a random label.** Two wrapups filing the same report at once
+  both see the label free. The second create gets a 409, and the generic publisher would retry
+  under a random suffix and file the report twice. `publish_record(retry_on_conflict=False)` hands
+  the 409 back, and the record under the label is read as on a probe: the same report is
+  `exists`, another is a collision (Codex P2, PR #23). A race on the same session is narrower.
+  There XNAT answers the second PUT as an update of the record the first just made, which the
+  create-only publisher cannot rule out.
 - **JSON numbers can be too large for a float** (thousands of digits). Such a value is left off the
   finding with a warning instead of raising `OverflowError` (Codex P1, PR #23).
 - **A character XML 1.0 forbids** (`json.loads` accepts `"\u0001"`) is written as its escape

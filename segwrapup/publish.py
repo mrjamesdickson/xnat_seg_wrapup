@@ -772,7 +772,7 @@ def _relabel(xml: str, label: str) -> str:
 
 def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, list],
                    timeout_seconds: float = 300.0, output_dir: Path | None = None, xsi_type: str | None = None,
-                   generated_label: bool = False) -> dict:
+                   generated_label: bool = False, retry_on_conflict: bool = True) -> dict:
     """Create the record, then upload each role's files to its ``out`` resource. Raises RuntimeError.
 
     Create-only, enforced twice: a label that already exists on the session is refused before
@@ -808,7 +808,9 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     try:
         status, text = _put(context, create_url, xml.encode(), "application/xml", timeout_seconds)
     except RuntimeError as error:
-        if "HTTP 409" not in str(error):
+        if "HTTP 409" not in str(error) or not retry_on_conflict:
+            # a caller whose label is its identity (a diagnostic report, segwrapup.dxreport) takes the
+            # 409 itself: a random suffix would file the same report twice (Codex P2, PR #23)
             raise
         # Labels are unique per project: another session's run of the same pipeline claimed
         # this one in the same second (the per-session probe above cannot see it). One retry
