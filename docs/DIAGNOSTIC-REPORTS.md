@@ -125,6 +125,12 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   failed upload would remove the record the other run filed (Codex P2, PR #23). The limit: the PUT
   has already rewritten that record's fields with this run's values. For the same report these
   are the same but for `issued`, and XNAT offers no conditional create to prevent it.
+- **A taken label is not yet a filed report.** The run that took it uploads the document next, and
+  deletes the record again if that fails. So a run that finds the label taken, by its probe or by a
+  race, waits up to 60 s (`SETTLE_WAIT_SECONDS`) for the document on `REPORT`. There: `exists`.
+  The record gone: its creator rolled back, and this run files the report itself, at most once
+  more. Still bare after the wait: an `error`, never a claim that the report is filed (Codex P2,
+  PR #23).
 - **JSON numbers can be too large for a float** (thousands of digits). Such a value is left off the
   finding with a warning instead of raising `OverflowError` (Codex P1, PR #23).
 - **A character XML 1.0 forbids** (`json.loads` accepts `"\u0001"`) is written as its escape

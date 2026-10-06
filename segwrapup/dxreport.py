@@ -23,8 +23,10 @@ import json
 import logging
 import math
 import re
+import time
 import urllib.error
 import urllib.parse
+from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from xml.sax.saxutils import escape
 
@@ -368,7 +370,23 @@ def _clip(value: str | None, limit: int, what: str) -> str | None:
 
 
 def _when(value: str | None, what: str) -> str | None:
-    if value and not DATETIME.match(value):
+    """A date-time the record's xs:dateTime column takes, else None with a warning. The shape is not enough:
+    2026-02-30, month 99 or an offset past 14 hours fail the whole create, so the calendar and the zone are
+    checked too (Codex P2, PR #23)."""
+    if not value:
+        return value
+    valid = bool(DATETIME.match(value))
+    if valid:
+        try:
+            # fromisoformat takes at most six fraction digits on older Pythons; the precision past them is not checked
+            moment = datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", value).replace("Z", "+00:00"))
+            # fromisoformat takes minutes past 59 in an offset (+05:75); xs:dateTime does not
+            zone = re.search(r"[+-](\d{2}):(\d{2})$", value)
+            valid = (moment.utcoffset() is None or abs(moment.utcoffset()) <= timedelta(hours=14)) and \
+                not (zone and int(zone.group(2)) > 59)
+        except ValueError:
+            valid = False
+    if not valid:
         logger.warning("%s %r is not a date-time the record can hold; left off", what, value)
         return None
     return value
@@ -468,20 +486,52 @@ def declared_path(output_dir: Path, derived_root: str | None, declared: str) -> 
     return root.joinpath(*relative.parts)
 
 
-def _existing(context: XnatContext, label_url: str, label: str, values: dict, timeout_seconds: float, race: bool = False) -> dict:
-    """The outcome when the label is already taken. The report id is the card's, deterministic for the
-    same inputs, so the same report is already filed, but only if the record there says so: a label
-    is a lossy spelling of the identity, and a different report under it is a collision to report, not
-    a report to drop (Codex P1, PR #23). Compared as the record holds them (cut to the column). Raises
-    what the read raises."""
-    there = _get_json(context, f"{label_url}?format=json", min(timeout_seconds, 60.0))["items"][0]["data_fields"]
-    if (there.get("source_id"), there.get("source_system")) != (values["source_id"], values["source_system"]):
-        logger.error("label %s on session %s holds report %r from %r, not %r from %r; not filed", label, context.session,
-                     there.get("source_id"), there.get("source_system"), values["source_id"], values["source_system"])
-        return {"error": f"label {label} is taken by report {there.get('source_id')!r} from {there.get('source_system')!r}"}
-    logger.info("diagnostic report %s already on session %s%s; not filed twice", label, context.session,
-                " (filed by a concurrent run)" if race else "")
-    return {"xsi_type": XSI_TYPE, "label": label, "exists": True, "source_id": values["source_id"]}
+#: How long a run that finds its report's label taken waits for the run that took it to upload the document.
+SETTLE_WAIT_SECONDS = 60.0
+SETTLE_POLL_SECONDS = 3.0
+
+
+def _settled(context: XnatContext, label: str, values: dict, timeout_seconds: float, race: bool = False) -> dict | None:
+    """The outcome when the label is already taken, or None when the record under it has gone.
+
+    The report id is the card's, deterministic for the same inputs, so the same report is already filed,
+    but only if the record there says so: a label is a lossy spelling of the identity, and a different
+    report under it is a collision to report, not a report to drop (Codex P1, PR #23). Compared as the
+    record holds them (cut to the column). And a taken label is not yet a filed report: the run that took
+    it uploads the document afterwards, and deletes the record again if that fails (Codex P2, PR #23).
+    So this waits, up to SETTLE_WAIT_SECONDS, for the document on REPORT: there, the report is filed; the
+    record gone (404), None, and the caller files it; neither in time, an error outcome. Raises what the
+    reads raise."""
+    label_url, files_base = record_urls(context, label)
+    deadline = time.monotonic() + SETTLE_WAIT_SECONDS
+    compared = False
+    while True:
+        status = _request(context, "GET", f"{label_url}?format=json", min(timeout_seconds, 60.0))
+        if status == 404:
+            logger.warning("the record under %s on session %s is gone: the run that created it rolled it back; this run files the report",
+                           label, context.session)
+            return None
+        if status != 200:
+            raise RuntimeError(f"could not read the record under label {label}: HTTP {status}")
+        if not compared:
+            there = _get_json(context, f"{label_url}?format=json", min(timeout_seconds, 60.0))["items"][0]["data_fields"]
+            if (there.get("source_id"), there.get("source_system")) != (values["source_id"], values["source_system"]):
+                logger.error("label %s on session %s holds report %r from %r, not %r from %r; not filed", label, context.session,
+                             there.get("source_id"), there.get("source_system"), values["source_id"], values["source_system"])
+                return {"error": f"label {label} is taken by report {there.get('source_id')!r} from {there.get('source_system')!r}"}
+            compared = True
+        listing = _get_json(context, f"{files_base}/{REPORT_ROLE}/files?format=json", min(timeout_seconds, 60.0))
+        if (listing.get("ResultSet") or {}).get("Result"):
+            logger.info("diagnostic report %s already on session %s%s; not filed twice", label, context.session,
+                        " (filed by a concurrent run)" if race else "")
+            return {"xsi_type": XSI_TYPE, "label": label, "exists": True, "source_id": values["source_id"]}
+        if time.monotonic() >= deadline:
+            logger.error("label %s on session %s holds this report without its %s document after %.0f s; not counted as filed",
+                         label, context.session, REPORT_ROLE, SETTLE_WAIT_SECONDS)
+            return {"error": f"label {label} holds this report without its {REPORT_ROLE} document after {SETTLE_WAIT_SECONDS:.0f} s: "
+                             "another run is still filing it or left it incomplete"}
+        logger.info("label %s holds this report but not yet its document; waiting for the run filing it", label)
+        time.sleep(SETTLE_POLL_SECONDS)
 
 
 def publish_diagnostic_report(context: XnatContext | None, output_dir: Path, derived_root: str | None, declared: str,
@@ -520,22 +570,33 @@ def publish_diagnostic_report(context: XnatContext | None, output_dir: Path, der
         label_url, _ = record_urls(context, label)
         probe = _request(context, "GET", f"{label_url}?format=json", min(timeout_seconds, 60.0))
         if probe == 200:
-            return _existing(context, label_url, label, values, timeout_seconds)
+            settled = _settled(context, label, values, timeout_seconds)
+            if settled is not None:
+                return settled
         xml = build_record_xml(values)
         # both parts sanitised: the name is a path on the record, so a versionId of "1/../x" must not make it one
         name = "diagnosticreport-%s-v%s.json" % tuple(re.sub(r"[^A-Za-z0-9_.-]+", "_", part).strip(".") or "_"
                                                       for part in (parsed["id"], values["source_version"]))
-        try:
-            outcome = publish_record(context, label, xml, {REPORT_ROLE: [RecordFile(path, name)]}, timeout_seconds=timeout_seconds,
-                                     xsi_type=XSI_TYPE, retry_on_conflict=False)
-        except RuntimeError as error:
-            # another wrapup filed a report under this label after the probe above: publish_record's own
-            # probe sees it ("already exists") or its create gets a 409. Either way the record there is
-            # read: the same report (a concurrent rerun) is already filed, anything else is a collision.
-            # Never a second record under a random label (Codex P2 x2, PR #23)
-            if "HTTP 409" not in str(error) and f"label {label} already exists" not in str(error):
-                raise
-            return _existing(context, label_url, label, values, timeout_seconds, race=True)
+        for attempt in (1, 2):
+            try:
+                outcome = publish_record(context, label, xml, {REPORT_ROLE: [RecordFile(path, name)]}, timeout_seconds=timeout_seconds,
+                                         xsi_type=XSI_TYPE, retry_on_conflict=False)
+                break
+            except RuntimeError as error:
+                # another wrapup filed a report under this label after the probe above: publish_record's own
+                # probe sees it ("already exists"), its create gets a 409, or XNAT answers it as an update.
+                # The record there is read and awaited: the same report, once its document is there, is
+                # already filed; anything else is a collision; gone again (its creator rolled back), this
+                # run files it, once more at most. Never a second record under a random label (Codex P2 x3, PR #23)
+                if "HTTP 409" not in str(error) and f"label {label} already exists" not in str(error):
+                    raise
+                settled = _settled(context, label, values, timeout_seconds, race=True)
+                if settled is not None:
+                    return settled
+                if attempt == 2:
+                    logger.error("label %s on session %s was taken and given up twice while this run filed it; not filed",
+                                 label, context.session)
+                    return {"error": f"label {label} was taken and released twice by other runs while this one filed it"}
     except (RuntimeError, urllib.error.URLError, http.client.HTTPException, OSError, KeyError, IndexError, TypeError, ValueError,
             AttributeError, ArithmeticError) as error:
         # http.client.HTTPException: a truncated XNAT answer raises IncompleteRead, which is not an OSError (Codex P1, PR #23)

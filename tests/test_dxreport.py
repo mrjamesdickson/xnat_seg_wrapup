@@ -190,17 +190,28 @@ def written(tmp_path, doc=None):
 
 @pytest.fixture
 def xnat(monkeypatch):
-    calls = {"published": [], "probe": 404,
+    calls = {"published": [], "probe": 404, "probes": [], "sleeps": [],
              # what a record already under the label says about itself, read when the probe finds one
-             "there": {"source_id": "3f2a9c1d0b7e4a65", "source_system": "urn:xnatworks:card:nv-reason-ct"}}
+             "there": {"source_id": "3f2a9c1d0b7e4a65", "source_system": "urn:xnatworks:card:nv-reason-ct"},
+             # its REPORT listing: the document is there unless a test says otherwise ("listings" first, in order)
+             "files": [{"Name": "diagnosticreport-3f2a9c1d0b7e4a65-v1.json"}], "listings": []}
     monkeypatch.setattr(dxreport, "fetch_session_facts", lambda ctx, timeout: dict(FACTS))
-    monkeypatch.setattr(dxreport, "_request", lambda ctx, method, url, timeout: calls["probe"])
-    monkeypatch.setattr(dxreport, "_get_json", lambda ctx, url, timeout: {"items": [{"data_fields": calls["there"]}]})
+    monkeypatch.setattr(dxreport, "_request", lambda ctx, method, url, timeout: calls["probes"].pop(0) if calls["probes"] else calls["probe"])
+
+    def get_json(ctx, url, timeout):
+        if "/files?" in url:
+            return {"ResultSet": {"Result": calls["listings"].pop(0) if calls["listings"] else calls["files"]}}
+        return {"items": [{"data_fields": calls["there"]}]}
+    monkeypatch.setattr(dxreport, "_get_json", get_json)
+    monkeypatch.setattr(dxreport, "SETTLE_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(dxreport.time, "sleep", lambda seconds: calls["sleeps"].append(seconds))
 
     def publish(ctx, label, xml, files, timeout_seconds=300.0, xsi_type=None, retry_on_conflict=True):
         if calls.get("conflict"):
+            calls["probe"] = 200                     # the other run's record is under the label now
             raise RuntimeError("PUT %s failed: HTTP 409 Conflict" % label)
         if calls.get("inner_probe_taken"):           # publish_record's own message for a label its probe finds
+            calls["probe"] = 200
             raise RuntimeError(f"label {label} already exists on session {ctx.session}; the record is create-only, "
                                "pass a fresh --record-label or let the run stamp one")
         calls["published"].append({"label": label, "xml": xml, "files": files, "xsi_type": xsi_type,
@@ -590,4 +601,60 @@ def test_wrapped_base64_is_decoded_and_other_junk_is_still_refused(caplog):
     plain = {"contentType": "text/plain", "data": base64.b64encode(b"Next.").decode()}
     assert dxreport.parse(card_report(presentedForm=[junk, plain]))["narrative"] == "Next."
     assert "not base64" in caplog.text
+
+
+# ── Codex round 12 on PR #23 ───────────────────────────────────────────────────
+def test_a_raced_record_counts_as_filed_only_once_its_document_is_there(tmp_path, xnat):
+    """The run that took the label uploads afterwards; until the document is on REPORT this run waits."""
+    xnat["conflict"] = True
+    xnat["listings"] = [[], []]                       # twice not yet, then the document
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out["exists"] is True and len(xnat["sleeps"]) == 2
+
+
+def test_a_raced_record_its_creator_rolls_back_is_filed_by_this_run(tmp_path, xnat):
+    """Codex P2, PR #23: the winner's upload failed and it deleted the record; the loser had reported it filed."""
+    calls = xnat
+    attempts = []
+
+    def publish(ctx, label, xml, files, timeout_seconds=300.0, xsi_type=None, retry_on_conflict=True):
+        attempts.append(label)
+        if len(attempts) == 1:
+            calls["probes"] = [404]                   # re-read after the 409: the creator has rolled it back
+            raise RuntimeError("PUT %s failed: HTTP 409 Conflict" % label)
+        calls["published"].append({"label": label})
+        return {"id": "XNAT_E99999", "label": label}
+    dxreport.publish_record, original = publish, dxreport.publish_record
+    try:
+        out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    finally:
+        dxreport.publish_record = original
+    assert out["id"] == "XNAT_E99999" and len(attempts) == 2 and len(calls["published"]) == 1
+
+
+def test_a_raced_record_that_never_gets_its_document_is_an_error_not_filed(tmp_path, xnat):
+    xnat["conflict"] = True
+    xnat["files"] = []                               # the other run never uploads
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert "without its REPORT document" in out["error"] and "exists" not in out
+
+
+def test_an_existing_record_without_its_document_is_awaited_too(tmp_path, xnat):
+    """Control for the plain probe: a record found before any create is also checked for its document."""
+    xnat["probe"] = 200
+    xnat["listings"] = [[]]
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out["exists"] is True and xnat["published"] == [] and len(xnat["sleeps"]) == 1
+
+
+@pytest.mark.parametrize("value", ["2026-02-30T12:00:00Z", "2026-99-01T12:00:00Z", "2026-01-01T25:00:00Z",
+                                   "2026-01-01T12:00:00+15:00", "2026-01-01T12:00:00+05:75", "2026-01-01T12:00:60Z"])
+def test_a_date_time_off_the_calendar_or_zone_is_left_off(value, caplog):
+    assert dxreport._when(value, "issued") is None and "not a date-time" in caplog.text
+
+
+@pytest.mark.parametrize("value", ["2026-02-28T12:00:00Z", "2024-02-29T23:59:59.1234567-14:00", "2026-01-01T00:00+14:00",
+                                   "2026-01-01T12:00:00"])
+def test_a_real_date_time_is_kept(value):
+    assert dxreport._when(value, "issued") == value
 
