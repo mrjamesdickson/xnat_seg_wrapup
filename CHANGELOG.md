@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.3 (2026-10-06)
+
+A session's existing record is found by its label (Codex P2 on PR #24 led to it).
+
+- **XNAT never found a session's assessor by label, so create-only did not hold at session scope.**
+  `GET /data/experiments/<session>/assessors/<label>` answers 404 for a record that exists:
+  `ExptAssessmentResource` looks a label up only when the URL names a project, and no project
+  route reaches a session's assessors without the subject (demo02, 2026-10-06; the resources under
+  that URL answer 500). So the existence probe has always answered "free" at session scope: a
+  reused `--record-label` was updated in place and had files uploaded into it, and a rerun of a
+  diagnostic report updated the filed record twice and ended as an error instead of `exists`.
+  Nothing was deleted or duplicated. `publish.find_record` now looks the label up in the session's
+  assessor listing (`/data/experiments/<session>/assessors`) and addresses what it finds by
+  accession id; `publish_record`'s probe and the diagnostic report's probe and settle wait use it.
+  Subject and dataset labels keep their project URLs, where the lookup works.
+- **A failed `REPORT` listing during the settle wait is not taken for a rollback** (Codex P2, PR
+  #24). A resource not made yet may answer 404, and a deleted record's files answer 500. The wait
+  looks the record up again; one that stays and never lists its document is the `error` outcome,
+  with the listing's last status.
+- Image tags 0.7.3 (seg-wrapup, proc-wrapup, record-fetch).
+
 ## 0.7.2 (2026-10-05)
 
 Cards can file a diagnostic report (James, 2026-10-05: "I thought nv-reason-ct 0.5.0 created a

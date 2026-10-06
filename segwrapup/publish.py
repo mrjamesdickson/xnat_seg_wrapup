@@ -44,7 +44,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from . import __version__
-from .execution import is_reserved
+from .execution import _get_json, is_reserved
 from .register import (LABEL_MAX, XnatContext, auth_headers, collection_label, fetch_dataset_facts, fetch_target_label,
                        list_subject_sessions)
 
@@ -100,6 +100,42 @@ def record_urls(context: XnatContext, name: str, by_id: bool = False) -> tuple[s
     session = urllib.parse.quote(context.session, safe="")
     url = f"{context.host}/data/experiments/{session}/assessors/{quoted}"
     return url, f"{url}/out/resources"
+
+
+def find_record(context: XnatContext, label: str, timeout_seconds: float = 60.0) -> tuple[int, str, str]:
+    """``(status, object_url, files_base)`` of the record under ``label``: 200 with its URLs when one
+    exists, 404 and empty URLs when none does, or the failing HTTP status. Raises RuntimeError when
+    XNAT does not answer.
+
+    At session scope XNAT never finds an assessor by label under
+    ``/data/experiments/<session>/assessors/<label>``: ExptAssessmentResource looks a label up only
+    when the URL names a project, and no project route reaches a session's assessors without its
+    subject. That URL answers 404 for a record that exists, and its resources answer 500 (demo02,
+    2026-10-06). The session's assessor listing names every assessor with its label and id, and a
+    record found there is addressed by id, which resolves without a project. Subject and dataset
+    labels are reached under the project, where the label lookup works."""
+    if context.scope != "session":
+        url, files_base = record_urls(context, label)
+        status = _request(context, "GET", f"{url}?format=json", timeout_seconds)
+        return (status, url, files_base) if status == 200 else (status, "", "")
+    listing_url = f"{context.host}/data/experiments/{urllib.parse.quote(context.session, safe='')}/assessors?format=json"
+    try:
+        rows = _get_json(context, listing_url, timeout_seconds)["ResultSet"]["Result"]
+    except urllib.error.HTTPError as error:
+        return error.code, "", ""
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as error:
+        # ValueError: an answer that is not JSON; KeyError/TypeError: JSON without the ResultSet
+        raise RuntimeError(f"GET {listing_url.split('?')[0]} failed: {type(error).__name__}: {error}") from error
+    if not isinstance(rows, list):   # a listing that lists nothing readable must not read as "the label is free"
+        raise RuntimeError(f"GET {listing_url.split('?')[0]} answered a ResultSet without a list of assessors")
+    matches = [row for row in rows if isinstance(row, dict) and row.get("label") == label]
+    if not matches:
+        return 404, "", ""
+    record_id = str(matches[0].get("ID") or "")
+    if not record_id:
+        raise RuntimeError(f"the assessor listing of session {context.session} names label {label} without its id")
+    url, files_base = record_urls(context, record_id, by_id=True)
+    return 200, url, files_base
 
 
 def created_record_id(response_text: str) -> str:
@@ -785,8 +821,8 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
     """
     files = _record_files(files, output_dir)
     xsi_type = xsi_type or xsi_type_for(context)   # a caller may publish another project asset (a trained model) at dataset scope
-    label_url, _ = record_urls(context, label)
-    probe = _request(context, "GET", f"{label_url}?format=json", timeout_seconds)
+    label_url, _ = record_urls(context, label)   # the create URL: a PUT by label, which XNAT resolves from the document
+    probe, _, _ = find_record(context, label, timeout_seconds)
     if probe == 200 and generated_label:
         # A label the wrapup stamped itself, taken by another run of the same pipeline on the same
         # owner within the same second (dataset scope has no per-session namespace): one retry with a
@@ -796,7 +832,7 @@ def publish_record(context: XnatContext, label: str, xml: str, files: dict[str, 
         logger.warning("generated label %s already exists on %s; retrying once as %s", label, context.target, retry)
         label, xml = retry, _relabel(xml, retry)
         label_url, _ = record_urls(context, label)
-        probe = _request(context, "GET", f"{label_url}?format=json", timeout_seconds)
+        probe, _, _ = find_record(context, label, timeout_seconds)
     if probe == 200:
         raise RuntimeError(f"label {label} already exists on {context.target}; the record is create-only, "
                            "pass a fresh --record-label or let the run stamp one")

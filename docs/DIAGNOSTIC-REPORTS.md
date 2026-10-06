@@ -1,4 +1,4 @@
-# Diagnostic report records (proc-wrapup 0.7.2)
+# Diagnostic report records (proc-wrapup 0.7.2; lookup by label fixed in 0.7.3)
 
 A card whose tool writes a FHIR R5 `DiagnosticReport` can have it filed on the session as a
 `dxreport:sessionReportData`. James asked for it on 2026-10-05, when NV-Reason-CT 0.5.0 turned
@@ -34,7 +34,8 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
 - The file must be a FHIR R5 `DiagnosticReport` with an `id`. **The id is the card's
   responsibility and should be deterministic** (NV-Reason-CT hashes the model revision, the input
   digest, the region and the prompts). The label is built from it, and a label that already exists
-  is taken as "this report is already filed" (probe 200 → `{"exists": true}`), which is what makes
+  is taken as "this report is already filed" (probe 200 → `{"exists": true}`; the probe looks the
+  label up in the session's assessor listing, see "XNAT cannot find a session's assessor by label"), which is what makes
   a rerun idempotent. A random id would file a fresh record on every rerun.
 - The model is a contained `Device` **that the findings name as their `device`**, with no performer
   for it. FHIR R5 allows only people and organisations as a report's `performer` (Codex P2,
@@ -130,9 +131,25 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   race, waits up to 60 s (`SETTLE_WAIT_SECONDS`) for the document on `REPORT`. There: `exists`.
   The record gone: its creator rolled back, and this run files the report itself, at most once
   more. Still bare after the wait: an `error`, never a claim that the report is filed (Codex P2,
-  PR #23). "Gone" is a 404 from any of the three reads, not only the status probe: the record
-  can be rolled back between the probe and the read of its fields or of its `REPORT` listing,
-  and that 404 is the same rollback, not an error. Any other failed read is an `error`.
+  PR #23). "Gone" is the label missing from the session's assessor listing, or a 404 when the
+  record's fields are read by id: it can be rolled back between the two. A failed `REPORT`
+  listing proves nothing either way: a resource not made yet may answer 404 (Codex P2, PR #24),
+  and a deleted record's files answer 500 on demo02. So the wait looks the record up again on its
+  next pass, and a record that stays and never lists its document ends as the `error`, with the
+  listing's last status. Any other failed read of the listing or the fields is an `error`.
+- **XNAT cannot find a session's assessor by label** (0.7.3). `GET
+  /data/experiments/<session>/assessors/<label>` answers 404 for a record that exists, and its
+  resources answer 500: `ExptAssessmentResource` resolves a label only when the URL names a
+  project, and the only project route to a session's assessors also needs the subject. Checked on
+  demo02 on 2026-10-06 against XNAT_E26409, which answered 200 by id and 404 by its label. Until
+  0.7.3 every probe here answered "free", so a rerun's create was answered as an update (200) of
+  the filed record. It uploaded nothing and deleted nothing, but it ended as an `error`, not
+  `exists`. The label is now looked up in the session's assessor listing
+  (`/data/experiments/<session>/assessors`, which names every assessor with its label and id).
+  The record it finds is read by id. `publish.find_record` does this for every session-scoped
+  record, the run record included. The rejected alternative was the label URL under
+  `/data/projects/<p>/subjects/<s>/experiments/<session>/assessors/<label>`, which needs the
+  subject id, an extra read the context does not carry.
 - **JSON numbers can be too large for a float** (thousands of digits). Such a value is left off the
   finding with a warning instead of raising `OverflowError` (Codex P1, PR #23).
 - **A character XML 1.0 forbids** (`json.loads` accepts `"\u0001"`) is written as its escape

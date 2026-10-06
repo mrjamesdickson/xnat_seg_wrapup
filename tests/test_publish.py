@@ -31,11 +31,16 @@ CONTEXT_ENV = {"XNAT_HOST": "http://x", "XNAT_USER": "alias", "XNAT_PASS": "secr
                "SEG_PROJECT": "PROJ_1", "SEG_SESSION_ID": "XNAT_E00018", "SEG_SCAN_ID": "2"}
 
 
+def _assessor_ids() -> dict:
+    """The accession id the fake gives each existing label."""
+    return {label: f"XNAT_E5{index:04d}" for index, label in enumerate(sorted(_Handler.existing_labels))}
+
+
 class _Handler(BaseHTTPRequestHandler):
     calls: list = []
     fail_paths: set = set()       # PUT to these prefixes answers 500
     fail_get_paths: set = set()   # GET of these prefixes answers 500
-    existing_labels: set = set()      # GET .../assessors/<label> answers 200 for these
+    existing_labels: set = set()      # records under these labels exist (listed by the session; 200 by id)
     get_status: int | None = None     # when set, every GET answers this instead
 
     def do_POST(self):
@@ -77,12 +82,23 @@ class _Handler(BaseHTTPRequestHandler):
                                                         {"ID": "XNAT_E9", "label": "old_record", "xsiType": "analysis:subjectAnalysisData"}]}}).encode()
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
             return
+        if self.path.split("?")[0].endswith("/assessors") and "/data/experiments/" in self.path:
+            # the session's assessor listing: every assessor with its label and id (publish.find_record)
+            if _Handler.get_status:
+                self.send_response(_Handler.get_status); self.end_headers(); return
+            rows = [{"ID": record_id, "label": label, "xsiType": "analysis:sessionAnalysisData", "project": "PROJ_1"}
+                    for label, record_id in _assessor_ids().items()] + [{"ID": "XNAT_E40000", "label": "unrelated", "project": "PROJ_1"}]
+            body = json.dumps({"ResultSet": {"Result": rows}}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+            return
         if "/assessors/" not in self.path and self.path.endswith("?format=json"):
             body = json.dumps({"items": [{"data_fields": {"label": "SUBJ01" if "/subjects/" in self.path else "SESS01"}}]}).encode()
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
             return
-        label = self.path.split("/assessors/")[-1].split("?")[0]
-        self.send_response(_Handler.get_status or (200 if label in _Handler.existing_labels else 404))
+        # /data/experiments/<session>/assessors/<name>: XNAT finds an assessor here by id only. A label needs a
+        # project in the URL (ExptAssessmentResource), so a record that exists answers 404 by its label.
+        name = self.path.split("/assessors/")[-1].split("?")[0]
+        self.send_response(_Handler.get_status or (200 if name in _assessor_ids().values() else 404))
         self.end_headers()
 
     def do_DELETE(self):
@@ -417,7 +433,7 @@ def test_publish_creates_record_then_uploads_files_to_its_out_resources(xnat, tm
     calls = [c for c in handler.calls if c["path"] != "/data/JSESSION"]   # the lazy login is not a working request
     paths = [c["path"] for c in calls]
     # create-only: existence is checked first, then the create PUT
-    assert paths[0] == "/data/experiments/XNAT_E00018/assessors/DeepWMH_scan2_X?format=json" and calls[0]["method"] == "GET"
+    assert paths[0] == "/data/experiments/XNAT_E00018/assessors?format=json" and calls[0]["method"] == "GET", "the label is looked up in the session's assessor listing"
     assert paths[1] == "/data/experiments/XNAT_E00018/assessors/DeepWMH_scan2_X?inbody=true"
     assert calls[1]["content_type"] == "application/xml" and calls[1]["body"] == b"<xml/>"
     assert "/data/experiments/XNAT_E00018/assessors/XNAT_E99999/out/resources/DERIVED/files/volumes.json?inbody=true&format=JSON" in paths
@@ -514,7 +530,7 @@ def test_probe_protocol_error_is_a_runtime_error_the_guard_records(xnat, tmp_pat
         raise http.client.BadStatusLine("garbage")
 
     monkeypatch.setattr(publish.urllib.request, "urlopen", urlopen_bad_status)
-    with pytest.raises(RuntimeError, match=r"GET .*assessors/DeepWMH_scan2_X failed: garbage"):
+    with pytest.raises(RuntimeError, match=r"GET .*/data/experiments/XNAT_E00018/assessors failed: BadStatusLine: garbage"):
         publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", {})
 
 
@@ -531,7 +547,7 @@ def test_truncated_error_body_on_create_is_still_a_runtime_error(xnat, tmp_path,
     def urlopen_500_truncated(request, timeout=None):
         raise urllib.error.HTTPError(request.full_url, 500, "boom", {}, _Truncated())
 
-    monkeypatch.setattr(publish, "_request", lambda *a, **k: 404)
+    monkeypatch.setattr(publish, "find_record", lambda *a, **k: (404, "", ""))
     monkeypatch.setattr(publish.urllib.request, "urlopen", urlopen_500_truncated)
     with pytest.raises(RuntimeError, match=r"HTTP 500 \(error body unreadable: IncompleteRead"):
         publish_record(_context(host), "DeepWMH_scan2_X", "<xml/>", {})
@@ -1290,3 +1306,66 @@ def test_a_character_xml_cannot_carry_is_written_as_its_escape_not_into_the_docu
     assert "tab\there, newline\nhere, return\rhere" in document
     # and an ordinary value is passed through unchanged, including non-ASCII text
     assert _xml_text("model_name", "mödell 3 été \U0001f600") == "mödell 3 été \U0001f600"
+
+
+# ── 0.7.3: XNAT cannot find a session's assessor by label ──────────────────────
+def test_find_record_looks_a_session_label_up_in_the_assessor_listing_and_answers_by_id(xnat):
+    """demo02, 2026-10-06: GET /data/experiments/<session>/assessors/<label> answers 404 for a record that exists
+    (ExptAssessmentResource resolves a label only when the URL names a project). The listing names it; the id resolves."""
+    from segwrapup.publish import find_record
+    host, handler = xnat
+    handler.existing_labels = {"DeepWMH_scan2_X", "other_label"}
+    status, url, files_base = find_record(_context(host), "DeepWMH_scan2_X")
+    record_id = _assessor_ids()["DeepWMH_scan2_X"]
+    assert (status, url, files_base) == (200, f"{host}/data/experiments/XNAT_E00018/assessors/{record_id}",
+                                         f"{host}/data/experiments/XNAT_E00018/assessors/{record_id}/out/resources")
+    gets = [c["path"] for c in handler.calls if c["method"] == "GET"]
+    assert gets == ["/data/experiments/XNAT_E00018/assessors?format=json"], "one listing, no lookup by label"
+    # control: the fake answers a by-label GET the way XNAT does, so the old probe could not have found it
+    import urllib.error
+    import urllib.request
+    request = urllib.request.Request(f"{host}/data/experiments/XNAT_E00018/assessors/DeepWMH_scan2_X?format=json")
+    with pytest.raises(urllib.error.HTTPError) as raised:
+        urllib.request.urlopen(request, timeout=10)
+    assert raised.value.code == 404
+
+
+def test_find_record_answers_404_for_a_label_the_session_does_not_list(xnat):
+    from segwrapup.publish import find_record
+    host, handler = xnat
+    handler.existing_labels = {"DeepWMH_scan2_X"}
+    assert find_record(_context(host), "DeepWMH_scan2_Y") == (404, "", "")
+    assert find_record(_context(host), "unrelat") == (404, "", ""), "a label is matched whole, not as a prefix"
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_find_record_passes_a_failed_listing_on_as_its_status(xnat, status):
+    from segwrapup.publish import find_record
+    host, handler = xnat
+    handler.get_status = status
+    assert find_record(_context(host), "DeepWMH_scan2_X") == (status, "", "")
+
+
+def test_find_record_refuses_a_listing_that_names_the_label_without_an_id(xnat, monkeypatch):
+    import segwrapup.publish as publish
+    host, _ = xnat
+    monkeypatch.setattr(publish, "_get_json", lambda ctx, url, timeout: {"ResultSet": {"Result": [{"label": "DeepWMH_scan2_X"}]}})
+    with pytest.raises(RuntimeError, match="names label DeepWMH_scan2_X without its id"):
+        publish.find_record(_context(host), "DeepWMH_scan2_X")
+    monkeypatch.setattr(publish, "_get_json", lambda ctx, url, timeout: {"items": []})
+    with pytest.raises(RuntimeError, match="assessors failed: KeyError"):
+        publish.find_record(_context(host), "DeepWMH_scan2_X")
+    for result in ({"label": "DeepWMH_scan2_X", "ID": "XNAT_E1"}, None, "DeepWMH_scan2_X"):
+        monkeypatch.setattr(publish, "_get_json", lambda ctx, url, timeout, result=result: {"ResultSet": {"Result": result}})
+        with pytest.raises(RuntimeError, match="without a list of assessors"):
+            publish.find_record(_context(host), "DeepWMH_scan2_X")
+
+
+def test_find_record_keeps_the_label_url_at_subject_scope(xnat):
+    """Subject and dataset records are reached under the project, where XNAT does resolve a label."""
+    from segwrapup.publish import find_record
+    host, handler = xnat
+    handler.existing_labels = {"taken_X"}
+    status, url, _ = find_record(_subject_context(host), "taken_X")
+    assert status == 200 and url.endswith("/subjects/XNAT_S09007/experiments/taken_X")
+    assert find_record(_subject_context(host), "free_X") == (404, "", "")
