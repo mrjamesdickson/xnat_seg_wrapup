@@ -30,7 +30,7 @@ report", "it would be a great demo piece").
   (`publish_record(retry_on_conflict=False)`); and, with container-workshop PR #65, the AI author is
   the Device the findings name, where FHIR R5 puts it, not a Device performer. Round 5: an XHTML narrative's entities are decoded once; a race
   seen by the publisher's own probe is read like a 409. Round 6: the fallback to every contained
-  Observation applies only to a report with no `result` at all. Round 7: a performer with no display (`Practitioner/123`, a contained Organization) still signs the report. Round 8: a `result` that names its observations by `identifier` alone also turns that fallback off. Round 10: a create XNAT answers as an update (200, not 201) is a race, so nothing is uploaded or rolled back; a PDF or undecodable `presentedForm` is passed over for the next text attachment or the XHTML. Every value is held to its column (255 characters for a plain string,
+  Observation applies only to a report with no `result` at all. Round 7: a performer with no display (`Practitioner/123`, a contained Organization) still signs the report. Round 8: a `result` that names its observations by `identifier` alone also turns that fallback off. Round 10: a create XNAT answers as an update (200, not 201) is a race, so nothing is uploaded or rolled back; a PDF or undecodable `presentedForm` is passed over for the next text attachment or the XHTML. Round 11: base64 wrapped across lines (FHIR allows whitespace) decodes. Every value is held to its column (255 characters for a plain string,
   single-precision floats, 32-bit ints), and the REPORT file name cannot carry a separator.
 - Image tags 0.7.2 (seg-wrapup, proc-wrapup, record-fetch).
 

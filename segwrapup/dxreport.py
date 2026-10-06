@@ -207,7 +207,9 @@ def narrative(doc: dict) -> str | None:
         charset = re.search(r"charset\s*=\s*\"?([A-Za-z0-9._-]+)", parameters, re.I)
         encoding = charset.group(1) if charset else "utf-8"
         try:
-            return base64.b64decode(data, validate=True).decode(encoding)
+            # FHIR base64Binary allows whitespace (wrapped encoders break lines); strict decoding refuses it,
+            # so it goes first and anything else that is not base64 is still refused (Codex P2, PR #23)
+            return base64.b64decode(re.sub(r"\s+", "", data), validate=True).decode(encoding)
         except (binascii.Error, ValueError, LookupError) as error:
             # LookupError: a charset Python does not know
             logger.warning("presentedForm %d is not base64 %s text (%s); looking further for the narrative", index, encoding, error)

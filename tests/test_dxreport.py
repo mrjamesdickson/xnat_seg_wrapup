@@ -577,3 +577,17 @@ def test_an_identifier_result_beside_a_contained_one_keeps_only_the_contained_on
     parsed = dxreport.parse(doc)
     assert [f["display"] for f in parsed["findings"]] == ["Direct question"]
     assert dxreport.report_kind(parsed) == "AI_DRAFT", "the finding it references names the model"
+
+
+# ── Codex round 11 on PR #23 ───────────────────────────────────────────────────
+def test_wrapped_base64_is_decoded_and_other_junk_is_still_refused(caplog):
+    encoded = base64.encodebytes(REPORT_TEXT.encode() * 3).decode()     # wrapped at 76 characters, newline-terminated
+    assert "\n" in encoded.strip()
+    wrapped = {"contentType": "text/plain", "data": encoded.replace("\n", "\r\n  ")}
+    assert dxreport.parse(card_report(presentedForm=[wrapped]))["narrative"] == REPORT_TEXT * 3
+    # control: characters outside the base64 alphabet are still refused, and the next attachment is used
+    junk = {"contentType": "text/plain", "data": "SGVsbG8@@"}
+    plain = {"contentType": "text/plain", "data": base64.b64encode(b"Next.").decode()}
+    assert dxreport.parse(card_report(presentedForm=[junk, plain]))["narrative"] == "Next."
+    assert "not base64" in caplog.text
+

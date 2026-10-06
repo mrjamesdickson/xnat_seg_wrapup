@@ -58,7 +58,7 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
 | `source_system` | `urn:xnatworks:card:<card id>` (the card id, `nv-reason-ct`, is in the label) |
 | `source_id`, `source_version` | the report's `id`, `meta.versionId` (default `1`) |
 | `report_kind` | `AI_DRAFT` / `FINAL_SIGNED` / `HUMAN_DRAFT` (the poller's rule, with the Device exception above) |
-| `conclusion`, `narrative` | `conclusion`. The first `presentedForm` that is text and decodes (base64, in its declared charset, else UTF-8; a PDF or an undecodable one is passed over: Codex P2, PR #23), else the untagged `text.div` |
+| `conclusion`, `narrative` | `conclusion`. The first `presentedForm` that is text and decodes (base64, whitespace ignored as FHIR allows, in its declared charset, else UTF-8; a PDF or an undecodable one is passed over: Codex P2, PR #23), else the untagged `text.div` |
 | `findings` | the contained `Observation`s `result` references; every contained one only when the report has no `result` at all (a `result` naming external observations, by reference or by `identifier` alone, means the contained ones only support: Codex P2, PR #23): code, display, valueString or first note, valueQuantity, a component named confidence or instance number, bodySite |
 | `pseudonymization` | a sentence saying the card wrote the report inside XNAT from the archived session |
 | `raw_json` | the document, when it is under 200,000 characters |
