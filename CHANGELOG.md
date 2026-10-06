@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.7.2 (2026-10-05)
+
+Cards can file a diagnostic report (James, 2026-10-05: "I thought nv-reason-ct 0.5.0 created a
+report", "it would be a great demo piece").
+
+- **`diagnosticReport`.** A results block may name a FHIR R5 `DiagnosticReport` the tool writes
+  (`XNW_DIAGNOSTIC_REPORT=<path inside the tool's output>`). At session scope, after the run
+  record of a run that succeeded, proc-wrapup files it as a `dxreport:sessionReportData` on the
+  session: the datatype and mapping of the FHIR report poller (`DiagnosticReportParser`,
+  `DxReportRecordMapper`), with the label `<session>_RPT_<card>_<report id>`, `source_system`
+  `urn:xnatworks:card:<card id>`, `AI_DRAFT` when the findings name a contained Device as their source, the
+  session's own accession, UID, modality and subject label, the findings the report references,
+  and the document itself on `REPORT`. It is create-only: an existing label is left alone. It
+  never raises, and every outcome is in `wrapup.json` under `diagnostic_report`. Values the
+  schema would refuse are clamped or cut. `segwrapup/dxreport.py`;
+  `RecordContract.diagnostic_report`; `docs/DIAGNOSTIC-REPORTS.md`.
+- The relabel retry on a 409 recognises a `dxreport:` root element as well as `analysis:`. A diagnostic report
+  itself is never relabelled: it is created with `retry_on_conflict=False`, and a 409 re-reads the canonical label.
+- Review fixes (Codex, PR #23). Only the Device a performer references makes an AI draft. A long
+  session label is shortened, not the report id. Characters XML 1.0 forbids are escaped. A
+  malformed nested value is an outcome, not an exception. Round 2: a number too large for a float is left
+  off; an id the label cannot spell as it is gets a hash beside it; a label already holding a
+  different report is a collision, not "already filed"; an unnamed Device the performer
+  references still makes an AI draft. Round 3: a truncated XNAT answer and a document
+  nested past the recursion limit are outcomes; session labels that rewrite alike get a hash;
+  hyphens stay in labels. Round 4: the card id is in the label as it is (hashed when long or
+  unspellable); a create race re-reads the label instead of retrying under a random one
+  (`publish_record(retry_on_conflict=False)`); and, with container-workshop PR #65, the AI author is
+  the Device the findings name, where FHIR R5 puts it, not a Device performer. Round 5: an XHTML narrative's entities are decoded once; a race
+  seen by the publisher's own probe is read like a 409. Round 6: the fallback to every contained
+  Observation applies only to a report with no `result` at all. Round 7: a performer with no display (`Practitioner/123`, a contained Organization) still signs the report. Round 8: a `result` that names its observations by `identifier` alone also turns that fallback off. Round 10: a create XNAT answers as an update (200, not 201) is a race, so nothing is uploaded or rolled back; a PDF or undecodable `presentedForm` is passed over for the next text attachment or the XHTML. Round 11: base64 wrapped across lines (FHIR allows whitespace) decodes. Round 12: a taken label counts as filed only once its document is on REPORT (a run waits up to 60 s, and files the report itself if the creator rolled back); date-times are checked against the calendar and the ±14:00 zone range, not only their shape. Every value is held to its column (255 characters for a plain string,
+  single-precision floats, 32-bit ints), and the REPORT file name cannot carry a separator.
+- Image tags 0.7.2 (seg-wrapup, proc-wrapup, record-fetch).
+
 ## 0.7.1 (2026-09-26)
 
 Training cards register their model (the link pair of

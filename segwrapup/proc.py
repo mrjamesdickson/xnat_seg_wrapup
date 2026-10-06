@@ -31,6 +31,7 @@ from pathlib import Path
 from . import __version__
 from .model import register_trained_model
 from .card import card_for_run, write_card_copy
+from .dxreport import publish_diagnostic_report
 from .execution import (RAW_DIRNAME, STATUS_FILENAME, chain_from_workflow, copy_raw_output, fetch_parent_logs,
                         own_workflow_id, read_status, run_status_from)
 from .prereq import MANIFEST as PREREQ_MANIFEST
@@ -241,6 +242,11 @@ def run(args: argparse.Namespace) -> int:
             manifest["trained_model"] = register_trained_model(
                 context, output_dir, RAW_DIRNAME, outcome, run_status, outcome.get("views") or {},
                 {**(outcome.get("contract") or {}), "pipeline": args.pipeline}, dataset_facts)
+        if (outcome or {}).get("id") and (outcome or {}).get("diagnostic_report"):
+            # A card whose tool writes a FHIR DiagnosticReport (0.7.2): filed beside the run record as a
+            # dxreport:sessionReportData, the record a vendor's report gets from the FHIR poller.
+            manifest["diagnostic_report"] = publish_diagnostic_report(
+                context, output_dir, RAW_DIRNAME, outcome["diagnostic_report"], run_status, outcome.get("contract") or {})
         (output_dir / "wrapup.json").write_text(json.dumps(manifest, indent=2))
         if args.pointer_only and (manifest.get("analysis_record") or {}).get("id"):
             # The record owns the bytes; the output handler gets a one-file pointer resource.

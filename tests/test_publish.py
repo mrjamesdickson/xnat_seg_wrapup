@@ -46,6 +46,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(500); self.end_headers()
 
     conflict_labels: set = set()      # PUT create of these labels answers 409 (taken elsewhere in the project)
+    update_labels: set = set()        # PUT create of these labels answers 200: XNAT updated a record a racing run made
 
     def do_GET(self):
         _Handler.calls.append({"path": self.path, "method": "GET", "auth": self.headers.get("Authorization"), "cookie": self.headers.get("Cookie")})
@@ -105,7 +106,7 @@ class _Handler(BaseHTTPRequestHandler):
             created_label = self.path.split("/assessors/" if "/assessors/" in self.path else "/experiments/")[1].split("?")[0]
             if _Handler.conflict_labels is None or created_label in _Handler.conflict_labels:
                 self.send_response(409); self.end_headers(); self.wfile.write(b"<h3>Conflict: Duplicate experiment label</h3>"); return
-        self.send_response(201 if is_create else 200)
+        self.send_response(201 if is_create and created_label not in _Handler.update_labels else 200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         # XNAT answers an assessor (or subject assessor) create with the new accession ID as plain text.
@@ -118,7 +119,7 @@ class _Handler(BaseHTTPRequestHandler):
 @pytest.fixture
 def xnat():
     _Handler.calls, _Handler.fail_paths, _Handler.existing_labels, _Handler.get_status = [], set(), set(), None
-    _Handler.conflict_labels, _Handler.fail_get_paths = set(), set()
+    _Handler.conflict_labels, _Handler.fail_get_paths, _Handler.update_labels = set(), set(), set()
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_port}", _Handler
@@ -816,6 +817,50 @@ def test_create_409_twice_is_reported_not_looped(xnat, tmp_path):
         publish.publish_record(context, "L", xml, {"REPORT": [out / "report.html"]}, output_dir=out)
     assert len([c for c in handler.calls if c["method"] == "PUT"]) == 2
 
+
+
+def test_create_409_without_a_retry_is_raised_for_a_caller_whose_label_is_its_identity(xnat, tmp_path):
+    """A diagnostic report's label is its identity (segwrapup.dxreport): a random suffix would file the
+    same report twice, so that caller takes the 409 itself (Codex P2, PR #23)."""
+    from segwrapup import publish
+    host, handler = xnat
+    handler.conflict_labels = {"S_RPT_card_r1"}
+    out = tmp_path / "out"; out.mkdir(); (out / "report.html").write_text("<p>r</p>")
+    context = XnatContext(host=host, user="u", password="p", project="P", session="XNAT_E00018", scan="2")
+    xml = '<dxreport:SessionReport xmlns:dxreport="x" project="P" label="S_RPT_card_r1"></dxreport:SessionReport>'
+    with pytest.raises(RuntimeError, match="HTTP 409"):
+        publish.publish_record(context, "S_RPT_card_r1", xml, {"REPORT": [out / "report.html"]}, output_dir=out,
+                               xsi_type="dxreport:sessionReportData", retry_on_conflict=False)
+    assert len([c for c in handler.calls if c["method"] == "PUT"]) == 1, "no second create under another label"
+
+
+def test_a_create_answered_as_an_update_uploads_and_deletes_nothing_for_an_identity_label(xnat, tmp_path):
+    """Two runs filing one diagnostic report pass both probes; XNAT answers the second PUT as an update
+    (200, not 201). Its files are not uploaded, and no rollback can delete the record the first run filed
+    (Codex P2, PR #23)."""
+    from segwrapup import publish
+    host, handler = xnat
+    handler.update_labels = {"S_RPT_card_r1"}
+    handler.fail_paths = {"/data/experiments/XNAT_E00018/assessors/S_RPT_card_r1/out"}   # an upload would fail
+    out = tmp_path / "out"; out.mkdir(); (out / "report.html").write_text("<p>r</p>")
+    context = XnatContext(host=host, user="u", password="p", project="P", session="XNAT_E00018", scan="2")
+    xml = '<dxreport:SessionReport xmlns:dxreport="x" project="P" label="S_RPT_card_r1"></dxreport:SessionReport>'
+    with pytest.raises(RuntimeError, match="label S_RPT_card_r1 already exists"):
+        publish.publish_record(context, "S_RPT_card_r1", xml, {"REPORT": [out / "report.html"]}, output_dir=out,
+                               xsi_type="dxreport:sessionReportData", retry_on_conflict=False)
+    assert [c["method"] for c in handler.calls if c["method"] in ("PUT", "DELETE")] == ["PUT"], "the create only: no upload, no rollback"
+
+
+def test_a_create_answered_201_still_uploads_for_an_identity_label(xnat, tmp_path):
+    """Control: the 200 rule must not stop a real create, which XNAT answers 201."""
+    from segwrapup import publish
+    host, handler = xnat
+    out = tmp_path / "out"; out.mkdir(); (out / "report.html").write_text("<p>r</p>")
+    context = XnatContext(host=host, user="u", password="p", project="P", session="XNAT_E00018", scan="2")
+    xml = '<dxreport:SessionReport xmlns:dxreport="x" project="P" label="S_RPT_card_r1"></dxreport:SessionReport>'
+    result = publish.publish_record(context, "S_RPT_card_r1", xml, {"REPORT": [out / "report.html"]}, output_dir=out,
+                                    xsi_type="dxreport:sessionReportData", retry_on_conflict=False)
+    assert result["id"] == "XNAT_E99999" and len([c for c in handler.calls if c["method"] == "PUT"]) == 2
 
 # ── subject scope (0.6.2) ───────────────────────────────────────────────────────
 

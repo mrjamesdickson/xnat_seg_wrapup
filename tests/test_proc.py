@@ -92,7 +92,10 @@ class _CS(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"items": [{"data_fields": {"ID": "XNAT_E77777", "label": "run_label_x", "project": "PROJ_1",
                                                                     "results_json": json.dumps({"views": {"MODEL": ["segmentation_spleen.pt"]}, "model": "monailabel-train"})}}]}).encode(), "application/json")
         elif self.path == "/data/experiments/XNAT_E00018?format=json":
-            self._send(200, json.dumps({"items": [{"data_fields": {"label": "SESS01"}}]}).encode(), "application/json")
+            self._send(200, json.dumps({"items": [{"data_fields": {"ID": "XNAT_E00018", "label": "SESS01", "project": "PROJ_1", "subject_ID": "XNAT_S00042",
+                                                                    "UID": "1.2.840.99.1", "modality": "CT"}}]}).encode(), "application/json")
+        elif self.path == "/data/subjects/XNAT_S00042?format=json":         # the diagnostic report's pseudonym (0.7.2)
+            self._send(200, json.dumps({"items": [{"data_fields": {"ID": "XNAT_S00042", "label": "RSNAPID001"}}]}).encode(), "application/json")
         elif self.path == "/data/experiments/XNAT_D0001?format=json":        # the frozen dataset a dataset-scoped run cites
             self._send(200, json.dumps({"items": [{"data_fields": {"label": "flanker-2sub", "included_count": 2,
                                                                     "xsiType": "analysis:analysisDatasetData"}}]}).encode(), "application/json")
@@ -124,7 +127,8 @@ class _CS(BaseHTTPRequestHandler):
         create = (("/assessors/" in self.path and "/out/" not in self.path) or ("/subjects/" in self.path and "/resources/" not in self.path)
                   or (self.path.startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in self.path))
         model_create = create and "/experiments/model_" in self.path
-        self._send(201 if create else 200, b"XNAT_E88888" if model_create else b"XNAT_E77777" if create else b"")
+        report_create = create and "_RPT_" in self.path                     # a diagnostic report record (0.7.2)
+        self._send(201 if create else 200, b"XNAT_E88888" if model_create else b"XNAT_E99999" if report_create else b"XNAT_E77777" if create else b"")
 
     def log_message(self, *args):
         pass
@@ -1411,3 +1415,72 @@ def test_a_view_that_cannot_be_inspected_is_an_outcome_not_an_abort(cs, tmp_path
     assert "could not be inspected" in error and "Input/output error" in error, error
     creates = [c["path"] for c in handler.calls if c["method"] == "PUT" and c["path"].startswith("/data/projects/PROJ_1/experiments/") and "/resources/" not in c["path"]]
     assert len(creates) == 1, "the run record only; no model asset"
+
+
+# ── diagnostic report records (0.7.2) ──────────────────────────────────────────
+def _report_output(tmp_path, status="preliminary"):
+    inp = tool_output(tmp_path, with_status={"exit_code": 0, "workflow_id": "4990"})
+    (inp / "diagnostic_report.json").write_text(json.dumps({
+        "resourceType": "DiagnosticReport", "id": "rpt1", "status": status,
+        "contained": [{"resourceType": "Device", "id": "model", "name": [{"value": "NVIDIA NV-Reason-CT"}]},
+                      {"resourceType": "Observation", "id": "f1", "code": {"text": "Lungs"}, "valueString": "Bilateral emboli."}],
+        "category": [{"coding": [{"code": "RAD"}]}], "code": {"coding": [{"system": "http://loinc.org", "code": "68604-8"}]},
+        "performer": [{"reference": "#model", "display": "NVIDIA NV-Reason-CT"}], "result": [{"reference": "#f1"}],
+        "conclusion": "Bilateral pulmonary emboli."}))
+    return inp
+
+
+def test_a_card_that_declares_a_diagnostic_report_files_it_beside_the_run_record(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _report_output(tmp_path), tmp_path / "out"
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "PyRadiomics", "XNW_DIAGNOSTIC_REPORT": "diagnostic_report.json"})
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777", "the run record first, as always"
+    assert manifest["diagnostic_report"] == {"xsi_type": "dxreport:sessionReportData", "id": "XNAT_E99999", "label": "SESS01_RPT_pyradiomics_rpt1",
+                                             "source_id": "rpt1", "report_kind": "AI_DRAFT", "findings": 1, "file": "diagnosticreport-rpt1-v1.json"}
+    (create,) = [c for c in handler.calls if c["method"] == "PUT" and "_RPT_" in c["path"] and "/resources/" not in c["path"]]
+    assert create["path"] == "/data/experiments/XNAT_E00018/assessors/SESS01_RPT_pyradiomics_rpt1?inbody=true"
+    xml = create["body"].decode()
+    for fragment in ("<dxreport:SessionReport ", "<xnat:imageSession_ID>XNAT_E00018<", "<dxreport:report_kind>AI_DRAFT<",
+                     "<dxreport:source_system>urn:xnatworks:card:pyradiomics<", "<dxreport:pseudonym>RSNAPID001<",
+                     "<dxreport:study_instance_uid>1.2.840.99.1<", "<dxreport:modality>CT<", "<dxreport:conclusion>Bilateral pulmonary emboli.<"):
+        assert fragment in xml, fragment
+    uploads = [c["path"] for c in handler.calls if c["method"] == "PUT" and "/resources/REPORT/files/diagnosticreport-rpt1-v1.json" in c["path"]]
+    assert len(uploads) == 1, "the document itself, whole, on the record's REPORT resource"
+    # the document is also part of the run's DERIVED tree, like everything else the tool wrote
+    assert any("/out/resources/DERIVED/files/diagnostic_report.json" in c["path"] for c in handler.calls)
+
+
+def test_without_the_declaration_no_report_record_is_made(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _report_output(tmp_path), tmp_path / "out"
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "PyRadiomics"})
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777" and "diagnostic_report" not in manifest
+    assert not [c for c in handler.calls if "_RPT_" in c["path"]]
+
+
+def test_a_failed_run_files_no_report(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _report_output(tmp_path), tmp_path / "out"
+    (inp / "status.json").write_text(json.dumps({"exit_code": 3, "workflow_id": "4990"}))
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "PyRadiomics", "XNW_DIAGNOSTIC_REPORT": "diagnostic_report.json"})
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777" and manifest["diagnostic_report"] == {"skipped": "run FAILED"}
+    assert not [c for c in handler.calls if "_RPT_" in c["path"]]
+
+
+def test_a_malformed_report_costs_only_the_report_record(cs, tmp_path, monkeypatch):
+    host, handler = cs
+    inp, out = _report_output(tmp_path), tmp_path / "out"
+    doc = json.loads((inp / "diagnostic_report.json").read_text())
+    (inp / "diagnostic_report.json").write_text(json.dumps({**doc, "presentedForm": ["oops"]}))
+    set_env(monkeypatch, host, {"PROC_PIPELINE_NAME": "PyRadiomics", "XNW_DIAGNOSTIC_REPORT": "diagnostic_report.json"})
+    assert proc.main(["--input", str(inp), "--output", str(out)]) == 0
+    manifest = json.loads((out / "wrapup.json").read_text())
+    assert manifest["analysis_record"]["id"] == "XNAT_E77777"
+    assert manifest["diagnostic_report"]["error"].startswith("AttributeError")
+    assert not [c for c in handler.calls if c["method"] == "PUT" and "_RPT_" in c["path"]]
