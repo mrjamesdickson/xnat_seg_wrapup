@@ -63,7 +63,9 @@ reformat a tool file; put a wrapup file in `DERIVED`; upload a zero-byte file an
 refuses it; it is listed as `skipped_empty`); or honour a card's globs for the four fixed resources.
 
 No `XNW_*` variables, no record; nothing else changes. Publishing is create-only and
-additive: a label that already exists on the session is refused before any write, a file
+additive: a label that already exists on the session is refused before any write (looked up in
+the session's assessor listing since 0.7.3: XNAT does not find a session's assessor by label, so
+before 0.7.3 a reused label was updated in place), a file
 upload that fails after the create deletes the new record again, and every failure is logged
 and written to `wrapup.json` under `analysis_record` while the masks, report and ROI
 collection still ship. `auto_qc_status` is `WARN` when any delivered mask could not be
@@ -99,7 +101,7 @@ Verified against the Container Service source (`CommandResolutionServiceImpl`,
   replacement keys. A parent that declares `project-id`/`session-id`/`scan-id`
   derived inputs can therefore hand the launch context to the wrapup as
   `SEG_PROJECT=#PROJECT_ID#`, `SEG_SESSION_ID=#SESSION_ID#`, `SEG_SCAN_ID=#SCAN_ID#`.
-- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.7.2"`.
+- A parent output handler opts in with `"via-wrapup-command": "xnatworks/seg-wrapup:0.7.3"`.
 - CS runs the wrapup's `command-line` **without overriding the image entrypoint**.
   This image therefore has no `ENTRYPOINT`, only `CMD ["seg-wrapup"]`; with an
   entrypoint the container ran `seg-wrapup seg-wrapup` and exited 2 on the first
@@ -212,8 +214,8 @@ this repo.
 ```bash
 uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python -e ".[test]"
 .venv/bin/python -m pytest
-docker build -t xnatworks/seg-wrapup:0.7.2 .
-docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.7.2
+docker build -t xnatworks/seg-wrapup:0.7.3 .
+docker run --rm -v /path/to/model-output:/input:ro -v /tmp/out:/output xnatworks/seg-wrapup:0.7.3
 ```
 
 Tests cover label-file parsing for each format, volume arithmetic, merging, the
@@ -300,7 +302,7 @@ session, where the reviewer looks. A FAILED record never satisfies a prerequisit
 A subject-scoped wrapper (plan D26: `<app>-subject` beside `<app>-session`) mounts the project
 archive through a derived Project input, because a Subject has no directory of its own. Its
 records mount is a second Project input carrying `via-setup-command
-xnatworks/record-fetch:0.7.2:record-fetch-subject`, which is `record-fetch --no-passthrough`
+xnatworks/record-fetch:0.7.3:record-fetch-subject`, which is `record-fetch --no-passthrough`
 (`commands/record-fetch-subject.json`, the same image): the prerequisites are resolved on every
 session of the subject and written to `prereq/<name>/<session label>/`, and nothing is passed
 through, since passing the archive through would copy it. Register it beside `record-fetch`
@@ -440,8 +442,9 @@ What it does not do: file a report from a run that did not succeed, from a subje
 dataset-scoped run, or when the tool wrote no file at the declared path (each is recorded
 under `diagnostic_report`, and the run record stands regardless). It does not file the same
 report twice. The report id is the card's, so a card that derives it from its inputs gets one
-record per distinct report, and a rerun that produces the same report finds it and stops. It
-does not sign, finalise or send the report anywhere. A person reviews an AI draft, outside
+record per distinct report, and a rerun that produces the same report finds it and stops
+(0.7.3 and later; under 0.7.2 such a rerun ended as an `error` after updating the filed record,
+because XNAT does not find a session's assessor by label). It does not sign, finalise or send the report anywhere. A person reviews an AI draft, outside
 this wrapup. A value the schema would refuse is clamped (an unknown status becomes `unknown`,
 an unknown category `OTH`) or cut to the schema's cap, with the full text kept in the `REPORT`
 file. `segwrapup/dxreport.py`; design in `docs/DIAGNOSTIC-REPORTS.md`.

@@ -31,7 +31,7 @@ from pathlib import Path, PurePosixPath
 from xml.sax.saxutils import escape
 
 from .execution import _get_json
-from .publish import RecordFile, _request, _xml_text, publish_record, record_urls
+from .publish import RecordFile, _xml_text, find_record, publish_record
 from .register import XnatContext
 
 logger = logging.getLogger(__name__)
@@ -500,54 +500,56 @@ def _settled(context: XnatContext, label: str, values: dict, timeout_seconds: fl
     record holds them (cut to the column). And a taken label is not yet a filed report: the run that took
     it uploads the document afterwards, and deletes the record again if that fails (Codex P2, PR #23).
     So this waits, up to SETTLE_WAIT_SECONDS, for the document on REPORT: there, the report is filed; the
-    record gone (404), None, and the caller files it; neither in time, an error outcome. Raises what the
-    reads raise."""
-    label_url, files_base = record_urls(context, label)
+    record gone from the session's assessors (or 404 when read), None, and the caller files it; neither in
+    time, an error outcome. The record is found through the session's assessor listing and read by id
+    (publish.find_record: XNAT cannot find a session's assessor by label). Raises what the reads raise."""
+    timeout = min(timeout_seconds, 60.0)
     deadline = time.monotonic() + SETTLE_WAIT_SECONDS
     compared = False
+    listing_failure = ""
 
     def gone() -> None:
         logger.warning("the record under %s on session %s is gone: the run that created it rolled it back; this run files the report",
                        label, context.session)
 
-    def read(url: str):
-        """The JSON at url; None when it answers 404: the record was rolled back between this run's reads,
-        which is the same as finding it gone (Codex P2, PR #23)."""
-        try:
-            return _get_json(context, url, min(timeout_seconds, 60.0))
-        except urllib.error.HTTPError as error:
-            if error.code != 404:
-                raise
-            return None
-
     while True:
-        status = _request(context, "GET", f"{label_url}?format=json", min(timeout_seconds, 60.0))
+        status, record_url, files_base = find_record(context, label, timeout)
         if status == 404:
             return gone()
         if status != 200:
             raise RuntimeError(f"could not read the record under label {label}: HTTP {status}")
         if not compared:
-            record = read(f"{label_url}?format=json")
-            if record is None:
-                return gone()
+            try:
+                record = _get_json(context, f"{record_url}?format=json", timeout)
+            except urllib.error.HTTPError as error:
+                if error.code != 404:
+                    raise
+                return gone()     # deleted between the listing and this read (Codex P2, PR #23)
             there = record["items"][0]["data_fields"]
             if (there.get("source_id"), there.get("source_system")) != (values["source_id"], values["source_system"]):
                 logger.error("label %s on session %s holds report %r from %r, not %r from %r; not filed", label, context.session,
                              there.get("source_id"), there.get("source_system"), values["source_id"], values["source_system"])
                 return {"error": f"label {label} is taken by report {there.get('source_id')!r} from {there.get('source_system')!r}"}
             compared = True
-        listing = read(f"{files_base}/{REPORT_ROLE}/files?format=json")
-        if listing is None:
-            return gone()
+        try:
+            listing = _get_json(context, f"{files_base}/{REPORT_ROLE}/files?format=json", timeout)
+            listing_failure = ""
+        except urllib.error.HTTPError as error:
+            # Not proof either way: a resource not made yet may answer 404 (Codex P2, PR #24), and the files of a
+            # record deleted since the read above answer 500 (demo02). The next pass looks the record up again;
+            # a record that stays and never lists its document ends as the error below.
+            listing_failure = f" (its {REPORT_ROLE} listing last answered HTTP {error.code})"
+            logger.warning("the %s listing of %s answered HTTP %d; looking the record up again", REPORT_ROLE, label, error.code)
+            listing = {}
         if (listing.get("ResultSet") or {}).get("Result"):
             logger.info("diagnostic report %s already on session %s%s; not filed twice", label, context.session,
                         " (filed by a concurrent run)" if race else "")
             return {"xsi_type": XSI_TYPE, "label": label, "exists": True, "source_id": values["source_id"]}
         if time.monotonic() >= deadline:
-            logger.error("label %s on session %s holds this report without its %s document after %.0f s; not counted as filed",
-                         label, context.session, REPORT_ROLE, SETTLE_WAIT_SECONDS)
-            return {"error": f"label {label} holds this report without its {REPORT_ROLE} document after {SETTLE_WAIT_SECONDS:.0f} s: "
-                             "another run is still filing it or left it incomplete"}
+            logger.error("label %s on session %s holds this report without its %s document after %.0f s%s; not counted as filed",
+                         label, context.session, REPORT_ROLE, SETTLE_WAIT_SECONDS, listing_failure)
+            return {"error": f"label {label} holds this report without its {REPORT_ROLE} document after {SETTLE_WAIT_SECONDS:.0f} s"
+                             f"{listing_failure}: another run is still filing it or left it incomplete"}
         logger.info("label %s holds this report but not yet its document; waiting for the run filing it", label)
         time.sleep(SETTLE_POLL_SECONDS)
 
@@ -585,8 +587,7 @@ def publish_diagnostic_report(context: XnatContext | None, output_dir: Path, der
                               pseudonymization=(f"None needed: card {card_id} {contract.get('card_revision') or ''} wrote this report "
                                                 "inside XNAT from the archived session; no outside document was involved").replace("  ", " "))
         label = values["label"]
-        label_url, _ = record_urls(context, label)
-        probe = _request(context, "GET", f"{label_url}?format=json", min(timeout_seconds, 60.0))
+        probe, _, _ = find_record(context, label, min(timeout_seconds, 60.0))
         if probe == 200:
             settled = _settled(context, label, values, timeout_seconds)
             if settled is not None:

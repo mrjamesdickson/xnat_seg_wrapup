@@ -189,6 +189,10 @@ def written(tmp_path, doc=None):
     return tmp_path
 
 
+#: Where publish.find_record finds a record: by id, under the session (XNAT cannot find a session's assessor by label).
+RECORD_URL = "http://x/data/experiments/XNAT_E00026/assessors/XNAT_E77"
+
+
 @pytest.fixture
 def xnat(monkeypatch):
     calls = {"published": [], "probe": 404, "probes": [], "sleeps": [],
@@ -197,11 +201,20 @@ def xnat(monkeypatch):
              # its REPORT listing: the document is there unless a test says otherwise ("listings" first, in order)
              "files": [{"Name": "diagnosticreport-3f2a9c1d0b7e4a65-v1.json"}], "listings": []}
     monkeypatch.setattr(dxreport, "fetch_session_facts", lambda ctx, timeout: dict(FACTS))
-    monkeypatch.setattr(dxreport, "_request", lambda ctx, method, url, timeout: calls["probes"].pop(0) if calls["probes"] else calls["probe"])
+
+    def find(ctx, label, timeout):
+        """publish.find_record: the session's assessor listing names the label (200) with the record's by-id URLs, or not (404)."""
+        calls["finds"].append(label)
+        status = calls["probes"].pop(0) if calls["probes"] else calls["probe"]
+        return (status, RECORD_URL, f"{RECORD_URL}/out/resources") if status == 200 else (status, "", "")
+    calls["finds"] = []
+    monkeypatch.setattr(dxreport, "find_record", find)
 
     def get_json(ctx, url, timeout):
-        if calls.get("gone_on_read") and calls["gone_on_read"](url):
-            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        assert url.startswith(RECORD_URL + "?") or url.startswith(RECORD_URL + "/"), f"read by id where the lookup found it, not {url}"
+        code = calls.get("fail_read") and calls["fail_read"](url)
+        if code:
+            raise urllib.error.HTTPError(url, code, "failed", {}, None)
         if "/files?" in url:
             return {"ResultSet": {"Result": calls["listings"].pop(0) if calls["listings"] else calls["files"]}}
         return {"items": [{"data_fields": calls["there"]}]}
@@ -528,7 +541,7 @@ def test_the_publishers_taken_label_message_is_the_one_the_race_handler_reads(mo
     """The race handler matches publish_record's own words; this pins them so a reworded message cannot
     silently turn an already-filed report into an error."""
     from segwrapup import publish
-    monkeypatch.setattr(publish, "_request", lambda ctx, method, url, timeout: 200)
+    monkeypatch.setattr(publish, "find_record", lambda ctx, label, timeout: (200, RECORD_URL, f"{RECORD_URL}/out/resources"))
     with pytest.raises(RuntimeError) as raised:
         publish.publish_record(context(), "HB0004_1_RPT_x_y", "<x/>", {}, xsi_type=dxreport.XSI_TYPE, retry_on_conflict=False)
     assert "label HB0004_1_RPT_x_y already exists" in str(raised.value)
@@ -663,10 +676,12 @@ def test_a_real_date_time_is_kept(value):
 
 
 # ── Codex round 13 on PR #23 ───────────────────────────────────────────────────
-@pytest.mark.parametrize("which", ["record", "listing"])
-def test_a_record_rolled_back_between_the_reads_is_taken_over_not_an_error(tmp_path, xnat, which):
-    """The status probe says 200, then the creator rolls back before the metadata or the REPORT listing is read:
-    that 404 is the record gone, and this run files the report (Codex P2, PR #23)."""
+@pytest.mark.parametrize("which, code", [("record", 404), ("listing", 500), ("listing", 404)])
+def test_a_record_rolled_back_between_the_reads_is_taken_over_not_an_error(tmp_path, xnat, which, code):
+    """The lookup finds the record, then the creator rolls it back before the metadata or the REPORT listing is read
+    (Codex P2, PR #23). The record read answers 404: gone. The listing proves nothing (a deleted record's files answer
+    500 on demo02, and a 404 may be a resource not made yet, Codex P2, PR #24): the next lookup no longer finds the
+    label, and this run files the report."""
     attempts = []
 
     def publish(ctx, label, xml, files, timeout_seconds=300.0, xsi_type=None, retry_on_conflict=True):
@@ -675,7 +690,13 @@ def test_a_record_rolled_back_between_the_reads_is_taken_over_not_an_error(tmp_p
             xnat["probe"] = 200
             raise RuntimeError("PUT %s failed: HTTP 409 Conflict" % label)
         return {"id": "XNAT_E99999", "label": label}
-    xnat["gone_on_read"] = (lambda url: "/files?" in url) if which == "listing" else (lambda url: "/files?" not in url)
+
+    def fail_read(url):
+        if ("/files?" in url) == (which == "listing"):
+            xnat["probe"] = 404                       # deleted: the session's assessors no longer list it
+            return code
+        return None
+    xnat["fail_read"] = fail_read
     original, dxreport.publish_record = dxreport.publish_record, publish
     try:
         out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
@@ -697,3 +718,49 @@ def test_another_read_failure_is_still_an_error(tmp_path, xnat):
         dxreport._get_json = original
     assert "500" in out["error"]
 
+
+
+# ── PR #24: XNAT cannot find a session's assessor by label ─────────────────────
+def test_the_probe_and_the_wait_find_the_record_through_the_lookup_and_read_it_by_id(tmp_path, xnat):
+    """demo02, 2026-10-06: /data/experiments/<session>/assessors/<label> answers 404 for a record that exists, so a
+    rerun never saw the report it had filed. The label is looked up (publish.find_record) and the record read by id
+    (the fixture's get_json refuses any other URL)."""
+    xnat["probe"] = 200
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out["exists"] is True and xnat["published"] == []
+    assert xnat["finds"] and set(xnat["finds"]) == {"HB0004_1_RPT_nv-reason-ct_3f2a9c1d0b7e4a65"}
+
+
+def test_a_report_resource_not_made_yet_is_awaited_not_taken_over(tmp_path, xnat):
+    """Codex P2, PR #24: the record is there and its REPORT resource is not yet; a listing 404 is not the record
+    gone. This run waits and then finds the document."""
+    xnat["probe"] = 200
+    answers = [404]
+    xnat["fail_read"] = lambda url: answers.pop(0) if "/files?" in url and answers else None
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert out["exists"] is True and xnat["published"] == [] and len(xnat["sleeps"]) == 1
+
+
+def test_a_listing_that_keeps_failing_on_a_record_that_stays_is_an_error(tmp_path, xnat):
+    """Control: a failing listing is retried, not believed; a record still listed whose document never lists is the
+    error outcome, with the listing's last answer in it."""
+    xnat["probe"] = 200
+    xnat["fail_read"] = lambda url: 500 if "/files?" in url else None
+    out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    assert "without its REPORT document" in out["error"] and "HTTP 500" in out["error"] and xnat["published"] == []
+
+
+def test_the_error_names_a_listing_failure_only_while_it_lasts(tmp_path, xnat):
+    """A listing that failed once and then answers with no document: the error is the missing document, not a stale 500."""
+    xnat["probe"] = 200
+    xnat["files"] = []
+    answers = [500]
+    xnat["fail_read"] = lambda url: answers.pop(0) if "/files?" in url and answers else None
+    times = iter([0.0, 0.0, 1.0, 1.0, 1.0])              # the deadline passes on the second pass
+    original = dxreport.time.monotonic
+    dxreport.time.monotonic = lambda: next(times)
+    try:
+        out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    finally:
+        dxreport.time.monotonic = original
+    assert "without its REPORT document" in out["error"] and "HTTP 500" not in out["error"] and len(xnat["sleeps"]) == 1
