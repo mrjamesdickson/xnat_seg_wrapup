@@ -130,7 +130,9 @@ User-facing description: README, "Diagnostic reports". Code: `segwrapup/dxreport
   race, waits up to 60 s (`SETTLE_WAIT_SECONDS`) for the document on `REPORT`. There: `exists`.
   The record gone: its creator rolled back, and this run files the report itself, at most once
   more. Still bare after the wait: an `error`, never a claim that the report is filed (Codex P2,
-  PR #23).
+  PR #23). "Gone" is a 404 from any of the three reads, not only the status probe: the record
+  can be rolled back between the probe and the read of its fields or of its `REPORT` listing,
+  and that 404 is the same rollback, not an error. Any other failed read is an `error`.
 - **JSON numbers can be too large for a float** (thousands of digits). Such a value is left off the
   finding with a warning instead of raising `OverflowError` (Codex P1, PR #23).
 - **A character XML 1.0 forbids** (`json.loads` accepts `"\u0001"`) is written as its escape
