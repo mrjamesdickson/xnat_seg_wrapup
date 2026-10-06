@@ -2,6 +2,7 @@
 import base64
 import json
 import re
+import urllib.error
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
@@ -199,6 +200,8 @@ def xnat(monkeypatch):
     monkeypatch.setattr(dxreport, "_request", lambda ctx, method, url, timeout: calls["probes"].pop(0) if calls["probes"] else calls["probe"])
 
     def get_json(ctx, url, timeout):
+        if calls.get("gone_on_read") and calls["gone_on_read"](url):
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
         if "/files?" in url:
             return {"ResultSet": {"Result": calls["listings"].pop(0) if calls["listings"] else calls["files"]}}
         return {"items": [{"data_fields": calls["there"]}]}
@@ -657,4 +660,40 @@ def test_a_date_time_off_the_calendar_or_zone_is_left_off(value, caplog):
                                    "2026-01-01T12:00:00"])
 def test_a_real_date_time_is_kept(value):
     assert dxreport._when(value, "issued") == value
+
+
+# ── Codex round 13 on PR #23 ───────────────────────────────────────────────────
+@pytest.mark.parametrize("which", ["record", "listing"])
+def test_a_record_rolled_back_between_the_reads_is_taken_over_not_an_error(tmp_path, xnat, which):
+    """The status probe says 200, then the creator rolls back before the metadata or the REPORT listing is read:
+    that 404 is the record gone, and this run files the report (Codex P2, PR #23)."""
+    attempts = []
+
+    def publish(ctx, label, xml, files, timeout_seconds=300.0, xsi_type=None, retry_on_conflict=True):
+        attempts.append(label)
+        if len(attempts) == 1:
+            xnat["probe"] = 200
+            raise RuntimeError("PUT %s failed: HTTP 409 Conflict" % label)
+        return {"id": "XNAT_E99999", "label": label}
+    xnat["gone_on_read"] = (lambda url: "/files?" in url) if which == "listing" else (lambda url: "/files?" not in url)
+    original, dxreport.publish_record = dxreport.publish_record, publish
+    try:
+        out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    finally:
+        dxreport.publish_record = original
+    assert out["id"] == "XNAT_E99999" and len(attempts) == 2
+
+
+def test_another_read_failure_is_still_an_error(tmp_path, xnat):
+    """Control: only a 404 means rolled back; a 500 on the read is an error outcome."""
+    xnat["probe"] = 200
+
+    def get_json(ctx, url, timeout):
+        raise urllib.error.HTTPError(url, 500, "Server Error", {}, None)
+    dxreport._get_json, original = get_json, dxreport._get_json
+    try:
+        out = dxreport.publish_diagnostic_report(context(), written(tmp_path), "raw", "diagnostic_report.json", "SUCCEEDED", CONTRACT)
+    finally:
+        dxreport._get_json = original
+    assert "500" in out["error"]
 

@@ -505,22 +505,40 @@ def _settled(context: XnatContext, label: str, values: dict, timeout_seconds: fl
     label_url, files_base = record_urls(context, label)
     deadline = time.monotonic() + SETTLE_WAIT_SECONDS
     compared = False
+
+    def gone() -> None:
+        logger.warning("the record under %s on session %s is gone: the run that created it rolled it back; this run files the report",
+                       label, context.session)
+
+    def read(url: str):
+        """The JSON at url; None when it answers 404: the record was rolled back between this run's reads,
+        which is the same as finding it gone (Codex P2, PR #23)."""
+        try:
+            return _get_json(context, url, min(timeout_seconds, 60.0))
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+            return None
+
     while True:
         status = _request(context, "GET", f"{label_url}?format=json", min(timeout_seconds, 60.0))
         if status == 404:
-            logger.warning("the record under %s on session %s is gone: the run that created it rolled it back; this run files the report",
-                           label, context.session)
-            return None
+            return gone()
         if status != 200:
             raise RuntimeError(f"could not read the record under label {label}: HTTP {status}")
         if not compared:
-            there = _get_json(context, f"{label_url}?format=json", min(timeout_seconds, 60.0))["items"][0]["data_fields"]
+            record = read(f"{label_url}?format=json")
+            if record is None:
+                return gone()
+            there = record["items"][0]["data_fields"]
             if (there.get("source_id"), there.get("source_system")) != (values["source_id"], values["source_system"]):
                 logger.error("label %s on session %s holds report %r from %r, not %r from %r; not filed", label, context.session,
                              there.get("source_id"), there.get("source_system"), values["source_id"], values["source_system"])
                 return {"error": f"label {label} is taken by report {there.get('source_id')!r} from {there.get('source_system')!r}"}
             compared = True
-        listing = _get_json(context, f"{files_base}/{REPORT_ROLE}/files?format=json", min(timeout_seconds, 60.0))
+        listing = read(f"{files_base}/{REPORT_ROLE}/files?format=json")
+        if listing is None:
+            return gone()
         if (listing.get("ResultSet") or {}).get("Result"):
             logger.info("diagnostic report %s already on session %s%s; not filed twice", label, context.session,
                         " (filed by a concurrent run)" if race else "")
